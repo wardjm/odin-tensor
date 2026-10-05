@@ -274,7 +274,7 @@ _view_extent :: proc(view: Tensor_View($T)) -> (first, last: int, ok: bool) {
 
 // _output_overlaps_view reports whether any element addressed by a validated
 // view shares memory with output's data.
-_output_overlaps_view :: proc(output: Tensor($T), view: Tensor_View(T)) -> bool {
+_output_overlaps_view :: proc(output: Tensor($O), view: Tensor_View($T)) -> bool {
 	if len(output.data) == 0 {
 		return false
 	}
@@ -285,7 +285,7 @@ _output_overlaps_view :: proc(output: Tensor($T), view: Tensor_View(T)) -> bool 
 	view_start := uintptr(&view.data[first])
 	view_end := uintptr(&view.data[last]) + size_of(T)
 	output_start := uintptr(raw_data(output.data))
-	output_end := output_start + uintptr(len(output.data)*size_of(T))
+	output_end := output_start + uintptr(len(output.data)*size_of(O))
 	return view_start < output_end && output_start < view_end
 }
 

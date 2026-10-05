@@ -934,6 +934,10 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&exponentials)
 	mean := mean_all(a) or_return
 	defer release(&mean)
+	indices := argmax_axis(a, 1, true, allocator) or_return
+	defer release(&indices)
+	smallest := argmin_axis_views(as_view(a), 0, false, allocator) or_return
+	defer release(&smallest)
 	return .None
 }
 
@@ -1491,6 +1495,145 @@ test_axis_reduction_view_and_into_variants :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
 	testing.expect_value(t, sum_axis_into(&rows, empty, 1), Tensor_Error.None)
 	expect_f64_data(t, rows.data, []f64{0, 0})
+}
+
+expect_int_data :: proc(t: ^testing.T, actual, expected: []int) {
+	testing.expect_value(t, len(actual), len(expected))
+	if len(actual) != len(expected) {
+		return
+	}
+	for i in 0..<len(expected) {
+		testing.expect_value(t, actual[i], expected[i])
+	}
+}
+
+@(test)
+test_argmax_and_argmin_along_an_axis :: proc(t: ^testing.T) {
+	values, err := from_slice(f64, []f64{1, 5, 5, 7, 2, 7}, []int{2, 3})
+	testing.expect(t, err == .None)
+	defer release(&values)
+
+	// Ties pick the first index.
+	rows: Tensor(int)
+	rows, err = argmax_axis(values, 1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&rows)
+	expect_shape(t, rows.shape, []int{2})
+	expect_int_data(t, rows.data, []int{1, 0})
+	columns: Tensor(int)
+	columns, err = argmax_axis(values, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&columns)
+	expect_int_data(t, columns.data, []int{1, 0, 1})
+	smallest: Tensor(int)
+	smallest, err = argmin_axis(values, -1, true)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&smallest)
+	expect_shape(t, smallest.shape, []int{2, 1})
+	expect_int_data(t, smallest.data, []int{0, 1})
+
+	// Views report indices in their own logical order.
+	transposed_shape, transposed_strides := [2]int{}, [2]int{}
+	transposed, view_err := transpose_view(as_view(values), transposed_shape[:], transposed_strides[:])
+	testing.expect(t, view_err == .None)
+	transposed_rows: Tensor(int)
+	transposed_rows, err = argmax_axis_views(transposed, 1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_rows)
+	expect_int_data(t, transposed_rows.data, []int{1, 0, 1})
+	transposed_columns: Tensor(int)
+	transposed_columns, err = argmin_axis_views(transposed, 0, true)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_columns)
+	expect_shape(t, transposed_columns.shape, []int{1, 2})
+	expect_int_data(t, transposed_columns.data, []int{0, 1})
+
+	// The first NaN wins for both argmax and argmin.
+	with_nan: Tensor(f64)
+	with_nan, err = from_slice(f64, []f64{1, 9, math.nan_f64(), 0, math.nan_f64()}, []int{5})
+	testing.expect(t, err == .None)
+	defer release(&with_nan)
+	nan_max: Tensor(int)
+	nan_max, err = argmax_axis(with_nan, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&nan_max)
+	expect_shape(t, nan_max.shape, []int{})
+	expect_int_data(t, nan_max.data, []int{2})
+	nan_min: Tensor(int)
+	nan_min, err = argmin_axis(with_nan, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&nan_min)
+	expect_int_data(t, nan_min.data, []int{2})
+
+	integers: Tensor(i32)
+	integers, err = from_slice(i32, []i32{4, -2, 4, -2}, []int{4})
+	testing.expect(t, err == .None)
+	defer release(&integers)
+	integer_min: Tensor(int)
+	integer_min, err = argmin_axis(integers, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&integer_min)
+	expect_int_data(t, integer_min.data, []int{1})
+
+	empty: Tensor(f64)
+	empty, err = new_tensor(f64, []int{2, 0})
+	testing.expect(t, err == .None)
+	defer release(&empty)
+	_, err = argmax_axis(empty, 1)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	_, err = argmin_axis_views(as_view(empty), -1)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	// Reducing the non-empty axis of an empty tensor gives an empty result.
+	empty_columns: Tensor(int)
+	empty_columns, err = argmax_axis(empty, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_columns)
+	expect_shape(t, empty_columns.shape, []int{0})
+	_, err = argmax_axis(values, 2)
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+}
+
+@(test)
+test_argmax_and_argmin_into_outputs :: proc(t: ^testing.T) {
+	values, err := from_slice(f64, []f64{1, 5, 5, 7, 2, 7}, []int{2, 3})
+	testing.expect(t, err == .None)
+	defer release(&values)
+	rows: Tensor(int)
+	rows, err = new_tensor(int, []int{2})
+	testing.expect(t, err == .None)
+	defer release(&rows)
+	kept_columns: Tensor(int)
+	kept_columns, err = new_tensor(int, []int{1, 3})
+	testing.expect(t, err == .None)
+	defer release(&kept_columns)
+
+	testing.expect_value(t, argmax_axis_into(&rows, values, 1), Tensor_Error.None)
+	expect_int_data(t, rows.data, []int{1, 0})
+	testing.expect_value(t, argmin_axis_into(&kept_columns, values, 0, true), Tensor_Error.None)
+	expect_int_data(t, kept_columns.data, []int{0, 1, 0})
+	testing.expect_value(t, argmin_axis_views_into(&rows, as_view(values), -1), Tensor_Error.None)
+	expect_int_data(t, rows.data, []int{0, 1})
+	transposed_shape, transposed_strides := [2]int{}, [2]int{}
+	transposed, view_err := transpose_view(as_view(values), transposed_shape[:], transposed_strides[:])
+	testing.expect(t, view_err == .None)
+	testing.expect_value(t, argmax_axis_views_into(&rows, transposed, 0), Tensor_Error.None)
+	expect_int_data(t, rows.data, []int{1, 0})
+
+	// Errors leave the output unchanged.
+	testing.expect_value(t, argmax_axis_into(&rows, values, 0), Tensor_Error.Shape_Mismatch)
+	testing.expect_value(t, argmax_axis_into(&kept_columns, values, 0), Tensor_Error.Shape_Mismatch)
+	testing.expect_value(t, argmin_axis_into(&rows, values, 2), Tensor_Error.Out_Of_Bounds)
+	empty: Tensor(f64)
+	empty, err = new_tensor(f64, []int{2, 0})
+	testing.expect(t, err == .None)
+	defer release(&empty)
+	testing.expect_value(t, argmax_axis_into(&rows, empty, 1), Tensor_Error.Empty_Reduction)
+	expect_int_data(t, rows.data, []int{1, 0})
+
+	// An output that overlaps the source is rejected, even for an int source.
+	folded := Tensor_View(int){data = rows.data, shape = []int{2, 1}, strides = []int{1, 1}}
+	testing.expect_value(t, argmax_axis_views_into(&rows, folded, 1), Tensor_Error.Aliased_Output)
+	expect_int_data(t, rows.data, []int{1, 0})
 }
 
 @(test)

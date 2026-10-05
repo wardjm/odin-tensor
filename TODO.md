@@ -25,7 +25,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
 
 ## Reductions
 
-- [ ] **`argmax_axis` / `argmin_axis`.** Return a `Tensor(int)` of indices along one axis, with negative axes, `keep_dims` and the `_views` forms. Ties pick the first index and a NaN wins, as in NumPy.
+- [x] **`argmax_axis` / `argmin_axis`.** Return a `Tensor(int)` of indices along one axis, with negative axes, `keep_dims` and the `_views` forms. Ties pick the first index and a NaN wins, as in NumPy.
   - Done when tests cover: `[[1,5,5],[7,2,7]]` axis 1 gives `[1,0]`; axis 0 gives `[1,0,1]`; NaN at index 2 gives 2; an empty axis gives `.Empty_Reduction`.
 - [ ] **`argmax_all` / `argmin_all`.** Return the flat row-major index as a rank-zero `Tensor(int)`.
   - Done when: a transposed view returns the index in the view's logical order, not the storage order.
@@ -73,5 +73,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when: `grep -n 'testing.expect(t, ' *_test.odin` returns no lines.
 - [ ] **Stop setup failures from cascading into panics.** Stop the test immediately when setup fails.
   - Done when: a deliberately failing `from_slice` in a test reports one failure instead of an index panic.
+- [ ] **Pass the allocator through every call in the tensor allocation scenario.** `tensor_allocation_scenario` calls `add`, `sum_axis`, `matmul`, `dot`, `exp` and `mean_all` without `allocator`, so those calls never see the failing allocator and their partial-failure cleanup is untested.
+  - Done when: every allocating call in the scenario passes `allocator`, and the tests still pass.
 - [ ] **Remove the remaining reads of `tape.nodes[...]` in tests.** Test recorded operation, axis and parent through behaviour (values and gradients) instead.
   - Done when: `grep -n 'tape.nodes\[' autodiff_test.odin` returns no lines.

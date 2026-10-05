@@ -100,32 +100,57 @@ _reduce_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axi
 		}
 	}
 
-	// Output elements map to source positions with the reduced reduced_axis at zero.
-	// Treat the source as [outer, reduced, inner] around that reduced_axis.
-	inner := 1
-	for dim in source.shape[reduced_axis+1:] {
-		inner *= dim
-	}
+	inner := _reduction_inner_count(source.shape, reduced_axis)
 	reduced_stride := source.strides[reduced_axis]
 	for output_index in 0..<len(output.data) {
-		outer_index := output_index / inner if inner > 0 else 0
-		inner_index := output_index - outer_index*inner
-		base_offset := source.offset
-		remaining := inner_index
-		for source_axis := len(source.shape)-1; source_axis > reduced_axis; source_axis -= 1 {
-			dim := source.shape[source_axis]
-			base_offset += (remaining % dim) * source.strides[source_axis]
-			remaining /= dim
-		}
-		remaining = outer_index
-		for source_axis := reduced_axis-1; source_axis >= 0; source_axis -= 1 {
-			dim := source.shape[source_axis]
-			base_offset += (remaining % dim) * source.strides[source_axis]
-			remaining /= dim
-		}
+		base_offset := _reduction_base_offset(source, reduced_axis, inner, output_index)
 		output.data[output_index] = _reduce_run(source.data, base_offset, reduced_stride, reduced_count, operation)
 	}
 	return .None
+}
+
+// _reduction_inner_count is the number of elements after axis, treating the
+// source as [outer, reduced, inner] around that axis.
+_reduction_inner_count :: proc(shape: []int, axis: int) -> int {
+	inner := 1
+	for dim in shape[axis+1:] {
+		inner *= dim
+	}
+	return inner
+}
+
+// _reduction_base_offset maps an output element of an axis reduction to the
+// source position with the reduced axis at zero.
+_reduction_base_offset :: proc(source: Tensor_View($T), reduced_axis, inner, output_index: int) -> int {
+	outer_index := output_index / inner if inner > 0 else 0
+	inner_index := output_index - outer_index*inner
+	base_offset := source.offset
+	remaining := inner_index
+	for source_axis := len(source.shape)-1; source_axis > reduced_axis; source_axis -= 1 {
+		dim := source.shape[source_axis]
+		base_offset += (remaining % dim) * source.strides[source_axis]
+		remaining /= dim
+	}
+	remaining = outer_index
+	for source_axis := reduced_axis-1; source_axis >= 0; source_axis -= 1 {
+		dim := source.shape[source_axis]
+		base_offset += (remaining % dim) * source.strides[source_axis]
+		remaining /= dim
+	}
+	return base_offset
+}
+
+// _reduced_shape writes the shape of an axis reduction into buffer.
+_reduced_shape :: proc(shape: []int, axis: int, keep_dims: bool, buffer: []int) -> []int {
+	rank := 0
+	for dim, source_axis in shape {
+		if source_axis == axis && !keep_dims {
+			continue
+		}
+		buffer[rank] = 1 if source_axis == axis else dim
+		rank += 1
+	}
+	return buffer[:rank]
 }
 
 // _reduce_axis_views returns a contiguous tensor reduced along axis.
@@ -138,15 +163,7 @@ _reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _Redu
 		}
 	}
 	shape_buffer: [MAX_RANK]int
-	rank := 0
-	for dim, source_axis in source.shape {
-		if source_axis == normalized && !keep_dims {
-			continue
-		}
-		shape_buffer[rank] = 1 if source_axis == normalized else dim
-		rank += 1
-	}
-	result = new_tensor(T, shape_buffer[:rank], allocator) or_return
+	result = new_tensor(T, _reduced_shape(source.shape, normalized, keep_dims, shape_buffer[:]), allocator) or_return
 	if err = _reduce_axis_views_into(&result, source, normalized, operation, keep_dims); err != .None {
 		release(&result)
 	}
@@ -206,6 +223,98 @@ max_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: i
 }
 min_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views_into(output, source, axis, .Min, keep_dims)
+}
+
+// _arg_reduce_axis_views_into writes the index of the largest (.Max) or
+// smallest (.Min) element along axis into an exactly shaped, contiguous output.
+// Ties pick the first index and the first NaN wins, as in NumPy. Output must
+// not overlap source; an overlap returns Aliased_Output.
+_arg_reduce_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, $operation: _Reduction_Operation, keep_dims := false) -> Tensor_Error {
+	#assert(operation == .Max || operation == .Min)
+	_validate_view(source) or_return
+	reduced_axis := _normalize_axis(axis, len(source.shape)) or_return
+	if !_reduction_shape_matches(output^, source.shape, reduced_axis, keep_dims) {
+		return .Shape_Mismatch
+	}
+	if _output_overlaps_view(output^, source) {
+		return .Aliased_Output
+	}
+	reduced_count := source.shape[reduced_axis]
+	if reduced_count == 0 {
+		return .Empty_Reduction
+	}
+	inner := _reduction_inner_count(source.shape, reduced_axis)
+	reduced_stride := source.strides[reduced_axis]
+	for output_index in 0..<len(output.data) {
+		offset := _reduction_base_offset(source, reduced_axis, inner, output_index)
+		best := source.data[offset]
+		best_index := 0
+		for index in 1..<reduced_count {
+			when intrinsics.type_is_float(T) {
+				if best != best {
+					break
+				}
+			}
+			offset += reduced_stride
+			element := source.data[offset]
+			is_better := element > best if operation == .Max else element < best
+			when intrinsics.type_is_float(T) {
+				is_better = is_better || element != element
+			}
+			if is_better {
+				best, best_index = element, index
+			}
+		}
+		output.data[output_index] = best_index
+	}
+	return .None
+}
+
+// _arg_reduce_axis_views returns a new Tensor(int) of indices along axis.
+_arg_reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _Reduction_Operation, keep_dims := false, allocator := context.allocator) -> (result: Tensor(int), err: Tensor_Error) {
+	_validate_view(source) or_return
+	normalized := _normalize_axis(axis, len(source.shape)) or_return
+	if source.shape[normalized] == 0 {
+		return result, .Empty_Reduction
+	}
+	shape_buffer: [MAX_RANK]int
+	result = new_tensor(int, _reduced_shape(source.shape, normalized, keep_dims, shape_buffer[:]), allocator) or_return
+	if err = _arg_reduce_axis_views_into(&result, source, normalized, operation, keep_dims); err != .None {
+		release(&result)
+	}
+	return
+}
+
+// argmax_axis and argmin_axis return the index of the largest or smallest
+// element along one axis as a Tensor(int). A negative axis counts from the end,
+// and keep_dims is NumPy's keepdims. Ties pick the first index, a NaN wins, and
+// an empty axis returns Empty_Reduction.
+argmax_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views(as_view(source), axis, .Max, keep_dims, allocator)
+}
+argmin_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views(as_view(source), axis, .Min, keep_dims, allocator)
+}
+
+argmax_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views(source, axis, .Max, keep_dims, allocator)
+}
+argmin_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views(source, axis, .Min, keep_dims, allocator)
+}
+
+argmax_axis_into :: proc(output: ^Tensor(int), source: Tensor($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views_into(output, as_view(source), axis, .Max, keep_dims)
+}
+argmin_axis_into :: proc(output: ^Tensor(int), source: Tensor($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views_into(output, as_view(source), axis, .Min, keep_dims)
+}
+
+argmax_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views_into(output, source, axis, .Max, keep_dims)
+}
+argmin_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_axis_views_into(output, source, axis, .Min, keep_dims)
 }
 
 // _reduce_all_views aggregates every element into a new rank-zero tensor.
