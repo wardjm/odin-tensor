@@ -27,7 +27,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
 
 - [x] **`argmax_axis` / `argmin_axis`.** Return a `Tensor(int)` of indices along one axis, with negative axes, `keep_dims` and the `_views` forms. Ties pick the first index and a NaN wins, as in NumPy.
   - Done when tests cover: `[[1,5,5],[7,2,7]]` axis 1 gives `[1,0]`; axis 0 gives `[1,0,1]`; NaN at index 2 gives 2; an empty axis gives `.Empty_Reduction`.
-- [ ] **`argmax_all` / `argmin_all`.** Return the flat row-major index as a rank-zero `Tensor(int)`.
+- [x] **`argmax_all` / `argmin_all`.** Return the flat row-major index as a rank-zero `Tensor(int)`.
   - Done when: a transposed view returns the index in the view's logical order, not the storage order.
 - [ ] **`prod_axis` / `prod_all`.** The product of an empty reduction is 1.
   - Done when tests cover: `[[1,2],[3,4]]` gives `[3,8]` (axis 0) and 24 (all); an empty input gives 1; i8 overflow wraps (documented).

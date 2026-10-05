@@ -938,6 +938,10 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&indices)
 	smallest := argmin_axis_views(as_view(a), 0, false, allocator) or_return
 	defer release(&smallest)
+	largest_index := argmax_all(a, allocator) or_return
+	defer release(&largest_index)
+	smallest_index := argmin_all_views(as_view(a), allocator) or_return
+	defer release(&smallest_index)
 	return .None
 }
 
@@ -1591,6 +1595,95 @@ test_argmax_and_argmin_along_an_axis :: proc(t: ^testing.T) {
 	expect_shape(t, empty_columns.shape, []int{0})
 	_, err = argmax_axis(values, 2)
 	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+}
+
+@(test)
+test_argmax_and_argmin_over_all_elements :: proc(t: ^testing.T) {
+	values, err := from_slice(f64, []f64{1, 5, 5, 7, 2, 7}, []int{2, 3})
+	testing.expect(t, err == .None)
+	defer release(&values)
+
+	// Ties pick the first flat index.
+	largest: Tensor(int)
+	largest, err = argmax_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&largest)
+	expect_shape(t, largest.shape, []int{})
+	expect_int_data(t, largest.data, []int{3})
+	smallest: Tensor(int)
+	smallest, err = argmin_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&smallest)
+	expect_int_data(t, smallest.data, []int{0})
+
+	// A transposed view counts in its own row-major order: [[1,7],[5,2],[5,7]]
+	// has its first 7 at flat index 1, where storage order would give 3, and
+	// [[9,2],[0,1]] has its 0 at index 2, where storage order would give 1.
+	transposed_shape, transposed_strides := [2]int{}, [2]int{}
+	transposed, view_err := transpose_view(as_view(values), transposed_shape[:], transposed_strides[:])
+	testing.expect(t, view_err == .None)
+	transposed_largest: Tensor(int)
+	transposed_largest, err = argmax_all_views(transposed)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_largest)
+	expect_int_data(t, transposed_largest.data, []int{1})
+	transposed_values: Tensor(f64)
+	transposed_values, err = from_slice(f64, []f64{9, 0, 2, 1}, []int{2, 2})
+	testing.expect(t, err == .None)
+	defer release(&transposed_values)
+	small_shape, small_strides := [2]int{}, [2]int{}
+	small_transposed, small_err := transpose_view(as_view(transposed_values), small_shape[:], small_strides[:])
+	testing.expect(t, small_err == .None)
+	transposed_smallest: Tensor(int)
+	transposed_smallest, err = argmin_all_views(small_transposed)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_smallest)
+	expect_int_data(t, transposed_smallest.data, []int{2})
+
+	// The first NaN wins for both argmax and argmin.
+	with_nan: Tensor(f64)
+	with_nan, err = from_slice(f64, []f64{1, 9, math.nan_f64(), 0, math.nan_f64(), -1}, []int{2, 3})
+	testing.expect(t, err == .None)
+	defer release(&with_nan)
+	nan_max: Tensor(int)
+	nan_max, err = argmax_all(with_nan)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&nan_max)
+	expect_int_data(t, nan_max.data, []int{2})
+	nan_min: Tensor(int)
+	nan_min, err = argmin_all(with_nan)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&nan_min)
+	expect_int_data(t, nan_min.data, []int{2})
+
+	integers: Tensor(i32)
+	integers, err = from_slice(i32, []i32{4, -2, 4, -2}, []int{2, 2})
+	testing.expect(t, err == .None)
+	defer release(&integers)
+	integer_max: Tensor(int)
+	integer_max, err = argmax_all(integers)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&integer_max)
+	expect_int_data(t, integer_max.data, []int{0})
+
+	scalar: Tensor(f64)
+	scalar, err = from_slice(f64, []f64{3}, []int{})
+	testing.expect(t, err == .None)
+	defer release(&scalar)
+	scalar_index: Tensor(int)
+	scalar_index, err = argmax_all(scalar)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&scalar_index)
+	expect_int_data(t, scalar_index.data, []int{0})
+
+	empty: Tensor(f64)
+	empty, err = new_tensor(f64, []int{2, 0})
+	testing.expect(t, err == .None)
+	defer release(&empty)
+	_, err = argmax_all(empty)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	_, err = argmin_all_views(as_view(empty))
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
 }
 
 @(test)

@@ -257,17 +257,23 @@ _arg_reduce_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T
 			}
 			offset += reduced_stride
 			element := source.data[offset]
-			is_better := element > best if operation == .Max else element < best
-			when intrinsics.type_is_float(T) {
-				is_better = is_better || element != element
-			}
-			if is_better {
+			if _arg_is_better(element, best, operation) {
 				best, best_index = element, index
 			}
 		}
 		output.data[output_index] = best_index
 	}
 	return .None
+}
+
+// _arg_is_better reports whether element should replace best in an argmax
+// (.Max) or argmin (.Min) scan. A NaN element always replaces a number.
+_arg_is_better :: #force_inline proc(element, best: $T, $operation: _Reduction_Operation) -> bool {
+	is_better := element > best if operation == .Max else element < best
+	when intrinsics.type_is_float(T) {
+		is_better = is_better || element != element
+	}
+	return is_better
 }
 
 // _arg_reduce_axis_views returns a new Tensor(int) of indices along axis.
@@ -315,6 +321,59 @@ argmax_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), ax
 }
 argmin_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
 	return _arg_reduce_axis_views_into(output, source, axis, .Min, keep_dims)
+}
+
+// _arg_reduce_all_views returns the flat row-major index, in the view's logical
+// order, of the largest (.Max) or smallest (.Min) element as a rank-zero
+// Tensor(int). Ties pick the first index, the first NaN wins, and an empty
+// source returns Empty_Reduction.
+_arg_reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operation, allocator := context.allocator) -> (result: Tensor(int), err: Tensor_Error) {
+	#assert(operation == .Max || operation == .Min)
+	_validate_view(source) or_return
+	count, _ := _element_count(source.shape)
+	if count == 0 {
+		return result, .Empty_Reduction
+	}
+	result = new_tensor(int, []int{}, allocator) or_return
+	row := _row_length(source.shape)
+	step := _inner_step(source, source.shape)
+	best := source.data[source.offset]
+	best_index := 0
+	search: for start := 0; start < count; start += row {
+		offset := _broadcast_offset(source, source.shape, start)
+		for column in 0..<row {
+			when intrinsics.type_is_float(T) {
+				if best != best {
+					break search
+				}
+			}
+			element := source.data[offset]
+			if _arg_is_better(element, best, operation) {
+				best, best_index = element, start+column
+			}
+			offset += step
+		}
+	}
+	result.data[0] = best_index
+	return result, .None
+}
+
+// argmax_all and argmin_all return the flat row-major index of the largest or
+// smallest element as a rank-zero Tensor(int). For a view the index follows the
+// view's logical order, not its storage. Ties pick the first index, a NaN wins,
+// and an empty source returns Empty_Reduction.
+argmax_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_all_views(as_view(source), .Max, allocator)
+}
+argmin_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_all_views(as_view(source), .Min, allocator)
+}
+
+argmax_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_all_views(source, .Max, allocator)
+}
+argmin_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _arg_reduce_all_views(source, .Min, allocator)
 }
 
 // _reduce_all_views aggregates every element into a new rank-zero tensor.

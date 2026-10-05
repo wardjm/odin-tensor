@@ -73,6 +73,7 @@ The directory name contains a hyphen, so the import needs an explicit name such 
 | `a.sum(axis=-1, keepdims=True)` | `sum_axis(a, -1, true)` |
 | `a.max()` | `max_all(a)` (returns a rank-zero tensor) |
 | `a.argmax(axis=1)` | `argmax_axis(a, 1)` (returns a `Tensor(int)`) |
+| `a.argmax()` | `argmax_all(a)` (returns a rank-zero `Tensor(int)`) |
 | `a @ b`, `np.dot(a, b)` | `matmul(a, b)`, `dot(a, b)` |
 
 Differences to keep in mind:
@@ -119,6 +120,8 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 `sum_axis`, `mean_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero; mean/max/min of an empty reduction return `.Empty_Reduction`.
 
 `argmax_axis` and `argmin_axis` take the same arguments, come in `_views`, `_into`, and `_views_into` forms (the output is a `Tensor(int)`), and return a `Tensor(int)` of indices along the axis. Ties pick the first index and the first NaN wins, as in NumPy; an empty axis returns `.Empty_Reduction`.
+
+`argmax_all` and `argmin_all` take `(source, allocator)`, come in `_views` forms, and return the flat row-major index as a rank-zero `Tensor(int)`. For a view the index follows the view's logical order, so a transposed view counts along its own rows, not its storage. Ties and NaN behave as for the axis forms; an empty tensor returns `.Empty_Reduction`.
 
 ### Products
 
@@ -190,7 +193,7 @@ Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, and slicing or broadc
 
 ## Limitations
 
-- No batched (rank > 2) `matmul`, no whole-tensor `argmax`/`argmin`, no `prod`, `var`/`std`, or multi-axis reductions.
+- No batched (rank > 2) `matmul`, no `prod`, `var`/`std`, or multi-axis reductions.
 - Kernels are straightforward loops: contiguous inputs take a direct path and strided inputs advance by row, but there is no SIMD tuning, cache blocking for large matrix products, or pairwise summation, so large float sums accumulate rounding error faster than NumPy's.
 
 ## Tests
