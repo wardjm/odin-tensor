@@ -125,26 +125,115 @@ dot_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_Erro
 	return _product_views_into(output, a, b)
 }
 
-// matmul is a @ b. For rank-one and rank-two inputs it matches NumPy's matmul,
-// including promotion of a vector operand, and therefore equals dot. Batched
-// (rank three and higher) inputs return Invalid_Shape.
+// _matmul_result_shape applies np.matmul's shape rules. A vector a is a single
+// row and a vector b a single column, and that promoted axis is dropped from the
+// result. Axes before the last two are batch axes, which broadcast as in add.
+_matmul_result_shape :: proc(a_shape, b_shape, shape_buffer: []int) -> (rank: int, err: Tensor_Error) {
+	a_rank, b_rank := len(a_shape), len(b_shape)
+	if a_rank == 0 || b_rank == 0 {
+		return 0, .Invalid_Shape
+	}
+	b_inner := b_shape[b_rank-2] if b_rank >= 2 else b_shape[0]
+	if a_shape[a_rank-1] != b_inner {
+		return 0, .Shape_Mismatch
+	}
+	a_batch := a_shape[:max(a_rank-2, 0)]
+	b_batch := b_shape[:max(b_rank-2, 0)]
+	rank = max(len(a_batch), len(b_batch))
+	if a_rank >= 2 {
+		rank += 1
+	}
+	if b_rank >= 2 {
+		rank += 1
+	}
+	if len(shape_buffer) < rank {
+		return 0, .Insufficient_Buffer
+	}
+	batch_rank := broadcast_shape(a_batch, b_batch, shape_buffer) or_return
+	if a_rank >= 2 {
+		shape_buffer[batch_rank] = a_shape[a_rank-2]
+	}
+	if b_rank >= 2 {
+		shape_buffer[rank-1] = b_shape[b_rank-1]
+	}
+	if _, valid := _element_count(shape_buffer[:rank]); !valid || !_strides_are_valid(shape_buffer[:rank]) {
+		return 0, .Invalid_Shape
+	}
+	return rank, .None
+}
+
+// _matmul_kernel runs _product_kernel once per batch index, each writing one
+// contiguous matrix of output. a and b must be validated and result_shape must
+// come from _matmul_result_shape.
+_matmul_kernel :: proc(output: []$T, a, b: Tensor_View(T), result_shape: []int) {
+	a_batch_rank := max(len(a.shape)-2, 0)
+	b_batch_rank := max(len(b.shape)-2, 0)
+	a_batch := Tensor_View(T){data = a.data, shape = a.shape[:a_batch_rank], strides = a.strides[:a_batch_rank], offset = a.offset}
+	b_batch := Tensor_View(T){data = b.data, shape = b.shape[:b_batch_rank], strides = b.strides[:b_batch_rank], offset = b.offset}
+	a_matrix := Tensor_View(T){data = a.data, shape = a.shape[a_batch_rank:], strides = a.strides[a_batch_rank:]}
+	b_matrix := Tensor_View(T){data = b.data, shape = b.shape[b_batch_rank:], strides = b.strides[b_batch_rank:]}
+	batch_shape := result_shape[:max(a_batch_rank, b_batch_rank)]
+	batch_count, _ := _element_count(batch_shape)
+	if batch_count == 0 {
+		return
+	}
+	matrix_size := len(output) / batch_count
+	for batch in 0..<batch_count {
+		a_matrix.offset = _broadcast_offset(a_batch, batch_shape, batch)
+		b_matrix.offset = _broadcast_offset(b_batch, batch_shape, batch)
+		_product_kernel(output[batch*matrix_size:][:matrix_size], a_matrix, b_matrix)
+	}
+}
+
+_matmul_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_Error {
+	_validate_view(a) or_return
+	_validate_view(b) or_return
+	shape_buffer: [MAX_RANK]int
+	result_rank := _matmul_result_shape(a.shape, b.shape, shape_buffer[:]) or_return
+	_validate_output(output^) or_return
+	if !_shapes_match(output.shape, shape_buffer[:result_rank]) {
+		return .Shape_Mismatch
+	}
+	if _output_overlaps_view(output^, a) || _output_overlaps_view(output^, b) {
+		return .Aliased_Output
+	}
+	_matmul_kernel(output.data, a, b, shape_buffer[:result_rank])
+	return .None
+}
+
+_matmul_views :: proc(a, b: Tensor_View($T), allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
+	_validate_view(a) or_return
+	_validate_view(b) or_return
+	shape_buffer: [MAX_RANK]int
+	result_rank := _matmul_result_shape(a.shape, b.shape, shape_buffer[:]) or_return
+	result = new_tensor(T, shape_buffer[:result_rank], allocator) or_return
+	_matmul_kernel(result.data, a, b, shape_buffer[:result_rank])
+	return result, .None
+}
+
+// matmul is a @ b with np.matmul's rules. A vector a is promoted to a row and a
+// vector b to a column, and the promoted axis is dropped from the result, so
+// for rank-one and rank-two inputs matmul equals dot. Higher ranks are stacks
+// of matrices: the last two axes multiply and the leading (batch) axes
+// broadcast, so [2,1,3,4] @ [5,4,2] is [2,5,3,2]. Rank-zero inputs return
+// Invalid_Shape.
 matmul :: proc(a, b: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
-	return _product_views(as_view(a), as_view(b), allocator)
+	return _matmul_views(as_view(a), as_view(b), allocator)
 }
 
 matmul_views :: proc(a, b: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
-	return _product_views(a, b, allocator)
+	return _matmul_views(a, b, allocator)
 }
 
 // matmul_into and matmul_views_into write into an exactly shaped output without
 // allocating. Output must not overlap either input; an overlap returns
 // Aliased_Output.
 matmul_into :: proc(output: ^Tensor($T), a, b: Tensor(T)) -> Tensor_Error where intrinsics.type_is_numeric(T) {
-	return _product_views_into(output, as_view(a), as_view(b))
+	return _matmul_views_into(output, as_view(a), as_view(b))
 }
 
 matmul_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_Error where intrinsics.type_is_numeric(T) {
-	return _product_views_into(output, a, b)
+	return _matmul_views_into(output, a, b)
 }
 
 // scale_in_place multiplies every element by a scalar without allocating.

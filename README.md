@@ -7,7 +7,7 @@ A small, generic, row-major tensor library for Odin, with strided views, NumPy-s
 - Owned tensors with explicit allocators, plus borrowed strided views (transpose, axis permutation, slicing, broadcasting) that never copy.
 - Element-wise `add`/`sub`/`mul`/`div` with NumPy broadcasting; `exp`, `log`, `sqrt`, `relu`, `sigmoid`, and `tanh` for floats.
 - `sum`/`mean`/`max`/`min` over one axis or the whole tensor, with negative axes and `keep_dims`.
-- `dot` and `matmul` for vectors and matrices.
+- `dot` for vectors and matrices; `matmul` also for stacks of matrices, with broadcast batch axes.
 - Allocation-free `_into` and `_in_place` forms for hot loops.
 - Reverse-mode autodiff for add/sub/mul/div, dot/matmul, ReLU/sigmoid/tanh, and sum/mean reductions.
 
@@ -133,7 +133,9 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 ### Products
 
-`dot` and `matmul` accept rank-one and rank-two operands with NumPy's rules: vector·vector is a rank-zero tensor, matrix·vector and vector·matrix are vectors, matrix·matrix is a matrix. For these ranks the two are identical. Both have `_views`, `_into`, and `_views_into` forms. Batched (rank three and higher) products are not supported and return `.Invalid_Shape`.
+`dot` and `matmul` accept rank-one and rank-two operands with NumPy's rules: vector·vector is a rank-zero tensor, matrix·vector and vector·matrix are vectors, matrix·matrix is a matrix. For these ranks the two are identical. Both have `_views`, `_into`, and `_views_into` forms.
+
+`matmul` also takes higher ranks, as `np.matmul` does: each operand is a stack of matrices in its last two axes, and the leading batch axes broadcast like `add`'s, so `[2,1,3,4] @ [5,4,2]` is `[2,5,3,2]`. A vector operand is promoted to a row (left) or column (right) of every matrix, and that axis is dropped from the result. Batch axes that cannot broadcast return `.Shape_Mismatch`. `dot` stays limited to ranks one and two and returns `.Invalid_Shape` for anything higher, since `np.dot` on stacks means something different.
 
 ## Allocators
 
@@ -197,11 +199,10 @@ main :: proc() {
 - **Handles.** A `Tape_Value` is an id, not a pointer, so a `Tape` can be moved freely. Every call takes the tape explicitly. A handle from another tape, or from before `tape_reset`/`tape_release`, returns `.Invalid_Tape`.
 - **Lifetime.** The tape grows as needed (`tape_init(T, reserve)` preallocates). `tape_reset` releases every node but keeps the storage, for rebuilding the graph each training step.
 
-Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, `prod`, `var`/`std`, and slicing or broadcasting views (broadcasting inside `tape_add` etc. is differentiable).
+Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, `prod`, `var`/`std`, batched `matmul` (`tape_matmul` returns `.Invalid_Shape` above rank two), and slicing or broadcasting views (broadcasting inside `tape_add` etc. is differentiable).
 
 ## Limitations
 
-- No batched (rank > 2) `matmul`.
 - Kernels are straightforward loops: contiguous inputs take a direct path and strided inputs advance by row, but there is no SIMD tuning or cache blocking for large matrix products.
 
 ## Tests

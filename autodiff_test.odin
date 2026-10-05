@@ -867,6 +867,29 @@ test_tape_dot_and_matmul_reverse_rules :: proc(t: ^testing.T) {
 	check_dot_reverse_case(t, []f64{1, 2, -1, 3, 4, 2}, []int{2, 3}, []f64{2, 1, -1, 3, 0.5, 4}, []int{3, 2}, []f64{1, -2, 0.5, 3}, []int{2, 2}, .Matmul)
 }
 
+@(test)
+test_tape_matmul_rejects_batched_operands :: proc(t: ^testing.T) {
+	a, err := new_tensor(f64, []int{2, 2, 3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&a)
+	b: Tensor(f64)
+	b, err = new_tensor(f64, []int{3, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&b)
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer tape_release(&tape)
+	av, bv: Tape_Value(f64)
+	av, err = tape_add_leaf_borrow(&tape, &a)
+	testing.expect_value(t, err, Tensor_Error.None)
+	bv, err = tape_add_leaf_borrow(&tape, &b)
+	testing.expect_value(t, err, Tensor_Error.None)
+	// matmul itself accepts these; the tape has no batched reverse rule yet.
+	_, err = tape_matmul(&tape, av, bv)
+	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
+}
+
 check_dot_reverse_case :: proc(t: ^testing.T, a_values: []f64, a_shape: []int, b_values: []f64, b_shape: []int, seed_values: []f64, seed_shape: []int, operation: Tape_Operation) {
 	a, a_err := from_slice(f64, a_values, a_shape)
 	testing.expect(t, a_err == .None)

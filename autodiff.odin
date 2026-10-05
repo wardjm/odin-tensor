@@ -35,7 +35,8 @@ tape_div :: proc(tape: ^Tape($T), a, b: Tape_Value(T)) -> (Tape_Value(T), Tensor
 	return _tape_binary(tape, a, b, .Div)
 }
 
-// tape_dot follows dot's rank-one/rank-two rules; tape_matmul requires matrices.
+// tape_dot and tape_matmul follow dot's rank-one/rank-two rules; batched
+// (rank > 2) operands return Invalid_Shape.
 tape_dot :: proc(tape: ^Tape($T), a, b: Tape_Value(T)) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _tape_binary(tape, a, b, .Dot)
 }

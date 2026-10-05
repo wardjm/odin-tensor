@@ -755,12 +755,6 @@ test_matrix_multiplication_errors_and_zero_inner_dimension :: proc(t: ^testing.T
 	inner, err = matmul(vector, vector)
 	testing.expect(t, err == .None && len(inner.shape) == 0)
 	release(&inner)
-	batched: Tensor(f64)
-	batched, err = new_tensor(f64, []int{2, 2, 3})
-	testing.expect(t, err == .None)
-	defer release(&batched)
-	_, err = matmul(batched, left)
-	testing.expect(t, err == .Invalid_Shape)
 
 	wrong_output: Tensor(f64)
 	wrong_output, err = new_tensor(f64, []int{2, 2})
@@ -788,6 +782,198 @@ test_matrix_multiplication_errors_and_zero_inner_dimension :: proc(t: ^testing.T
 	for value in empty_product.data {
 		testing.expect(t, value == 0)
 	}
+}
+
+// expect_batch_matches_matmul checks that output[batch] equals the 2-D matmul
+// of a[a_batch] and b[b_batch], each a contiguous row-major matrix.
+expect_batch_matches_matmul :: proc(t: ^testing.T, output: Tensor(f64), batch: int, a: Tensor(f64), a_batch: int, b: Tensor(f64), b_batch: int, loc := #caller_location) {
+	m, k, n := a.shape[len(a.shape)-2], a.shape[len(a.shape)-1], b.shape[len(b.shape)-1]
+	a_matrix, err := from_slice(f64, a.data[a_batch*m*k:][:m*k], []int{m, k})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&a_matrix)
+	b_matrix: Tensor(f64)
+	b_matrix, err = from_slice(f64, b.data[b_batch*k*n:][:k*n], []int{k, n})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&b_matrix)
+	expected: Tensor(f64)
+	expected, err = matmul(a_matrix, b_matrix)
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&expected)
+	expect_f64_data(t, output.data[batch*m*n:][:m*n], expected.data)
+}
+
+// counting_values returns 1, 2, ..., count scaled by factor, for test operands.
+counting_values :: proc(count: int, factor: f64) -> []f64 {
+	values := make([]f64, count)
+	for &value, i in values {
+		value = f64(i+1) * factor
+	}
+	return values
+}
+
+@(test)
+test_batched_matmul_stacks_matrices :: proc(t: ^testing.T) {
+	a_values := counting_values(24, 1)
+	defer delete(a_values)
+	b_values := counting_values(20, 0.5)
+	defer delete(b_values)
+	a, err := from_slice(f64, a_values, []int{2, 3, 4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&a)
+	b: Tensor(f64)
+	b, err = from_slice(f64, b_values, []int{4, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&b)
+
+	product: Tensor(f64)
+	product, err = matmul(a, b)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&product)
+	expect_shape(t, product.shape, []int{2, 3, 5})
+	expect_batch_matches_matmul(t, product, 0, a, 0, b, 0)
+	expect_batch_matches_matmul(t, product, 1, a, 1, b, 0)
+
+	output: Tensor(f64)
+	output, err = new_tensor(f64, []int{2, 3, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&output)
+	testing.expect_value(t, matmul_into(&output, a, b), Tensor_Error.None)
+	expect_f64_data(t, output.data, product.data)
+
+	// A vector operand is promoted and its axis dropped, as in NumPy.
+	row: Tensor(f64)
+	row, err = from_slice(f64, []f64{1, 0, -1, 2}, []int{4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&row)
+	row_products: Tensor(f64)
+	row_products, err = matmul(a, row)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&row_products)
+	expect_shape(t, row_products.shape, []int{2, 3})
+	expect_f64_data(t, row_products.data, []f64{6, 14, 22, 30, 38, 46})
+	column: Tensor(f64)
+	column, err = from_slice(f64, []f64{1, 0, -1}, []int{3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&column)
+	column_products: Tensor(f64)
+	column_products, err = matmul(column, a)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&column_products)
+	expect_shape(t, column_products.shape, []int{2, 4})
+	expect_f64_data(t, column_products.data, []f64{-8, -8, -8, -8, -8, -8, -8, -8})
+}
+
+@(test)
+test_batched_matmul_broadcasts_batch_axes :: proc(t: ^testing.T) {
+	a_values := counting_values(24, 1)
+	defer delete(a_values)
+	b_values := counting_values(40, -0.25)
+	defer delete(b_values)
+	a, err := from_slice(f64, a_values, []int{2, 1, 3, 4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&a)
+	b: Tensor(f64)
+	b, err = from_slice(f64, b_values, []int{5, 4, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&b)
+
+	product: Tensor(f64)
+	product, err = matmul(a, b)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&product)
+	expect_shape(t, product.shape, []int{2, 5, 3, 2})
+	for i in 0..<2 {
+		for j in 0..<5 {
+			expect_batch_matches_matmul(t, product, i*5+j, a, i, b, j)
+		}
+	}
+
+	// The same values as b through a strided view: copy b with its first two
+	// axes swapped, then swap them back in a view.
+	shape_buffer, strides_buffer: [3]int
+	swapped: Tensor_View(f64)
+	swapped, err = permute_view(as_view(b), []int{1, 0, 2}, shape_buffer[:], strides_buffer[:])
+	testing.expect_value(t, err, Tensor_Error.None)
+	swapped_copy: Tensor(f64)
+	swapped_copy, err = copy_view(swapped)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&swapped_copy)
+	restored_shape, restored_strides: [3]int
+	restored: Tensor_View(f64)
+	restored, err = permute_view(as_view(swapped_copy), []int{1, 0, 2}, restored_shape[:], restored_strides[:])
+	testing.expect_value(t, err, Tensor_Error.None)
+	testing.expect(t, !_is_contiguous_view(restored), "the restored view should be strided")
+	view_product: Tensor(f64)
+	view_product, err = matmul_views(as_view(a), restored)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&view_product)
+	expect_f64_data(t, view_product.data, product.data)
+}
+
+@(test)
+test_batched_matmul_errors_and_aliasing :: proc(t: ^testing.T) {
+	a, err := new_tensor(f64, []int{2, 3, 4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&a)
+	b: Tensor(f64)
+	b, err = new_tensor(f64, []int{3, 4, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&b)
+	_, err = matmul(a, b)
+	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
+	output: Tensor(f64)
+	output, err = new_tensor(f64, []int{3, 3, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&output)
+	testing.expect_value(t, matmul_into(&output, a, b), Tensor_Error.Shape_Mismatch)
+
+	wrong_inner: Tensor(f64)
+	wrong_inner, err = new_tensor(f64, []int{2, 3, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&wrong_inner)
+	_, err = matmul(a, wrong_inner)
+	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
+
+	// An empty batch axis gives an empty result, and a batch axis of one
+	// broadcasts against it.
+	empty_batch: Tensor(f64)
+	empty_batch, err = new_tensor(f64, []int{0, 4, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_batch)
+	single_batch: Tensor(f64)
+	single_batch, err = new_tensor(f64, []int{1, 3, 4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&single_batch)
+	empty_product: Tensor(f64)
+	empty_product, err = matmul(single_batch, empty_batch)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_product)
+	expect_shape(t, empty_product.shape, []int{0, 3, 2})
+	testing.expect_value(t, len(empty_product.data), 0)
+
+	// Batched outputs follow the same overlap rule as 2-D products: any input
+	// that shares memory with the output is rejected and the output kept.
+	stacked_values := counting_values(8, 1)
+	defer delete(stacked_values)
+	stacked: Tensor(f64)
+	stacked, err = from_slice(f64, stacked_values, []int{2, 2, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&stacked)
+	identity: Tensor(f64)
+	identity, err = from_slice(f64, []f64{1, 0, 0, 1}, []int{2, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&identity)
+	testing.expect_value(t, matmul_into(&stacked, stacked, identity), Tensor_Error.Aliased_Output)
+	second_matrix := Tensor_View(f64){data = stacked.data, shape = []int{2, 2}, strides = []int{2, 1}, offset = 4}
+	testing.expect_value(t, matmul_views_into(&stacked, as_view(stacked), second_matrix), Tensor_Error.Aliased_Output)
+	testing.expect_value(t, matmul_views_into(&stacked, as_view(identity), as_view(stacked)), Tensor_Error.Aliased_Output)
+	expect_f64_data(t, stacked.data, stacked_values)
+	separate: Tensor(f64)
+	separate, err = new_tensor(f64, []int{2, 2, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&separate)
+	testing.expect_value(t, matmul_into(&separate, stacked, identity), Tensor_Error.None)
+	expect_f64_data(t, separate.data, stacked_values)
 }
 
 @(test)
