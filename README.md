@@ -203,7 +203,7 @@ Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, `prod`, `var`/`std`, 
 
 ## Limitations
 
-- Kernels are straightforward loops: contiguous inputs take a direct path and strided inputs advance by row, but there is no SIMD tuning or cache blocking for large matrix products.
+- Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products are cache-blocked with register tiles, but there is no hand-written SIMD and no multithreading, so large products are well short of a BLAS.
 
 ## Tests
 
