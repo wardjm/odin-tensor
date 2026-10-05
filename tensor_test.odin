@@ -976,6 +976,64 @@ test_batched_matmul_edge_cases :: proc(t: ^testing.T) {
 	}
 }
 
+// expect_matmul_matches_naive multiplies an m×k by a k×n matrix of small
+// integer values and compares every element with a plain triple loop. Sums stay
+// exact in f32, so the comparison is exact for floats too. With transpose_b, b
+// is a transposed view, so its rows are not contiguous.
+expect_matmul_matches_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: int, transpose_b: bool, loc := #caller_location) {
+	a, err := new_tensor(T, []int{m, k})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&a)
+	for &value, i in a.data {
+		value = T(i%7 - 3)
+	}
+	b_storage: Tensor(T)
+	b_storage, err = new_tensor(T, []int{n, k} if transpose_b else []int{k, n})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&b_storage)
+	for &value, i in b_storage.data {
+		value = T(i%5 - 2)
+	}
+	b := as_view(b_storage)
+	shape_buffer, strides_buffer: [2]int
+	if transpose_b {
+		b, err = transpose_view(b, shape_buffer[:], strides_buffer[:])
+		testing.expect_value(t, err, Tensor_Error.None, loc)
+	}
+
+	product: Tensor(T)
+	product, err = matmul_views(as_view(a), b)
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&product)
+	expect_shape(t, product.shape, []int{m, n})
+	mismatches := 0
+	for i in 0..<m {
+		for j in 0..<n {
+			expected: T
+			for p in 0..<k {
+				expected += a.data[i*k + p] * b.data[b.offset + p*b.strides[0] + j*b.strides[1]]
+			}
+			if product.data[i*n + j] != expected {
+				mismatches += 1
+			}
+		}
+	}
+	testing.expectf(t, mismatches == 0, "%v %dx%d @ %dx%d (transpose_b=%v): %d elements differ from the naive product", typeid_of(T), m, k, k, n, transpose_b, mismatches, loc = loc)
+}
+
+@(test)
+test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
+	// Sizes straddle the register tiles and the k blocks, leaving partial row
+	// and column tiles and a partial last block.
+	expect_matmul_matches_naive(t, f32, 5, 300, 37, false)
+	expect_matmul_matches_naive(t, f32, 5, 300, 37, true)
+	expect_matmul_matches_naive(t, f64, 7, 513, 19, false)
+	expect_matmul_matches_naive(t, i64, 4, 256, 16, true)
+	expect_matmul_matches_naive(t, i8, 3, 9, 70, false)
+	expect_matmul_matches_naive(t, f32, 1, 300, 37, false)
+	expect_matmul_matches_naive(t, f32, 6, 300, 1, false)
+}
+
 @(test)
 test_batched_matmul_errors_and_aliasing :: proc(t: ^testing.T) {
 	a, err := new_tensor(f64, []int{2, 3, 4})

@@ -50,7 +50,7 @@ CASES := []Case{
 	{name = "sum_axis 0", run = bench_sum_axis, repetitions = 20},
 	{name = "sum_all", run = bench_sum_all, repetitions = 20},
 	{name = "matmul_into 256", run = bench_matmul_256, repetitions = 10},
-	// TODO.md: cache-block large matmul, at least 2x faster.
+	// TODO.md: cache-block large matmul, at least 2x faster (done).
 	{name = "matmul_into 512", run = bench_matmul_512, repetitions = 5, baseline_ms = 17.6, target_speedup = 2},
 	// TODO.md: per-row offsets in backward kernels, at least 5x faster.
 	{name = "tape_mul + backward 1000x1000", run = bench_tape_mul_backward, repetitions = 5, baseline_ms = 130, target_speedup = 5},
