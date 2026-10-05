@@ -2271,6 +2271,82 @@ test_integer_sum_max_and_min :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_float_sums_are_pairwise :: proc(t: ^testing.T) {
+	// Adding 0.1 to an f32 accumulator ten million times one by one stalls once
+	// the total is large enough, finishing about 10% off; pairwise sums stay
+	// within rounding of the exact total.
+	COUNT :: 10_000_000
+	values, err := new_tensor(f32, []int{COUNT})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&values)
+	fill(&values, 0.1)
+	expect_near :: proc(t: ^testing.T, actual: f32, expected: f64, location := #caller_location) {
+		testing.expectf(t, abs(f64(actual)-expected) <= 1e-3*expected, "got %v, want %v", actual, expected, loc = location)
+	}
+
+	total: Tensor(f32)
+	total, err = sum_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&total)
+	expect_near(t, total.data[0], 1e6)
+	mean: Tensor(f32)
+	mean, err = mean_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&mean)
+	expect_near(t, mean.data[0], 0.1)
+	along_axis: Tensor(f32)
+	along_axis, err = sum_axis(values, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&along_axis)
+	expect_near(t, along_axis.data[0], 1e6)
+
+	// Many short rows: the rows are combined pairwise too, not just each row.
+	columns := Tensor_View(f32){data = values.data, shape = []int{COUNT/4, 4}, strides = []int{4, 1}}
+	shape_buffer, strides_buffer := [2]int{}, [2]int{}
+	rows, view_err := transpose_view(columns, shape_buffer[:], strides_buffer[:])
+	testing.expect_value(t, view_err, Tensor_Error.None)
+	transposed_total: Tensor(f32)
+	transposed_total, err = sum_all_views(rows)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_total)
+	expect_near(t, transposed_total.data[0], 1e6)
+	over_axes: Tensor(f32)
+	over_axes, err = mean_axes_views(columns, []int{0, 1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&over_axes)
+	expect_near(t, over_axes.data[0], 0.1)
+	strided_axis: Tensor(f32)
+	strided_axis, err = sum_axis_views(columns, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&strided_axis)
+	for column in strided_axis.data {
+		expect_near(t, column, 2.5e5)
+	}
+
+	// Integer sums are exact and still wrap in T.
+	bytes: Tensor(i8)
+	bytes, err = new_tensor(i8, []int{100, 100})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&bytes)
+	fill(&bytes, 1)
+	byte_total: Tensor(i8)
+	byte_total, err = sum_all(bytes)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&byte_total)
+	testing.expect_value(t, byte_total.data[0], i8(16))
+	counts: Tensor(i32)
+	counts, err = new_tensor(i32, []int{1000, 1000})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&counts)
+	fill(&counts, 3)
+	count_total: Tensor(i32)
+	count_total, err = sum_all(counts)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&count_total)
+	testing.expect_value(t, count_total.data[0], i32(3_000_000))
+}
+
+@(test)
 test_zero_stride_broadcast_views_feed_every_operation :: proc(t: ^testing.T) {
 	row, err := from_slice(f64, []f64{1, 2, 3}, []int{3})
 	testing.expect(t, err == .None)

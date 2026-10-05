@@ -35,7 +35,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when tests cover: `[1,2,3,4]` gives var 1.25 and std √1.25; `ddof=1` gives 5/3; `ddof >= count` gives `.Empty_Reduction`.
 - [x] **Reduce over several axes.** Add `sum_axes(source, axes: []int, keep_dims)` and the same for mean, max and min. Repeated or out-of-range axes are an error.
   - Done when tests cover: shape `[2,3,4]` over axes `{0,2}` gives shape `[3]` and matches nested `sum_axis` calls; `{0,0}` gives `.Invalid_Shape`; `{-1}` equals `{2}`.
-- [ ] **Pairwise summation for floats** in `sum`/`mean`, as NumPy does.
+- [x] **Pairwise summation for floats** in `sum`/`mean`, as NumPy does.
   - Done when tests cover: the f32 sum of 10⁷ copies of `0.1` is within 1e-3 relative of 10⁶ (naive summation is off by about 10%); integer sums are unchanged.
 
 ## Products

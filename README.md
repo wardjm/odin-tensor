@@ -85,6 +85,7 @@ Differences to keep in mind:
 - Results never change type. `mean`, `var`, and `std` are only defined for floating-point tensors (they are a compile error on integers), and integer `sum` and `prod` accumulate in `T`, so they wrap on overflow where NumPy would widen.
 - Integer division truncates and returns `.Division_By_Zero` for a zero divisor, and `.Integer_Overflow` for signed `min(T) / -1`. Float division follows IEEE rules like NumPy: `x/0` is ±Inf or NaN.
 - `max` and `min` propagate NaN, like `np.max`.
+- Float `sum` and `mean` use pairwise summation, so rounding error grows with the log of the element count. NumPy only sums pairwise along the innermost contiguous axis; here every float sum is pairwise, including strided axes and whole-tensor sums over views. Integer sums add in order. `var` and `std` take a pairwise mean, but sum the squared deviations in order.
 - Views are explicit. A view never owns memory, and procedures that build one take caller-provided shape and stride buffers.
 - `slice_view` takes a count instead of a stop index, so reverse and empty slices are unambiguous.
 - Element types must be numeric (`add` on `Tensor(bool)` is a compile error); unary math requires floats.
@@ -200,8 +201,8 @@ Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, `prod`, `var`/`std`, 
 
 ## Limitations
 
-- No batched (rank > 2) `matmul` and no multi-axis reductions.
-- Kernels are straightforward loops: contiguous inputs take a direct path and strided inputs advance by row, but there is no SIMD tuning, cache blocking for large matrix products, or pairwise summation, so large float sums accumulate rounding error faster than NumPy's.
+- No batched (rank > 2) `matmul`.
+- Kernels are straightforward loops: contiguous inputs take a direct path and strided inputs advance by row, but there is no SIMD tuning or cache blocking for large matrix products.
 
 ## Tests
 

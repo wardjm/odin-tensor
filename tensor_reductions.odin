@@ -38,9 +38,12 @@ _combine :: #force_inline proc(accumulator, element: $T, $operation: _Reduction_
 
 // _reduce_run folds count elements starting at offset and advancing by step.
 // Sums start from zero, products from one; max/min start from the first element.
+// Float sums are pairwise (see _pairwise_sum); integer sums add in order.
 _reduce_run :: #force_inline proc(data: []$T, offset, step, count: int, $operation: _Reduction_Operation) -> T {
 	offset := offset
-	when operation == .Sum || operation == .Mean {
+	when (operation == .Sum || operation == .Mean) && intrinsics.type_is_float(T) {
+		value := _pairwise_sum(data, offset, step, count)
+	} else when operation == .Sum || operation == .Mean {
 		value: T = 0
 		for _ in 0..<count {
 			value += data[offset]
@@ -63,6 +66,46 @@ _reduce_run :: #force_inline proc(data: []$T, offset, step, count: int, $operati
 		value /= T(count)
 	}
 	return value
+}
+
+// PAIRWISE_BLOCK is the run length below which _pairwise_sum stops splitting,
+// as in NumPy.
+PAIRWISE_BLOCK :: 128
+
+// _pairwise_sum adds count elements starting at offset and advancing by step.
+// Runs longer than PAIRWISE_BLOCK are split in half and the halves summed
+// recursively, so rounding error grows with log(count) rather than count. Within
+// a block, eight interleaved accumulators keep each partial sum short, as
+// NumPy's pairwise_sum does.
+_pairwise_sum :: proc(data: []$T, offset, step, count: int) -> T {
+	if count < 8 {
+		value: T = 0
+		for i in 0..<count {
+			value += data[offset + i*step]
+		}
+		return value
+	}
+	if count <= PAIRWISE_BLOCK {
+		partial: [8]T
+		for lane in 0..<8 {
+			partial[lane] = data[offset + lane*step]
+		}
+		i := 8
+		for ; i <= count-8; i += 8 {
+			base := offset + i*step
+			for lane in 0..<8 {
+				partial[lane] += data[base + lane*step]
+			}
+		}
+		value := ((partial[0]+partial[1]) + (partial[2]+partial[3])) + ((partial[4]+partial[5]) + (partial[6]+partial[7]))
+		for ; i < count; i += 1 {
+			value += data[offset + i*step]
+		}
+		return value
+	}
+	half := count/2
+	half -= half % 8
+	return _pairwise_sum(data, offset, step, half) + _pairwise_sum(data, offset + half*step, step, count-half)
 }
 
 // _reduction_shape_matches validates an exactly shaped contiguous output.
@@ -587,10 +630,7 @@ _fold_view :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_O
 	row := _row_length(source.shape)
 	step := _inner_step(source, source.shape)
 	when operation == .Sum || operation == .Mean {
-		value: T = 0
-		for start := 0; start < count; start += row {
-			value += _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, .Sum)
-		}
+		value := _sum_rows(source, 0, count/row if row > 0 else 0, row, step)
 		when operation == .Mean {
 			value /= T(count)
 		}
@@ -604,6 +644,23 @@ _fold_view :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_O
 		for start := row; start < count; start += row {
 			value = _combine(value, _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, operation), operation)
 		}
+	}
+	return value
+}
+
+// _sum_rows adds row_count rows of a validated view, starting at first_row. For
+// floats the row sums are themselves combined pairwise, so a view of many short
+// rows keeps the accuracy of one long run.
+_sum_rows :: proc(source: Tensor_View($T), first_row, row_count, row, step: int) -> T {
+	when intrinsics.type_is_float(T) {
+		if row_count > 8 {
+			half := row_count/2
+			return _sum_rows(source, first_row, half, row, step) + _sum_rows(source, first_row+half, row_count-half, row, step)
+		}
+	}
+	value: T = 0
+	for r in first_row..<first_row+row_count {
+		value += _reduce_run(source.data, _broadcast_offset(source, source.shape, r*row), step, row, .Sum)
 	}
 	return value
 }
@@ -755,8 +812,8 @@ std_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: i
 
 // _variance_all_views returns the variance (or, with take_sqrt, the standard
 // deviation) of every element as a rank-zero tensor. An empty source, or ddof
-// >= the element count, returns Empty_Reduction. Rows are folded with a fixed step in two passes: one
-// for the mean, one for the squared deviations.
+// >= the element count, returns Empty_Reduction. It makes two passes: a
+// pairwise mean, then a sum of squared deviations.
 _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
 	count, _ := _element_count(source.shape)
@@ -764,13 +821,9 @@ _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool
 		return result, .Empty_Reduction
 	}
 	result = new_tensor(T, []int{}, allocator) or_return
+	mean := _fold_view(source, count, .Mean)
 	row := _row_length(source.shape)
 	step := _inner_step(source, source.shape)
-	total: T = 0
-	for start := 0; start < count; start += row {
-		total += _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, .Sum)
-	}
-	mean := total / T(count)
 	squares: T = 0
 	for start := 0; start < count; start += row {
 		offset := _broadcast_offset(source, source.shape, start)
