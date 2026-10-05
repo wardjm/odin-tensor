@@ -36,6 +36,7 @@ State :: struct {
 	square_512_out:                 tensor.Tensor(f32),
 	square_256_a, square_256_b:     tensor.Tensor(f32),
 	square_256_out:                 tensor.Tensor(f32),
+	row_out, narrow, narrow_out:    tensor.Tensor(f32),
 	grad_left, grad_right:          tensor.Tensor(f64),
 }
 
@@ -50,8 +51,12 @@ CASES := []Case{
 	{name = "sum_axis 0", run = bench_sum_axis, repetitions = 20},
 	{name = "sum_all", run = bench_sum_all, repetitions = 20},
 	{name = "matmul_into 256", run = bench_matmul_256, repetitions = 10},
-	// TODO.md: cache-block large matmul, at least 2x faster (done).
+	// TODO.md: cache-block large matmul, at least 2x faster.
 	{name = "matmul_into 512", run = bench_matmul_512, repetitions = 5, baseline_ms = 17.6, target_speedup = 2},
+	// Shapes the matmul blocking skips or leaves a column tail on, to catch
+	// regressions on them.
+	{name = "matmul_into vector @ 1000x1000", run = bench_matmul_vector, repetitions = 20},
+	{name = "matmul_into 1000x1000 @ 1000x15", run = bench_matmul_narrow, repetitions = 20},
 	// TODO.md: per-row offsets in backward kernels, at least 5x faster.
 	{name = "tape_mul + backward 1000x1000", run = bench_tape_mul_backward, repetitions = 5, baseline_ms = 130, target_speedup = 5},
 }
@@ -123,12 +128,15 @@ setup :: proc(s: ^State) {
 	s.square_512_a = filled(f32, []int{512, 512}, 1)
 	s.square_512_b = filled(f32, []int{512, 512}, 1)
 	s.square_512_out = filled(f32, []int{512, 512}, 0)
+	s.row_out = filled(f32, []int{N}, 0)
+	s.narrow = filled(f32, []int{N, 15}, 1)
+	s.narrow_out = filled(f32, []int{N, 15}, 0)
 	s.grad_left = filled(f64, []int{N, N}, 0.5)
 	s.grad_right = filled(f64, []int{N, N}, 2)
 }
 
 teardown :: proc(s: ^State) {
-	for t in ([]^tensor.Tensor(f32){&s.a, &s.b, &s.row, &s.output, &s.square_256_a, &s.square_256_b, &s.square_256_out, &s.square_512_a, &s.square_512_b, &s.square_512_out}) {
+	for t in ([]^tensor.Tensor(f32){&s.a, &s.b, &s.row, &s.output, &s.square_256_a, &s.square_256_b, &s.square_256_out, &s.square_512_a, &s.square_512_b, &s.square_512_out, &s.row_out, &s.narrow, &s.narrow_out}) {
 		tensor.release(t)
 	}
 	tensor.release(&s.grad_left)
@@ -180,6 +188,14 @@ bench_matmul_256 :: proc(s: ^State) {
 
 bench_matmul_512 :: proc(s: ^State) {
 	must(tensor.matmul_into(&s.square_512_out, s.square_512_a, s.square_512_b))
+}
+
+bench_matmul_vector :: proc(s: ^State) {
+	must(tensor.matmul_into(&s.row_out, s.row, s.a))
+}
+
+bench_matmul_narrow :: proc(s: ^State) {
+	must(tensor.matmul_into(&s.narrow_out, s.a, s.narrow))
 }
 
 bench_tape_mul_backward :: proc(s: ^State) {

@@ -44,14 +44,22 @@ _dot_result_shape :: proc(a_shape, b_shape, shape_buffer: []int) -> (rank: int, 
 // _PRODUCT_TILE_ROWS rows by _PRODUCT_TILE_BYTES of columns, and k is split
 // into blocks of _PRODUCT_BLOCK_DEPTH so each tile's slice of b can be packed
 // into a contiguous panel that stays in L1 while every row tile reuses it.
-// Sizes were tuned on matmul_into 512 in bench.
+// Sizes were tuned on matmul_into 512 in bench. Products with fewer than
+// _PRODUCT_TILE_ROWS rows, fewer than _PRODUCT_MIN_BLOCKED_DEPTH inner
+// elements, or less than one column tile reuse b too little to pay for packing
+// and skip blocking.
 _PRODUCT_TILE_ROWS :: 2
 _PRODUCT_TILE_BYTES :: 64
 _PRODUCT_BLOCK_DEPTH :: 256
+_PRODUCT_MIN_BLOCKED_DEPTH :: 8
 
 // _product_kernel computes output = a @ b with vectors treated as a single row
-// (a) or column (b). Each output element still sums its k products in order
-// from zero, so blocking does not change the result.
+// (a) or column (b). The outer loop walks k blocks; within each, column tiles
+// pack their panel of b and then sweep the row tiles, and columns past the
+// last full tile take the unpacked i-k-j loop. Each output element still sums
+// its k products in order from zero, so blocking does not change the result.
+// The inlining directives on the _product_strip calls are measured choices:
+// either way round, narrow or tail-heavy products lose 10-15%.
 _product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 	TILE_COLUMNS :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
 	a_rank, b_rank := len(a.shape), len(b.shape)
@@ -65,6 +73,10 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 	for &value in output {
 		value = 0
 	}
+	if m < _PRODUCT_TILE_ROWS || k < _PRODUCT_MIN_BLOCKED_DEPTH || n < TILE_COLUMNS {
+		#force_inline _product_strip(output, a, b, 0, k, 0, n)
+		return
+	}
 	full_rows := m - m%_PRODUCT_TILE_ROWS
 	full_columns := n - n%TILE_COLUMNS
 	panel: [_PRODUCT_BLOCK_DEPTH*TILE_COLUMNS]T = ---
@@ -72,6 +84,7 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 		depth := min(_PRODUCT_BLOCK_DEPTH, k-k0)
 		a_block := a
 		a_block.offset += k0*a_inner_stride
+		block_panel := panel[:depth*TILE_COLUMNS]
 		for j0 := 0; j0 < full_columns; j0 += TILE_COLUMNS {
 			for p in 0..<depth {
 				b_offset := b.offset + (k0+p)*b_row_stride + j0*b_column_stride
@@ -80,41 +93,25 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 				}
 			}
 			for i0 := 0; i0 < full_rows; i0 += _PRODUCT_TILE_ROWS {
-				_product_tile(output[i0*n + j0:], n, a_block, i0, a_row_stride, a_inner_stride, panel[:depth*TILE_COLUMNS])
+				_product_tile(_PRODUCT_TILE_ROWS, TILE_COLUMNS, output[i0*n + j0:], n, a_block, i0, a_row_stride, a_inner_stride, block_panel)
 			}
 			for i in full_rows..<m {
-				a_offset := a_block.offset + i*a_row_stride
-				for j in 0..<TILE_COLUMNS {
-					sum := output[i*n + j0 + j]
-					for p in 0..<depth {
-						sum += a.data[a_offset + p*a_inner_stride] * panel[p*TILE_COLUMNS + j]
-					}
-					output[i*n + j0 + j] = sum
-				}
+				_product_tile(1, TILE_COLUMNS, output[i*n + j0:], n, a_block, i, a_row_stride, a_inner_stride, block_panel)
 			}
 		}
-		for i in 0..<m {
-			a_offset := a_block.offset + i*a_row_stride
-			for j in full_columns..<n {
-				b_offset := b.offset + k0*b_row_stride + j*b_column_stride
-				sum := output[i*n + j]
-				for p in 0..<depth {
-					sum += a.data[a_offset + p*a_inner_stride] * b.data[b_offset + p*b_row_stride]
-				}
-				output[i*n + j] = sum
-			}
+		if full_columns < n {
+			#force_no_inline _product_strip(output, a, b, k0, k0+depth, full_columns, n)
 		}
 	}
 }
 
-// _product_tile adds a's rows i0..<i0+_PRODUCT_TILE_ROWS times the packed panel
-// into the matching output tile, whose first element is output[0] and whose
-// rows are row_length apart. The tile is accumulated in locals so the compiler
-// can keep it in registers.
-_product_tile :: #force_inline proc(output: []$T, row_length: int, a: Tensor_View(T), i0, a_row_stride, a_inner_stride: int, panel: []T) #no_bounds_check {
-	TILE_COLUMNS :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
-	tile: [_PRODUCT_TILE_ROWS][TILE_COLUMNS]T = ---
-	for r in 0..<_PRODUCT_TILE_ROWS {
+// _product_tile adds a's rows i0..<i0+ROWS times the packed panel, whose rows
+// are TILE_COLUMNS wide, into the matching output tile, whose first element is
+// output[0] and whose rows are row_length apart. The tile is accumulated in
+// locals so the compiler can keep it in registers.
+_product_tile :: #force_inline proc($ROWS, $TILE_COLUMNS: int, output: []$T, row_length: int, a: Tensor_View(T), i0, a_row_stride, a_inner_stride: int, panel: []T) #no_bounds_check {
+	tile: [ROWS][TILE_COLUMNS]T = ---
+	for r in 0..<ROWS {
 		for j in 0..<TILE_COLUMNS {
 			tile[r][j] = output[r*row_length + j]
 		}
@@ -122,16 +119,50 @@ _product_tile :: #force_inline proc(output: []$T, row_length: int, a: Tensor_Vie
 	a_offset := a.offset + i0*a_row_stride
 	for p in 0..<len(panel)/TILE_COLUMNS {
 		b_row := panel[p*TILE_COLUMNS:][:TILE_COLUMNS]
-		for r in 0..<_PRODUCT_TILE_ROWS {
+		for r in 0..<ROWS {
 			scale := a.data[a_offset + r*a_row_stride + p*a_inner_stride]
 			for j in 0..<TILE_COLUMNS {
 				tile[r][j] += scale * b_row[j]
 			}
 		}
 	}
-	for r in 0..<_PRODUCT_TILE_ROWS {
+	for r in 0..<ROWS {
 		for j in 0..<TILE_COLUMNS {
 			output[r*row_length + j] = tile[r][j]
+		}
+	}
+}
+
+// _product_strip adds a[:, k0..<k1] @ b[k0..<k1, j0..<j1] into the matching
+// columns of output for every row. It loops i-k-j so the innermost loop walks
+// one output row and one row of b with fixed steps. It keeps bounds checks
+// because narrow products measured about 10% slower without them.
+_product_strip :: proc(output: []$T, a, b: Tensor_View(T), k0, k1, j0, j1: int) {
+	a_rank, b_rank := len(a.shape), len(b.shape)
+	m := a.shape[0] if a_rank == 2 else 1
+	n := b.shape[1] if b_rank == 2 else 1
+	a_row_stride := a.strides[0] if a_rank == 2 else 0
+	a_inner_stride := a.strides[a_rank-1]
+	b_row_stride := b.strides[0]
+	b_column_stride := b.strides[1] if b_rank == 2 else 0
+	width := j1 - j0
+	for i in 0..<m {
+		output_row := output[i*n + j0:][:width]
+		for inner in k0..<k1 {
+			scale := a.data[a.offset + i*a_row_stride + inner*a_inner_stride]
+			b_offset := b.offset + inner*b_row_stride + j0*b_column_stride
+			if b_column_stride == 1 {
+				// Contiguous rows of b: a slice loop the compiler can vectorize.
+				b_row := b.data[b_offset:][:width]
+				for j in 0..<width {
+					output_row[j] += scale * b_row[j]
+				}
+				continue
+			}
+			for j in 0..<width {
+				output_row[j] += scale * b.data[b_offset]
+				b_offset += b_column_stride
+			}
 		}
 	}
 }

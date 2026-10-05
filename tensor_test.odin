@@ -1,5 +1,6 @@
 package tensor
 
+import "base:intrinsics"
 import "core:math"
 import "core:mem"
 import "core:testing"
@@ -976,62 +977,156 @@ test_batched_matmul_edge_cases :: proc(t: ^testing.T) {
 	}
 }
 
-// expect_matmul_matches_naive multiplies an m×k by a k×n matrix of small
-// integer values and compares every element with a plain triple loop. Sums stay
-// exact in f32, so the comparison is exact for floats too. With transpose_b, b
-// is a transposed view, so its rows are not contiguous.
-expect_matmul_matches_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: int, transpose_b: bool, loc := #caller_location) {
-	a, err := new_tensor(T, []int{m, k})
-	testing.expect_value(t, err, Tensor_Error.None, loc)
-	defer release(&a)
-	for &value, i in a.data {
-		value = T(i%7 - 3)
+// fill_product_operand fills data with operand values. Float values are not
+// small integers, so their sums round differently when the products are added
+// in another order; integer types get small values.
+fill_product_operand :: proc(data: []$T, seed: int) {
+	for &value, i in data {
+		when intrinsics.type_is_float(T) {
+			value = T(0.1*f64((i+seed)%7) + 1e-3*f64(i) - 0.3)
+		} else {
+			value = T((i+seed)%7 - 3)
+		}
 	}
-	b_storage: Tensor(T)
-	b_storage, err = new_tensor(T, []int{n, k} if transpose_b else []int{k, n})
-	testing.expect_value(t, err, Tensor_Error.None, loc)
-	defer release(&b_storage)
-	for &value, i in b_storage.data {
-		value = T(i%5 - 2)
-	}
-	b := as_view(b_storage)
-	shape_buffer, strides_buffer: [2]int
-	if transpose_b {
-		b, err = transpose_view(b, shape_buffer[:], strides_buffer[:])
-		testing.expect_value(t, err, Tensor_Error.None, loc)
-	}
+}
 
-	product: Tensor(T)
-	product, err = matmul_views(as_view(a), b)
-	testing.expect_value(t, err, Tensor_Error.None, loc)
-	defer release(&product)
-	expect_shape(t, product.shape, []int{m, n})
+// naive_product_element sums a[i, :] * b[:, j] from zero in index order, the
+// order matmul keeps, treating a rank-one a as a row and a rank-one b as a
+// column.
+naive_product_element :: proc(a, b: Tensor_View($T), i, j: int) -> (sum: T) {
+	a_row_stride := a.strides[0] if len(a.shape) == 2 else 0
+	a_inner_stride := a.strides[len(a.shape)-1]
+	b_column_stride := b.strides[1] if len(b.shape) == 2 else 0
+	for p in 0..<a.shape[len(a.shape)-1] {
+		sum += a.data[a.offset + i*a_row_stride + p*a_inner_stride] * b.data[b.offset + p*b.strides[0] + j*b_column_stride]
+	}
+	return
+}
+
+// expect_product_matches_naive compares output, the m×n product of a and b,
+// with naive_product_element. The comparison is exact, so a kernel that adds
+// float products in another order fails it.
+expect_product_matches_naive :: proc(t: ^testing.T, output: []$T, a, b: Tensor_View(T), loc := #caller_location) {
+	m := a.shape[0] if len(a.shape) == 2 else 1
+	n := b.shape[1] if len(b.shape) == 2 else 1
+	k := a.shape[len(a.shape)-1]
 	mismatches := 0
 	for i in 0..<m {
 		for j in 0..<n {
-			expected: T
-			for p in 0..<k {
-				expected += a.data[i*k + p] * b.data[b.offset + p*b.strides[0] + j*b.strides[1]]
-			}
-			if product.data[i*n + j] != expected {
+			if output[i*n + j] != naive_product_element(a, b, i, j) {
 				mismatches += 1
 			}
 		}
 	}
-	testing.expectf(t, mismatches == 0, "%v %dx%d @ %dx%d (transpose_b=%v): %d elements differ from the naive product", typeid_of(T), m, k, k, n, transpose_b, mismatches, loc = loc)
+	testing.expectf(t, mismatches == 0, "%v %v @ %v (k=%d, a strides %v, b strides %v): %d elements differ from the naive product", typeid_of(T), a.shape, b.shape, k, a.strides, b.strides, mismatches, loc = loc)
+}
+
+// expect_matmul_matches_naive multiplies an m×k by a k×n matrix and compares
+// the result exactly with the naive product. With transpose_a or transpose_b
+// that operand is a transposed view, so its rows are not contiguous.
+expect_matmul_matches_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: int, transpose_a, transpose_b: bool, loc := #caller_location) {
+	a_storage, err := new_tensor(T, []int{k, m} if transpose_a else []int{m, k})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&a_storage)
+	fill_product_operand(a_storage.data, 0)
+	b_storage: Tensor(T)
+	b_storage, err = new_tensor(T, []int{n, k} if transpose_b else []int{k, n})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&b_storage)
+	fill_product_operand(b_storage.data, 3)
+	a, b := as_view(a_storage), as_view(b_storage)
+	a_shape, a_strides, b_shape, b_strides: [2]int
+	if transpose_a {
+		a, err = transpose_view(a, a_shape[:], a_strides[:])
+		testing.expect_value(t, err, Tensor_Error.None, loc)
+	}
+	if transpose_b {
+		b, err = transpose_view(b, b_shape[:], b_strides[:])
+		testing.expect_value(t, err, Tensor_Error.None, loc)
+	}
+
+	product: Tensor(T)
+	product, err = matmul_views(a, b)
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&product)
+	expect_shape(t, product.shape, []int{m, n})
+	expect_product_matches_naive(t, product.data, a, b, loc = loc)
+}
+
+// expect_vector_products_match_naive multiplies a k-vector by a k×n matrix and
+// an n×k matrix by a k-vector, comparing both exactly with the naive product.
+expect_vector_products_match_naive :: proc(t: ^testing.T, $T: typeid, k, n: int, loc := #caller_location) {
+	vector, err := new_tensor(T, []int{k})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&vector)
+	fill_product_operand(vector.data, 0)
+	right: Tensor(T)
+	right, err = new_tensor(T, []int{k, n})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&right)
+	fill_product_operand(right.data, 3)
+	left: Tensor(T)
+	left, err = new_tensor(T, []int{n, k})
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&left)
+	fill_product_operand(left.data, 5)
+
+	row_product: Tensor(T)
+	row_product, err = matmul(vector, right)
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&row_product)
+	expect_shape(t, row_product.shape, []int{n})
+	expect_product_matches_naive(t, row_product.data, as_view(vector), as_view(right), loc = loc)
+	column_product: Tensor(T)
+	column_product, err = matmul(left, vector)
+	testing.expect_value(t, err, Tensor_Error.None, loc)
+	defer release(&column_product)
+	expect_shape(t, column_product.shape, []int{n})
+	expect_product_matches_naive(t, column_product.data, as_view(left), as_view(vector), loc = loc)
 }
 
 @(test)
 test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
 	// Sizes straddle the register tiles and the k blocks, leaving partial row
 	// and column tiles and a partial last block.
-	expect_matmul_matches_naive(t, f32, 5, 300, 37, false)
-	expect_matmul_matches_naive(t, f32, 5, 300, 37, true)
-	expect_matmul_matches_naive(t, f64, 7, 513, 19, false)
-	expect_matmul_matches_naive(t, i64, 4, 256, 16, true)
-	expect_matmul_matches_naive(t, i8, 3, 9, 70, false)
-	expect_matmul_matches_naive(t, f32, 1, 300, 37, false)
-	expect_matmul_matches_naive(t, f32, 6, 300, 1, false)
+	expect_matmul_matches_naive(t, f32, 5, 300, 37, false, false)
+	expect_matmul_matches_naive(t, f32, 5, 300, 37, false, true)
+	expect_matmul_matches_naive(t, f32, 5, 300, 37, true, false)
+	expect_matmul_matches_naive(t, f32, 6, 600, 33, true, true)
+	expect_matmul_matches_naive(t, f64, 7, 513, 19, false, false)
+	expect_matmul_matches_naive(t, f64, 3, 513, 7, false, false)
+	expect_matmul_matches_naive(t, i64, 4, 256, 16, false, true)
+	expect_matmul_matches_naive(t, i8, 3, 9, 70, false, false)
+	expect_matmul_matches_naive(t, f32, 1, 300, 37, false, false)
+	expect_matmul_matches_naive(t, f32, 6, 300, 1, false, false)
+	expect_matmul_matches_naive(t, f32, 8, 3, 40, false, false)
+	expect_vector_products_match_naive(t, f32, 600, 37)
+	expect_vector_products_match_naive(t, f64, 257, 8)
+}
+
+@(test)
+test_batched_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
+	m, k, n :: 3, 600, 21
+	a, err := new_tensor(f32, []int{2, m, k})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&a)
+	fill_product_operand(a.data, 0)
+	b: Tensor(f32)
+	b, err = new_tensor(f32, []int{k, n})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&b)
+	fill_product_operand(b.data, 3)
+
+	product: Tensor(f32)
+	product, err = matmul(a, b)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&product)
+	expect_shape(t, product.shape, []int{2, m, n})
+	a_shape, a_strides := [2]int{m, k}, [2]int{k, 1}
+	for batch in 0..<2 {
+		a_matrix := Tensor_View(f32){data = a.data, shape = a_shape[:], strides = a_strides[:], offset = batch*m*k}
+		expect_product_matches_naive(t, product.data[batch*m*n:][:m*n], a_matrix, as_view(b))
+	}
 }
 
 @(test)
