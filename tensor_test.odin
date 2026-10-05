@@ -399,7 +399,12 @@ test_reductions_over_several_axes :: proc(t: ^testing.T) {
 	last, err = sum_axes(values, []int{-1})
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&last)
-	expect_shape(t, last.shape, inner.shape)
+	third: Tensor(f64)
+	third, err = sum_axes(values, []int{2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&third)
+	expect_shape(t, last.shape, third.shape)
+	expect_f64_data(t, last.data, third.data)
 	expect_f64_data(t, last.data, inner.data)
 
 	// Every axis matches the whole-tensor reduction; no axes copies the source.
@@ -424,6 +429,11 @@ test_reductions_over_several_axes :: proc(t: ^testing.T) {
 	_, err = max_axes(values, []int{0, 3})
 	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
 	_, err = min_axes_views(as_view(values), []int{-4})
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+	// Every axis is bounds-checked before repeats, so the order does not matter.
+	_, err = sum_axes(values, []int{0, 0, 5})
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+	_, err = sum_axes(values, []int{5, 0, 0})
 	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
 
 	// A permuted view reduces along its own axes: view[k,i,j] = values[i,j,k].
@@ -465,6 +475,12 @@ test_reductions_over_several_axes :: proc(t: ^testing.T) {
 	defer release(&kept)
 	testing.expect_value(t, max_axes_into(&kept, values, []int{0, 2}, true), Tensor_Error.None)
 	expect_f64_data(t, kept.data, []f64{15, 19, 23})
+	copied: Tensor(f64)
+	copied, err = new_tensor(f64, []int{2, 3, 4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&copied)
+	testing.expect_value(t, mean_axes_into(&copied, values, []int{}), Tensor_Error.None)
+	expect_f64_data(t, copied.data, counting[:])
 
 	// Wrong output shapes, bad axes, and overlapping outputs are rejected without writing.
 	testing.expect_value(t, sum_axes_into(&kept, values, []int{0, 2}), Tensor_Error.Shape_Mismatch)
@@ -497,6 +513,47 @@ test_reductions_over_several_axes :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&nothing_kept)
 	expect_shape(t, nothing_kept.shape, []int{0})
+	empty_products: Tensor(f64)
+	empty_products, err = prod_axes(empty, []int{1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_products)
+	expect_f64_data(t, empty_products.data, []f64{1, 1, 1, 1, 1, 1})
+
+	// A rank-zero source has no axes to reduce.
+	scalar: Tensor(f64)
+	scalar, err = from_slice(f64, []f64{5}, []int{})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&scalar)
+	scalar_copy: Tensor(f64)
+	scalar_copy, err = sum_axes(scalar, []int{})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&scalar_copy)
+	expect_shape(t, scalar_copy.shape, []int{})
+	expect_f64_data(t, scalar_copy.data, []f64{5})
+	_, err = sum_axes(scalar, []int{0})
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+	_, err = max_axes(scalar, []int{-1})
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+
+	// A NaN anywhere in a block wins for max and min, including across rows.
+	for position in 0..<4 {
+		grid := []f64{1, 2, 3, 4}
+		grid[position] = math.nan_f64()
+		source: Tensor(f64)
+		source, err = from_slice(f64, grid, []int{2, 2})
+		testing.expect_value(t, err, Tensor_Error.None)
+		largest_nan: Tensor(f64)
+		largest_nan, err = max_axes(source, []int{0, 1})
+		testing.expect_value(t, err, Tensor_Error.None)
+		testing.expectf(t, math.is_nan(largest_nan.data[0]), "max_axes with NaN at %d gave %v", position, largest_nan.data[0])
+		smallest_nan: Tensor(f64)
+		smallest_nan, err = min_axes(source, []int{1, 0})
+		testing.expect_value(t, err, Tensor_Error.None)
+		testing.expectf(t, math.is_nan(smallest_nan.data[0]), "min_axes with NaN at %d gave %v", position, smallest_nan.data[0])
+		release(&largest_nan)
+		release(&smallest_nan)
+		release(&source)
+	}
 
 	// Integer sums accumulate in the element type.
 	integers: Tensor(i32)
@@ -508,6 +565,36 @@ test_reductions_over_several_axes :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&integer_sums)
 	expect_i32_data(t, integer_sums.data, []i32{16, 20})
+	integer_products: Tensor(i32)
+	integer_products, err = prod_axes(integers, []int{0, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&integer_products)
+	expect_i32_data(t, integer_products.data, []i32{60, 672})
+	integer_max: Tensor(i32)
+	integer_max, err = max_axes(integers, []int{0, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&integer_max)
+	expect_i32_data(t, integer_max.data, []i32{6, 8})
+	integer_min: Tensor(i32)
+	integer_min, err = min_axes(integers, []int{2, 0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&integer_min)
+	expect_i32_data(t, integer_min.data, []i32{1, 3})
+
+	// prod_axes has the same _views, _into, and _views_into forms.
+	product_view: Tensor(i32)
+	product_view, err = prod_axes_views(as_view(integers), []int{1, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&product_view)
+	expect_i32_data(t, product_view.data, []i32{24, 1680})
+	product_output: Tensor(i32)
+	product_output, err = new_tensor(i32, []int{2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&product_output)
+	testing.expect_value(t, prod_axes_into(&product_output, integers, []int{0, 1}), Tensor_Error.None)
+	expect_i32_data(t, product_output.data, []i32{105, 384})
+	testing.expect_value(t, prod_axes_views_into(&product_output, as_view(integers), []int{-1, 0}), Tensor_Error.None)
+	expect_i32_data(t, product_output.data, []i32{60, 672})
 }
 
 @(test)
