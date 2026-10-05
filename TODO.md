@@ -20,7 +20,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
 
 - [x] **Check the README examples automatically.** Add a script that extracts each ```` ```odin ```` block from `README.md`, builds it against the library, and fails on a compile error.
   - Done when: the script fails after a deliberate typo in an example, and passes on the current README.
-- [ ] **Put the repo under git with CI.** Initialise git and add a CI job that runs the test command above plus the README check.
+- [x] **Put the repo under git with CI.** Initialise git and add a CI job that runs the test command above plus the README check.
   - Done when: a pushed commit with a failing test turns CI red.
 
 ## Reductions
