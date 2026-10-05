@@ -37,6 +37,8 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when tests cover: shape `[2,3,4]` over axes `{0,2}` gives shape `[3]` and matches nested `sum_axis` calls; `{0,0}` gives `.Invalid_Shape`; `{-1}` equals `{2}`.
 - [x] **Pairwise summation for floats** in `sum`/`mean`, as NumPy does.
   - Done when tests cover: the f32 sum of 10⁷ copies of `0.1` is within 1e-3 relative of 10⁶ (naive summation is off by about 10%); integer sums are unchanged.
+- [ ] **Pairwise squared deviations in `var`/`std`.** The mean pass is already pairwise; the sum of squared deviations still adds in order. NumPy sums both pairwise.
+  - Done when: the f32 `var_all` of 10⁷ elements alternating `0.9` and `1.1` is within 1e-3 relative of 0.01 (adding in order gives about 0.00957); the README no longer lists this as a difference from NumPy.
 
 ## Products
 
