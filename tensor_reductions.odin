@@ -625,10 +625,13 @@ argmin_all_views :: proc(source: Tensor_View($T), allocator := context.allocator
 
 // _fold_view aggregates the count elements of a validated view. Sums start
 // from zero and products from one; max/min require count > 0. Rows of the view
-// are folded with a fixed step, then combined.
+// are folded with a fixed step, then combined. A contiguous view is one row.
 _fold_view :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_Operation) -> T {
 	row := _row_length(source.shape)
 	step := _inner_step(source, source.shape)
+	if _is_contiguous_view(source) {
+		row, step = count, 1
+	}
 	when operation == .Sum || operation == .Mean {
 		value := _sum_rows(source, 0, count/row if row > 0 else 0, row, step)
 		when operation == .Mean {
