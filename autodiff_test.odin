@@ -873,10 +873,68 @@ test_tape_batched_matmul_matches_finite_differences :: proc(t: ^testing.T) {
 	check_tape_helper(t, .Matmul, values, []int{2, 2, 3}, values[:6], []int{3, 2})
 	// a's leading batch axis of size 1 broadcasts, so its gradient sums both batches.
 	check_tape_helper(t, .Matmul, values[:6], []int{1, 2, 3}, values, []int{2, 3, 2})
-	// Batch axes broadcast on both sides, and vectors promote as in rank two.
+	// Batch axes broadcast on both sides.
 	check_tape_helper(t, .Matmul, values, []int{2, 1, 2, 3}, values[:6], []int{2, 3, 1})
+	// A rank-two a broadcasts against b's batch axes.
+	check_tape_helper(t, .Matmul, values[:6], []int{2, 3}, values, []int{2, 1, 3, 2})
+	// Vectors promote as in rank two.
 	check_tape_helper(t, .Matmul, values[:3], []int{3}, values, []int{2, 3, 2})
 	check_tape_helper(t, .Matmul, values, []int{2, 2, 3}, values[:3], []int{3})
+}
+
+@(test)
+test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) {
+	storage, err := from_slice(f64, []f64{0.3, -1.2, 0.8, 1.5, -0.4, 0.9, 0.7, -0.5, 1.3, -0.2, 1.1, 0.6}, []int{2, 2, 3})
+	testing.expect(t, err == .None)
+	defer release(&storage)
+	shape_buffer, strides_buffer := [3]int{}, [3]int{}
+	// permuted is storage with each batch's matrix transposed: shape {2, 3, 2}, strides {6, 1, 3}.
+	permuted, view_err := permute_view(as_view(storage), []int{0, 2, 1}, shape_buffer[:], strides_buffer[:])
+	testing.expect(t, view_err == .None)
+	contiguous: Tensor(f64)
+	contiguous, err = copy_view(permuted)
+	testing.expect(t, err == .None)
+	defer release(&contiguous)
+	b: Tensor(f64)
+	b, err = from_slice(f64, []f64{2, -1, 0.5, 3}, []int{2, 2})
+	testing.expect(t, err == .None)
+	defer release(&b)
+	seed: Tensor(f64)
+	seed, err = new_tensor(f64, []int{2, 3, 2})
+	testing.expect(t, err == .None)
+	defer release(&seed)
+	for &value, i in seed.data {
+		value = 1 + math.sin(f64(i))
+	}
+
+	view_tape, view_tape_err := tape_init(f64)
+	testing.expect(t, view_tape_err == .None)
+	defer tape_release(&view_tape)
+	view_a, view_a_err := tape_add_leaf_view(&view_tape, permuted)
+	testing.expect(t, view_a_err == .None)
+	view_b, view_b_err := tape_add_leaf_borrow(&view_tape, &b)
+	testing.expect(t, view_b_err == .None)
+	view_product, view_product_err := tape_matmul(&view_tape, view_a, view_b)
+	testing.expect(t, view_product_err == .None)
+	testing.expect_value(t, tape_backward_with_seed(&view_tape, view_product, seed), Tensor_Error.None)
+
+	copy_tape, copy_tape_err := tape_init(f64)
+	testing.expect(t, copy_tape_err == .None)
+	defer tape_release(&copy_tape)
+	copy_a, copy_a_err := tape_add_leaf_borrow(&copy_tape, &contiguous)
+	testing.expect(t, copy_a_err == .None)
+	copy_b, copy_b_err := tape_add_leaf_borrow(&copy_tape, &b)
+	testing.expect(t, copy_b_err == .None)
+	copy_product, copy_product_err := tape_matmul(&copy_tape, copy_a, copy_b)
+	testing.expect(t, copy_product_err == .None)
+	testing.expect_value(t, tape_backward_with_seed(&copy_tape, copy_product, seed), Tensor_Error.None)
+
+	view_a_grad, _ := tape_gradient(&view_tape, view_a)
+	copy_a_grad, _ := tape_gradient(&copy_tape, copy_a)
+	expect_f64_data(t, view_a_grad.data, copy_a_grad.data)
+	view_b_grad, _ := tape_gradient(&view_tape, view_b)
+	copy_b_grad, _ := tape_gradient(&copy_tape, copy_b)
+	expect_f64_data(t, view_b_grad.data, copy_b_grad.data)
 }
 
 @(test)
