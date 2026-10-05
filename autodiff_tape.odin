@@ -17,6 +17,9 @@ Tape_Operation :: enum {
 	Relu,
 	Sigmoid,
 	Tanh,
+	Exp,
+	Log,
+	Sqrt,
 	Sum_All,
 	Mean_All,
 	Sum_Axis,
@@ -178,10 +181,12 @@ tape_add_leaf_copy :: proc(tape: ^Tape($T), value: Tensor_View(T), requires_grad
 	return result, .None
 }
 
-// tape_record_unary moves a ReLU, sigmoid, or tanh result onto the tape. Other
-// operations return Unsupported_Operation.
+// tape_record_unary moves a ReLU, sigmoid, tanh, exp, log, or sqrt result onto
+// the tape. Other operations return Unsupported_Operation.
 tape_record_unary :: proc(tape: ^Tape($T), output: ^Tensor(T), operation: Tape_Operation, parent: Tape_Value(T)) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
-	if operation != .Relu && operation != .Sigmoid && operation != .Tanh {
+	#partial switch operation {
+	case .Relu, .Sigmoid, .Tanh, .Exp, .Log, .Sqrt:
+	case:
 		return result, .Unsupported_Operation
 	}
 	return _tape_record_node(tape, output, operation, parent, {}, 1)

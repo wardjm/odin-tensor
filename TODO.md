@@ -51,7 +51,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
 
 ## Autodiff coverage
 
-- [ ] **`tape_exp`, `tape_log`, `tape_sqrt`.** Add the backward rules (exp: y; log: 1/x; sqrt: 1/(2y)).
+- [x] **`tape_exp`, `tape_log`, `tape_sqrt`.** Add the backward rules (exp: y; log: 1/x; sqrt: 1/(2y)).
   - Done when: `check_tape_helper` passes finite differences for each with positive inputs, and `log` of 0 gives an Inf gradient, not an error.
 - [ ] **`tape_max_axis` / `tape_max_all` (and min).** The gradient goes to the arg-max element, with ties going to the first index (matches `argmax`; PyTorch splits ties evenly, so record the choice in the README).
   - Done when tests cover: finite differences pass on inputs without ties, and the gradient of `[3,3]` is `[1,0]`.

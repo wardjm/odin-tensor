@@ -1425,10 +1425,13 @@ tape_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	activated := tanh_views(product_view, allocator) or_return
 	defer release(&activated)
 	activated_value := tape_record_unary(&tape, &activated, .Tanh, product_value) or_return
-	activated_view := tape_value(&tape, activated_value) or_return
-	means := mean_axis_views(activated_view, 1, false, allocator) or_return
+	exponential_value := tape_exp(&tape, activated_value) or_return
+	root_value := tape_sqrt(&tape, exponential_value) or_return
+	logged_value := tape_log(&tape, root_value) or_return
+	logged_view := tape_value(&tape, logged_value) or_return
+	means := mean_axis_views(logged_view, 1, false, allocator) or_return
 	defer release(&means)
-	means_value := tape_record_mean_axis(&tape, &means, activated_value, 1) or_return
+	means_value := tape_record_mean_axis(&tape, &means, logged_value, 1) or_return
 	means_view := tape_value(&tape, means_value) or_return
 	total := sum_all_views(means_view, allocator) or_return
 	defer release(&total)
@@ -1463,6 +1466,12 @@ apply_tape_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Ta
 		return tape_sigmoid(tape, a)
 	case .Tanh:
 		return tape_tanh(tape, a)
+	case .Exp:
+		return tape_exp(tape, a)
+	case .Log:
+		return tape_log(tape, a)
+	case .Sqrt:
+		return tape_sqrt(tape, a)
 	case .Sum_All:
 		return tape_sum_all(tape, a)
 	case .Mean_All:
@@ -1557,6 +1566,44 @@ test_every_tape_helper_matches_finite_differences :: proc(t: ^testing.T) {
 	for operation in ([]Tape_Operation{.Relu, .Sigmoid, .Tanh, .Sum_All, .Mean_All, .Sum_Axis, .Mean_Axis}) {
 		check_tape_helper(t, operation, matrix_values, []int{2, 3}, row_values, []int{3})
 	}
+	// log and sqrt are only differentiable for positive inputs.
+	positive_values := []f64{0.3, 1.2, 0.8, 1.5, 0.4, 2.9}
+	for operation in ([]Tape_Operation{.Exp, .Log, .Sqrt}) {
+		check_tape_helper(t, operation, positive_values, []int{2, 3}, row_values, []int{3})
+	}
+}
+
+@(test)
+test_tape_log_and_sqrt_of_zero_give_infinite_gradients :: proc(t: ^testing.T) {
+	x, err := from_slice(f64, []f64{0, 4}, []int{2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&x)
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer tape_release(&tape)
+
+	// d/dx log x = 1/x and d/dx sqrt x = 1/(2 sqrt x) are both 1/4 at x = 4.
+	for operation in ([]Tape_Operation{.Log, .Sqrt}) {
+		tape_reset(&tape)
+		x_value, x_err := tape_add_leaf_borrow(&tape, &x)
+		testing.expect_value(t, x_err, Tensor_Error.None)
+		y, y_err := apply_tape_helper(&tape, x_value, x_value, operation)
+		testing.expectf(t, y_err == .None, "%v: %v", operation, y_err)
+		loss, loss_err := tape_sum_all(&tape, y)
+		testing.expect_value(t, loss_err, Tensor_Error.None)
+		testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
+		x_grad, _ := tape_gradient(&tape, x_value)
+		testing.expectf(t, math.is_inf(x_grad.data[0], 1), "%v: gradient at 0 is %v, want +Inf", operation, x_grad.data[0])
+		testing.expectf(t, x_grad.data[1] == 0.25, "%v: gradient at 4 is %v, want 0.25", operation, x_grad.data[1])
+	}
+	// log(0) = -Inf is recorded as the forward value, not rejected.
+	tape_reset(&tape)
+	x_value, _ := tape_add_leaf_borrow(&tape, &x)
+	logged, logged_err := tape_log(&tape, x_value)
+	testing.expect_value(t, logged_err, Tensor_Error.None)
+	logged_view, _ := tape_value(&tape, logged)
+	testing.expect_value(t, logged_view.data[0], math.inf_f64(-1))
 }
 
 @(test)

@@ -92,7 +92,7 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			err = _backward_dot(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
 		case .Matmul:
 			err = _backward_matmul(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
-		case .Relu, .Sigmoid, .Tanh:
+		case .Relu, .Sigmoid, .Tanh, .Exp, .Log, .Sqrt:
 			err = _backward_activation(&scratch[a], scratch[node_id], tape.nodes[a].value, node.value, node.operation)
 		case .Sum_All:
 			err = _backward_sum_all(&scratch[a], scratch[node_id], tape.nodes[a].value)
@@ -229,11 +229,14 @@ _backward_mean_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input:
 	return .None
 }
 
-// _backward_activation applies the elementwise VJP for relu, sigmoid, or tanh.
-// Forward values stay on the tape: ReLU uses its input and sigmoid/tanh use
-// their outputs, avoiding a second transcendental evaluation.
+// _backward_activation applies the elementwise VJP for relu, sigmoid, tanh,
+// exp, log, or sqrt. Forward values stay on the tape: ReLU and log use their
+// input and the others use their outputs, avoiding a second transcendental
+// evaluation.
 _backward_activation :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input, output: Tensor_View(T), operation: Tape_Operation) -> Tensor_Error where intrinsics.type_is_float(T) {
-	if operation != .Relu && operation != .Sigmoid && operation != .Tanh {
+	#partial switch operation {
+	case .Relu, .Sigmoid, .Tanh, .Exp, .Log, .Sqrt:
+	case:
 		return .Unsupported_Operation
 	}
 	if !_shapes_match(input.shape, output.shape) || !_shapes_match(output.shape, output_grad.shape) {
@@ -259,6 +262,12 @@ _backward_activation :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), inpu
 		case .Tanh:
 			value := output.data[output_offset]
 			derivative = 1 - value*value
+		case .Exp:
+			derivative = output.data[output_offset]
+		case .Log:
+			derivative = 1 / input.data[input_offset]
+		case .Sqrt:
+			derivative = 1 / (2*output.data[output_offset])
 		}
 		gradient.data[linear] += output_grad.data[linear] * derivative
 	}
