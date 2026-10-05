@@ -2347,6 +2347,54 @@ test_float_sums_are_pairwise :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_float_sums_across_block_boundaries :: proc(t: ^testing.T) {
+	// Whole numbers sum exactly in f64, so any element dropped or added twice
+	// around the eight-lane blocks, their leftovers or a split shows up.
+	for count in ([]int{0, 1, 7, 8, 9, 15, 16, 17, 127, 128, 129, 255, 256, 257, 1000}) {
+		expected := f64(count*(count+1)/2)
+		values, err := new_tensor(f64, []int{count})
+		testing.expect_value(t, err, Tensor_Error.None)
+		defer release(&values)
+		for &value, i in values.data {
+			value = f64(i+1)
+		}
+		total: Tensor(f64)
+		total, err = sum_all(values)
+		testing.expect_value(t, err, Tensor_Error.None)
+		defer release(&total)
+		testing.expectf(t, total.data[0] == expected, "sum_all of %v: got %v, want %v", count, total.data[0], expected)
+		along_axis: Tensor(f64)
+		along_axis, err = sum_axis(values, 0)
+		testing.expect_value(t, err, Tensor_Error.None)
+		defer release(&along_axis)
+		testing.expectf(t, along_axis.data[0] == expected, "sum_axis of %v: got %v, want %v", count, along_axis.data[0], expected)
+		if count > 0 {
+			mean: Tensor(f64)
+			mean, err = mean_all(values)
+			testing.expect_value(t, err, Tensor_Error.None)
+			defer release(&mean)
+			testing.expectf(t, mean.data[0] == f64(count+1)/2, "mean_all of %v: got %v", count, mean.data[0])
+		}
+
+		// Axis 0 of [count, 3] walks each column with stride 3.
+		columns: Tensor(f64)
+		columns, err = new_tensor(f64, []int{count, 3})
+		testing.expect_value(t, err, Tensor_Error.None)
+		defer release(&columns)
+		for &value, i in columns.data {
+			value = f64(i/3+1)
+		}
+		column_totals: Tensor(f64)
+		column_totals, err = sum_axis(columns, 0)
+		testing.expect_value(t, err, Tensor_Error.None)
+		defer release(&column_totals)
+		for column in column_totals.data {
+			testing.expectf(t, column == expected, "strided sum of %v: got %v, want %v", count, column, expected)
+		}
+	}
+}
+
+@(test)
 test_zero_stride_broadcast_views_feed_every_operation :: proc(t: ^testing.T) {
 	row, err := from_slice(f64, []f64{1, 2, 3}, []int{3})
 	testing.expect(t, err == .None)
