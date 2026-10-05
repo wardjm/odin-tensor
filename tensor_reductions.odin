@@ -194,10 +194,10 @@ mean_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator :
 prod_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views(as_view(source), axis, .Prod, keep_dims, allocator)
 }
-max_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+max_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views(as_view(source), axis, .Max, keep_dims, allocator)
 }
-min_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+min_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views(as_view(source), axis, .Min, keep_dims, allocator)
 }
 
@@ -210,10 +210,10 @@ mean_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, 
 prod_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views(source, axis, .Prod, keep_dims, allocator)
 }
-max_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+max_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views(source, axis, .Max, keep_dims, allocator)
 }
-min_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+min_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views(source, axis, .Min, keep_dims, allocator)
 }
 
@@ -226,10 +226,10 @@ mean_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_d
 prod_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views_into(output, as_view(source), axis, .Prod, keep_dims)
 }
-max_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+max_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views_into(output, as_view(source), axis, .Max, keep_dims)
 }
-min_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+min_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views_into(output, as_view(source), axis, .Min, keep_dims)
 }
 
@@ -242,10 +242,10 @@ mean_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: 
 prod_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views_into(output, source, axis, .Prod, keep_dims)
 }
-max_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+max_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views_into(output, source, axis, .Max, keep_dims)
 }
-min_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+min_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_axis_views_into(output, source, axis, .Min, keep_dims)
 }
 
@@ -293,7 +293,11 @@ _arg_reduce_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T
 // _arg_is_better reports whether element should replace best in an argmax
 // (.Max) or argmin (.Min) scan. A NaN element always replaces a number.
 _arg_is_better :: #force_inline proc(element, best: $T, $operation: _Reduction_Operation) -> bool {
-	is_better := element > best if operation == .Max else element < best
+	when operation == .Max {
+		is_better := element > best
+	} else {
+		is_better := element < best
+	}
 	when intrinsics.type_is_float(T) {
 		is_better = is_better || element != element
 	}
@@ -319,31 +323,31 @@ _arg_reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _
 // element along one axis as a Tensor(int). A negative axis counts from the end,
 // and keep_dims is NumPy's keepdims. Ties pick the first index, a NaN wins, and
 // an empty axis returns Empty_Reduction.
-argmax_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmax_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views(as_view(source), axis, .Max, keep_dims, allocator)
 }
-argmin_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmin_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views(as_view(source), axis, .Min, keep_dims, allocator)
 }
 
-argmax_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmax_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views(source, axis, .Max, keep_dims, allocator)
 }
-argmin_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmin_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views(source, axis, .Min, keep_dims, allocator)
 }
 
-argmax_axis_into :: proc(output: ^Tensor(int), source: Tensor($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+argmax_axis_into :: proc(output: ^Tensor(int), source: Tensor($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views_into(output, as_view(source), axis, .Max, keep_dims)
 }
-argmin_axis_into :: proc(output: ^Tensor(int), source: Tensor($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+argmin_axis_into :: proc(output: ^Tensor(int), source: Tensor($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views_into(output, as_view(source), axis, .Min, keep_dims)
 }
 
-argmax_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+argmax_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views_into(output, source, axis, .Max, keep_dims)
 }
-argmin_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+argmin_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views_into(output, source, axis, .Min, keep_dims)
 }
 
@@ -386,17 +390,17 @@ _arg_reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Op
 // smallest element as a rank-zero Tensor(int). For a view the index follows the
 // view's logical order, not its storage. Ties pick the first index, a NaN wins,
 // and an empty source returns Empty_Reduction.
-argmax_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmax_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_all_views(as_view(source), .Max, allocator)
 }
-argmin_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmin_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_all_views(as_view(source), .Min, allocator)
 }
 
-argmax_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmax_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_all_views(source, .Max, allocator)
 }
-argmin_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_numeric(T) {
+argmin_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_all_views(source, .Min, allocator)
 }
 
@@ -456,10 +460,10 @@ mean_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(
 prod_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(as_view(source), .Prod, allocator)
 }
-max_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+max_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_all_views(as_view(source), .Max, allocator)
 }
-min_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+min_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_all_views(as_view(source), .Min, allocator)
 }
 
@@ -472,10 +476,10 @@ mean_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) 
 prod_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(source, .Prod, allocator)
 }
-max_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+max_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_all_views(source, .Max, allocator)
 }
-min_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+min_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_all_views(source, .Min, allocator)
 }
 
@@ -501,8 +505,8 @@ _variance_run :: #force_inline proc(data: []$T, offset, step, count, ddof: int, 
 
 // _variance_axis_views_into writes the variance (or, with take_sqrt, the
 // standard deviation) along axis into an exactly shaped, contiguous output.
-// ddof >= the axis length returns Empty_Reduction. Output must not overlap
-// source; an overlap returns Aliased_Output.
+// An empty axis, or ddof >= its length, returns Empty_Reduction. Output must
+// not overlap source; an overlap returns Aliased_Output.
 _variance_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis, ddof: int, $take_sqrt: bool, keep_dims := false) -> Tensor_Error {
 	_validate_view(source) or_return
 	reduced_axis := _normalize_axis(axis, len(source.shape)) or_return
@@ -513,7 +517,7 @@ _variance_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), a
 		return .Aliased_Output
 	}
 	reduced_count := source.shape[reduced_axis]
-	if reduced_count <= ddof {
+	if reduced_count == 0 || reduced_count <= ddof {
 		return .Empty_Reduction
 	}
 	inner := _reduction_inner_count(source.shape, reduced_axis)
@@ -530,7 +534,7 @@ _variance_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), a
 _variance_axis_views :: proc(source: Tensor_View($T), axis, ddof: int, $take_sqrt: bool, keep_dims := false, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
 	normalized := _normalize_axis(axis, len(source.shape)) or_return
-	if source.shape[normalized] <= ddof {
+	if source.shape[normalized] == 0 || source.shape[normalized] <= ddof {
 		return result, .Empty_Reduction
 	}
 	shape_buffer: [MAX_RANK]int
@@ -543,8 +547,8 @@ _variance_axis_views :: proc(source: Tensor_View($T), axis, ddof: int, $take_sqr
 
 // var_axis and std_axis return the variance and standard deviation along one
 // axis, dividing by n-ddof as in NumPy. A negative axis counts from the end,
-// and keep_dims is NumPy's keepdims. ddof >= n returns Empty_Reduction. Both
-// require a floating-point type.
+// and keep_dims is NumPy's keepdims. n == 0 or ddof >= n returns
+// Empty_Reduction. Both require a floating-point type.
 var_axis :: proc(source: Tensor($T), axis: int, ddof := 0, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _variance_axis_views(as_view(source), axis, ddof, false, keep_dims, allocator)
 }
@@ -574,13 +578,13 @@ std_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: i
 }
 
 // _variance_all_views returns the variance (or, with take_sqrt, the standard
-// deviation) of every element as a rank-zero tensor. ddof >= the element count
-// returns Empty_Reduction. Rows are folded with a fixed step in two passes: one
+// deviation) of every element as a rank-zero tensor. An empty source, or ddof
+// >= the element count, returns Empty_Reduction. Rows are folded with a fixed step in two passes: one
 // for the mean, one for the squared deviations.
 _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
 	count, _ := _element_count(source.shape)
-	if count <= ddof {
+	if count == 0 || count <= ddof {
 		return result, .Empty_Reduction
 	}
 	result = new_tensor(T, []int{}, allocator) or_return
@@ -609,8 +613,8 @@ _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool
 }
 
 // var_all and std_all return the variance and standard deviation of every
-// element as a rank-zero tensor, dividing by n-ddof as in NumPy. ddof >= n
-// returns Empty_Reduction. Both require a floating-point type.
+// element as a rank-zero tensor, dividing by n-ddof as in NumPy. n == 0 or
+// ddof >= n returns Empty_Reduction. Both require a floating-point type.
 var_all :: proc(source: Tensor($T), ddof := 0, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _variance_all_views(as_view(source), ddof, false, allocator)
 }

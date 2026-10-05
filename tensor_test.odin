@@ -253,6 +253,12 @@ test_variance_and_standard_deviation :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&column_deviations)
 	expect_f32_close(t, column_deviations.data, []f32{1, 2})
+	sample_columns: Tensor(f32)
+	sample_columns, err = var_axis(grid, 0, ddof = 1, keep_dims = true)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&sample_columns)
+	expect_shape(t, sample_columns.shape, []int{1, 2})
+	expect_f32_close(t, sample_columns.data, []f32{2, 8})
 
 	// A transposed view reduces along its own rows, which are the columns.
 	transposed_shape, transposed_strides := [2]int{}, [2]int{}
@@ -303,12 +309,41 @@ test_variance_and_standard_deviation :: proc(t: ^testing.T) {
 	_, err = var_axis(grid, 0, ddof = 2)
 	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
 	testing.expect_value(t, std_axis_into(&output, grid, 1, 2), Tensor_Error.Empty_Reduction)
+	_, err = var_axis_views(transposed, 0, ddof = 2)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	_, err = std_all_views(transposed, ddof = 4)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	testing.expect_value(t, var_axis_views_into(&output, transposed, 1, 2), Tensor_Error.Empty_Reduction)
+
+	// A negative ddof divides by more than n, as in NumPy: 5/(4+1) = 1.
+	widened: Tensor(f64)
+	widened, err = var_all(values, ddof = -1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&widened)
+	expect_f64_data(t, widened.data, []f64{1})
 	empty: Tensor(f64)
 	empty, err = new_tensor(f64, []int{0})
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&empty)
 	_, err = var_all(empty)
 	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	// An empty reduction is an error even when a negative ddof would leave
+	// degrees of freedom.
+	_, err = var_all(empty, ddof = -1)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	_, err = std_all_views(as_view(empty), ddof = -1)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	empty_rows: Tensor(f64)
+	empty_rows, err = new_tensor(f64, []int{2, 0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_rows)
+	_, err = var_axis(empty_rows, 1, ddof = -1)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	empty_output: Tensor(f64)
+	empty_output, err = new_tensor(f64, []int{2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_output)
+	testing.expect_value(t, std_axis_into(&empty_output, empty_rows, 1, -1), Tensor_Error.Empty_Reduction)
 
 	_, err = var_axis(grid, 2)
 	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
@@ -1086,6 +1121,16 @@ expect_f32_close :: proc(t: ^testing.T, actual, expected: []f32, tolerance: f32 
 	}
 }
 
+expect_int_data :: proc(t: ^testing.T, actual, expected: []int) {
+	testing.expect_value(t, len(actual), len(expected))
+	if len(actual) != len(expected) {
+		return
+	}
+	for i in 0..<len(expected) {
+		testing.expect_value(t, actual[i], expected[i])
+	}
+}
+
 expect_shape :: proc(t: ^testing.T, actual, expected: []int) {
 	testing.expectf(t, _shapes_match(actual, expected), "shape %v, want %v", actual, expected)
 }
@@ -1726,16 +1771,6 @@ test_axis_reduction_view_and_into_variants :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
 	testing.expect_value(t, sum_axis_into(&rows, empty, 1), Tensor_Error.None)
 	expect_f64_data(t, rows.data, []f64{0, 0})
-}
-
-expect_int_data :: proc(t: ^testing.T, actual, expected: []int) {
-	testing.expect_value(t, len(actual), len(expected))
-	if len(actual) != len(expected) {
-		return
-	}
-	for i in 0..<len(expected) {
-		testing.expect_value(t, actual[i], expected[i])
-	}
 }
 
 @(test)

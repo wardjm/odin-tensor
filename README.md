@@ -121,9 +121,9 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 `sum_axis`, `mean_axis`, `prod_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `prod_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero and its product is one; mean/max/min of an empty reduction return `.Empty_Reduction`. Integer sums and products accumulate in the element type and wrap on overflow, so the product of seven `i8` 2s is -128.
 
-`var_axis` and `std_axis` take `(source, axis, ddof, keep_dims, allocator)` and `var_all` and `std_all` take `(source, ddof, allocator)`, with the same `_views` and `_into` forms. They divide by `n - ddof` (`ddof` defaults to 0, as in NumPy) and return `.Empty_Reduction` when `ddof >= n`. The variance is computed in two passes, the mean first and then the squared deviations, so it does not lose precision when the mean is large compared with the spread.
+`var_axis` and `std_axis` take `(source, axis, ddof, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `var_all` and `std_all` take `(source, ddof, allocator)` and come in `_views` forms. They divide by `n - ddof` (`ddof` defaults to 0, as in NumPy) and return `.Empty_Reduction` when `n` is 0 or `ddof >= n`. The variance is computed in two passes, the mean first and then the squared deviations, so it does not lose precision when the mean is large compared with the spread.
 
-`argmax_axis` and `argmin_axis` take the same arguments as `sum_axis`, come in `_views`, `_into`, and `_views_into` forms (the output is a `Tensor(int)`), and return a `Tensor(int)` of indices along the axis. Ties pick the first index and the first NaN wins, as in NumPy; an empty axis returns `.Empty_Reduction`.
+`argmax_axis` and `argmin_axis` take the same arguments as `sum_axis`, come in `_views`, `_into`, and `_views_into` forms (the output is a `Tensor(int)`), and return a `Tensor(int)` of indices along the axis. Ties pick the first index and the first NaN wins, as in NumPy; an empty axis returns `.Empty_Reduction`. `max`, `min`, `argmax`, and `argmin` need an ordered element type, so complex tensors do not compile.
 
 `argmax_all` and `argmin_all` take `(source, allocator)`, come in `_views` forms, and return the flat row-major index as a rank-zero `Tensor(int)`. For a view the index follows the view's logical order, so a transposed view counts along its own rows, not its storage. Ties and NaN behave as for the axis forms; an empty tensor returns `.Empty_Reduction`.
 
@@ -193,7 +193,7 @@ main :: proc() {
 - **Handles.** A `Tape_Value` is an id, not a pointer, so a `Tape` can be moved freely. Every call takes the tape explicitly. A handle from another tape, or from before `tape_reset`/`tape_release`, returns `.Invalid_Tape`.
 - **Lifetime.** The tape grows as needed (`tape_init(T, reserve)` preallocates). `tape_reset` releases every node but keeps the storage, for rebuilding the graph each training step.
 
-Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, and slicing or broadcasting views (broadcasting inside `tape_add` etc. is differentiable).
+Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, `prod`, `var`/`std`, and slicing or broadcasting views (broadcasting inside `tape_add` etc. is differentiable).
 
 ## Limitations
 
