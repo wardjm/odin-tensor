@@ -44,7 +44,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
 
 - [x] **Batched `matmul`.** Leading dimensions broadcast, as in `np.matmul`; the last two axes multiply.
   - Done when tests cover: `[2,3,4] @ [4,5]` gives `[2,3,5]` and equals two 2-D matmuls; `[2,1,3,4] @ [5,4,2]` gives `[2,5,3,2]`; mismatched batch dimensions give `.Shape_Mismatch`; the `_into` overlap rules still hold.
-- [ ] **Batched `matmul` in autodiff.**
+- [x] **Batched `matmul` in autodiff.**
   - Done when: `check_tape_helper(.Matmul, …)` passes finite differences with a `[2,2,3] @ [3,2]` case.
 - [ ] **Cache-block large `matmul`.**
   - Done when: existing product tests pass unchanged, and `odin run bench -o:speed` reports PASS for `matmul_into 512` (2× faster than its 17.6 ms baseline).

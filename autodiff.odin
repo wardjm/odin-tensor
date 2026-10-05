@@ -35,8 +35,9 @@ tape_div :: proc(tape: ^Tape($T), a, b: Tape_Value(T)) -> (Tape_Value(T), Tensor
 	return _tape_binary(tape, a, b, .Div)
 }
 
-// tape_dot and tape_matmul follow dot's rank-one/rank-two rules; batched
-// (rank > 2) operands return Invalid_Shape.
+// tape_dot follows dot's rank-one/rank-two rules; batched (rank > 2) operands
+// return Invalid_Shape. tape_matmul follows matmul, including broadcast batch
+// axes, whose gradients sum over the batches each operand was broadcast to.
 tape_dot :: proc(tape: ^Tape($T), a, b: Tape_Value(T)) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _tape_binary(tape, a, b, .Dot)
 }
@@ -87,10 +88,10 @@ _tape_binary :: proc(tape: ^Tape($T), a, b: Tape_Value(T), operation: Tape_Opera
 		output = mul_views(a_view, b_view, tape.allocator) or_return
 	case .Div:
 		output = div_views(a_view, b_view, tape.allocator) or_return
-	case .Dot, .Matmul:
-		// dot rejects batched operands before computing anything; on ranks 1-2
-		// it equals matmul. Batched matmul has no reverse rule yet.
+	case .Dot:
 		output = dot_views(a_view, b_view, tape.allocator) or_return
+	case .Matmul:
+		output = matmul_views(a_view, b_view, tape.allocator) or_return
 	case:
 		return result, .Unsupported_Operation
 	}

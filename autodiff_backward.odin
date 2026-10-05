@@ -88,8 +88,10 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		switch node.operation {
 		case .Add, .Sub, .Mul, .Div:
 			err = _backward_binary_elementwise(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.operation)
-		case .Dot, .Matmul:
-			err = _backward_dot(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.operation)
+		case .Dot:
+			err = _backward_dot(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
+		case .Matmul:
+			err = _backward_matmul(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
 		case .Relu, .Sigmoid, .Tanh:
 			err = _backward_activation(&scratch[a], scratch[node_id], tape.nodes[a].value, node.value, node.operation)
 		case .Sum_All:
@@ -307,11 +309,8 @@ _backward_binary_elementwise :: proc(grad_a, grad_b: ^Tensor($T), output_grad: T
 }
 
 // _backward_dot applies vector/vector, matrix/vector, vector/matrix, or
-// matrix/matrix product reverse rules, shared by dot and matmul.
-_backward_dot :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a, b: Tensor_View(T), operation: Tape_Operation) -> Tensor_Error where intrinsics.type_is_float(T) {
-	if operation != .Dot && operation != .Matmul {
-		return .Unsupported_Operation
-	}
+// matrix/matrix product reverse rules.
+_backward_dot :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a, b: Tensor_View(T)) -> Tensor_Error where intrinsics.type_is_float(T) {
 	if err := _validate_dot_view(a); err != .None {
 		return err
 	}
@@ -326,63 +325,101 @@ _backward_dot :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a, b:
 	if !_shapes_match(output_grad.shape, shape_buffer[:result_rank]) {
 		return .Shape_Mismatch
 	}
+	return _backward_matrix_product(grad_a.data, grad_b.data, output_grad.data, a, b)
+}
 
+// _backward_matmul applies the matrix product rule once per batch index. A
+// batch axis an operand was broadcast along maps several batches onto one
+// slice of its gradient, so their contributions sum there.
+_backward_matmul :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a, b: Tensor_View(T)) -> Tensor_Error where intrinsics.type_is_float(T) {
+	if err := _validate_autodiff_view(a); err != .None {
+		return err
+	}
+	if err := _validate_autodiff_view(b); err != .None {
+		return err
+	}
+	shape_buffer: [MAX_RANK]int
+	result_rank, shape_err := _matmul_result_shape(a.shape, b.shape, shape_buffer[:])
+	if shape_err != .None {
+		return shape_err
+	}
+	if !_shapes_match(output_grad.shape, shape_buffer[:result_rank]) {
+		return .Shape_Mismatch
+	}
+	a_batch_rank := max(len(a.shape)-2, 0)
+	b_batch_rank := max(len(b.shape)-2, 0)
+	batch_shape := shape_buffer[:max(a_batch_rank, b_batch_rank)]
+	batch_count, _ := _element_count(batch_shape)
+	if batch_count == 0 {
+		return .None
+	}
+	a_batch := Tensor_View(T){data = a.data, shape = a.shape[:a_batch_rank], strides = a.strides[:a_batch_rank], offset = a.offset}
+	b_batch := Tensor_View(T){data = b.data, shape = b.shape[:b_batch_rank], strides = b.strides[:b_batch_rank], offset = b.offset}
+	a_matrix := Tensor_View(T){data = a.data, shape = a.shape[a_batch_rank:], strides = a.strides[a_batch_rank:]}
+	b_matrix := Tensor_View(T){data = b.data, shape = b.shape[b_batch_rank:], strides = b.strides[b_batch_rank:]}
+	a_matrix_size, _ := _element_count(a_matrix.shape)
+	b_matrix_size, _ := _element_count(b_matrix.shape)
+	output_matrix_size := len(output_grad.data) / batch_count
+	for batch in 0..<batch_count {
+		a_matrix.offset = _broadcast_offset(a_batch, batch_shape, batch)
+		b_matrix.offset = _broadcast_offset(b_batch, batch_shape, batch)
+		a_grad, b_grad: []T
+		if grad_a.data != nil {
+			a_index, ok := _broadcast_gradient_index(a_batch.shape, batch_shape, batch)
+			if !ok {
+				return .Invalid_Shape
+			}
+			a_grad = grad_a.data[a_index*a_matrix_size:][:a_matrix_size]
+		}
+		if grad_b.data != nil {
+			b_index, ok := _broadcast_gradient_index(b_batch.shape, batch_shape, batch)
+			if !ok {
+				return .Invalid_Shape
+			}
+			b_grad = grad_b.data[b_index*b_matrix_size:][:b_matrix_size]
+		}
+		upstream := output_grad.data[batch*output_matrix_size:][:output_matrix_size]
+		_backward_matrix_product(a_grad, b_grad, upstream, a_matrix, b_matrix) or_return
+	}
+	return .None
+}
+
+// _backward_matrix_product accumulates one rank-one/rank-two product's
+// gradients into contiguous grad_a and grad_b (nil when not tracked). A vector
+// a is a single row and a vector b a single column, as in the forward kernel.
+_backward_matrix_product :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T)) -> Tensor_Error {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	inner_count := a.shape[a_rank-1]
-	m, n := 1, 1
-	if a_rank == 2 {
-		m = a.shape[0]
-	}
-	if b_rank == 2 {
-		n = b.shape[1]
-	}
+	m := a.shape[0] if a_rank == 2 else 1
+	n := b.shape[1] if b_rank == 2 else 1
+	a_row_stride := a.strides[0] if a_rank == 2 else 0
+	b_column_stride := b.strides[1] if b_rank == 2 else 0
 	for i in 0..<m {
 		for j in 0..<n {
-			if output_grad.data == nil {
+			upstream_index := i*n + j
+			if upstream_index >= len(upstream) {
 				return .Invalid_Shape
 			}
-			upstream_index := 0
-			if a_rank == 2 && b_rank == 2 {
-				upstream_index = i*n+j
-			} else if a_rank == 2 {
-				upstream_index = i
-			} else if b_rank == 2 {
-				upstream_index = j
-			}
-			if upstream_index < 0 || upstream_index >= len(output_grad.data) {
-				return .Invalid_Shape
-			}
-			upstream := output_grad.data[upstream_index]
+			gradient := upstream[upstream_index]
 			for inner in 0..<inner_count {
-				a_offset := a.offset + inner*a.strides[a_rank-1]
-				if a_rank == 2 {
-					a_offset += i*a.strides[0]
-				}
-				b_offset := b.offset + inner*b.strides[0]
-				if b_rank == 2 {
-					b_offset += j*b.strides[1]
-				}
-				a_grad_index, b_grad_index := inner, inner
-				if a_rank == 2 {
-					a_grad_index = i*inner_count + inner
-				}
-				if b_rank == 2 {
-					b_grad_index = inner*n + j
-				}
+				a_offset := a.offset + i*a_row_stride + inner*a.strides[a_rank-1]
+				b_offset := b.offset + inner*b.strides[0] + j*b_column_stride
 				if a_offset < 0 || a_offset >= len(a.data) || b_offset < 0 || b_offset >= len(b.data) {
 					return .Out_Of_Bounds
 				}
-				if grad_a.data != nil {
-					if a_grad_index < 0 || a_grad_index >= len(grad_a.data) {
+				if grad_a != nil {
+					a_grad_index := i*inner_count + inner
+					if a_grad_index >= len(grad_a) {
 						return .Invalid_Shape
 					}
-					grad_a.data[a_grad_index] += upstream*b.data[b_offset]
+					grad_a[a_grad_index] += gradient*b.data[b_offset]
 				}
-				if grad_b.data != nil {
-					if b_grad_index < 0 || b_grad_index >= len(grad_b.data) {
+				if grad_b != nil {
+					b_grad_index := inner*n + j
+					if b_grad_index >= len(grad_b) {
 						return .Invalid_Shape
 					}
-					grad_b.data[b_grad_index] += upstream*a.data[a_offset]
+					grad_b[b_grad_index] += gradient*a.data[a_offset]
 				}
 			}
 		}

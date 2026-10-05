@@ -287,9 +287,15 @@ _tape_record_node :: proc(tape: ^Tape($T), output: ^Tensor(T), operation: Tape_O
 			if !_broadcast_shapes_match(a_shape, b_shape, output.shape) {
 				return result, .Shape_Mismatch
 			}
-		case .Dot, .Matmul:
+		case .Dot:
 			shape_buffer := [2]int{}
 			rank := _dot_result_shape(a_shape, b_shape, shape_buffer[:]) or_return
+			if !_shapes_match(output.shape, shape_buffer[:rank]) {
+				return result, .Shape_Mismatch
+			}
+		case .Matmul:
+			shape_buffer: [MAX_RANK]int
+			rank := _matmul_result_shape(a_shape, b_shape, shape_buffer[:]) or_return
 			if !_shapes_match(output.shape, shape_buffer[:rank]) {
 				return result, .Shape_Mismatch
 			}

@@ -868,7 +868,19 @@ test_tape_dot_and_matmul_reverse_rules :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_tape_matmul_rejects_batched_operands :: proc(t: ^testing.T) {
+test_tape_batched_matmul_matches_finite_differences :: proc(t: ^testing.T) {
+	values := []f64{0.3, -1.2, 0.8, 1.5, -0.4, 0.9, 0.7, -0.5, 1.3, -0.2, 1.1, 0.6}
+	check_tape_helper(t, .Matmul, values, []int{2, 2, 3}, values[:6], []int{3, 2})
+	// a's leading batch axis of size 1 broadcasts, so its gradient sums both batches.
+	check_tape_helper(t, .Matmul, values[:6], []int{1, 2, 3}, values, []int{2, 3, 2})
+	// Batch axes broadcast on both sides, and vectors promote as in rank two.
+	check_tape_helper(t, .Matmul, values, []int{2, 1, 2, 3}, values[:6], []int{2, 3, 1})
+	check_tape_helper(t, .Matmul, values[:3], []int{3}, values, []int{2, 3, 2})
+	check_tape_helper(t, .Matmul, values, []int{2, 2, 3}, values[:3], []int{3})
+}
+
+@(test)
+test_tape_dot_rejects_batched_operands :: proc(t: ^testing.T) {
 	a, err := new_tensor(f64, []int{2, 2, 3})
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&a)
@@ -885,8 +897,7 @@ test_tape_matmul_rejects_batched_operands :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.None)
 	bv, err = tape_add_leaf_borrow(&tape, &b)
 	testing.expect_value(t, err, Tensor_Error.None)
-	// matmul itself accepts these; the tape has no batched reverse rule yet.
-	_, err = tape_matmul(&tape, av, bv)
+	_, err = tape_dot(&tape, av, bv)
 	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
 }
 
