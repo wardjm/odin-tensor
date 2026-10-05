@@ -72,6 +72,7 @@ The directory name contains a hyphen, so the import needs an explicit name such 
 | `a += b` | `add_in_place(&a, b)` |
 | `a.sum(axis=-1, keepdims=True)` | `sum_axis(a, -1, true)` |
 | `a.prod(axis=0)` | `prod_axis(a, 0)` |
+| `a.sum(axis=(0, 2))` | `sum_axes(a, []int{0, 2})` |
 | `a.std(axis=0, ddof=1)` | `std_axis(a, 0, ddof = 1)` |
 | `a.max()` | `max_all(a)` (returns a rank-zero tensor) |
 | `a.argmax(axis=1)` | `argmax_axis(a, 1)` (returns a `Tensor(int)`) |
@@ -120,6 +121,8 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 ### Reductions
 
 `sum_axis`, `mean_axis`, `prod_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `prod_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero and its product is one; mean/max/min of an empty reduction return `.Empty_Reduction`. Integer sums and products accumulate in the element type and wrap on overflow, so the product of seven `i8` 2s is -128.
+
+`sum_axes`, `mean_axes`, `max_axes`, and `min_axes` reduce several axes at once and take `(source, axes, keep_dims, allocator)`, with the same `_views`, `_into`, and `_views_into` forms. Negative axes count from the end, a repeated axis returns `.Invalid_Shape`, and an out-of-range one `.Out_Of_Bounds`. An empty `axes` list reduces nothing and copies the source, as NumPy's `axis=()` does.
 
 `var_axis` and `std_axis` take `(source, axis, ddof, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `var_all` and `std_all` take `(source, ddof, allocator)` and come in `_views` forms. They divide by `n - ddof` (`ddof` defaults to 0, as in NumPy) and return `.Empty_Reduction` when `n` is 0 or `ddof >= n`. The variance is computed in two passes, the mean first and then the squared deviations, so it does not lose precision when the mean is large compared with the spread.
 

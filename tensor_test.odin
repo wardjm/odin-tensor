@@ -350,6 +350,167 @@ test_variance_and_standard_deviation :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_reductions_over_several_axes :: proc(t: ^testing.T) {
+	// values[i,j,k] = 12i + 4j + k over shape [2,3,4].
+	counting: [24]f64
+	for i in 0..<len(counting) {
+		counting[i] = f64(i)
+	}
+	values, err := from_slice(f64, counting[:], []int{2, 3, 4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&values)
+
+	// Over axes {0,2}: sum_{i,k} (12i + 4j + k) = 32j + 60.
+	sums: Tensor(f64)
+	sums, err = sum_axes(values, []int{0, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&sums)
+	expect_shape(t, sums.shape, []int{3})
+	expect_f64_data(t, sums.data, []f64{60, 92, 124})
+	inner: Tensor(f64)
+	inner, err = sum_axis(values, 2)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&inner)
+	nested: Tensor(f64)
+	nested, err = sum_axis(inner, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&nested)
+	expect_f64_data(t, sums.data, nested.data)
+
+	means: Tensor(f64)
+	means, err = mean_axes(values, []int{2, 0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&means)
+	expect_f64_data(t, means.data, []f64{7.5, 11.5, 15.5})
+	largest: Tensor(f64)
+	largest, err = max_axes(values, []int{0, 2}, true)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&largest)
+	expect_shape(t, largest.shape, []int{1, 3, 1})
+	expect_f64_data(t, largest.data, []f64{15, 19, 23})
+	smallest: Tensor(f64)
+	smallest, err = min_axes(values, []int{0, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&smallest)
+	expect_f64_data(t, smallest.data, []f64{0, 4, 8})
+
+	// A negative axis counts from the end, so {-1} is {2}.
+	last: Tensor(f64)
+	last, err = sum_axes(values, []int{-1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&last)
+	expect_shape(t, last.shape, inner.shape)
+	expect_f64_data(t, last.data, inner.data)
+
+	// Every axis matches the whole-tensor reduction; no axes copies the source.
+	everything: Tensor(f64)
+	everything, err = sum_axes(values, []int{2, 1, 0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&everything)
+	expect_shape(t, everything.shape, []int{})
+	expect_f64_data(t, everything.data, []f64{276})
+	nothing: Tensor(f64)
+	nothing, err = max_axes(values, []int{})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&nothing)
+	expect_shape(t, nothing.shape, []int{2, 3, 4})
+	expect_f64_data(t, nothing.data, counting[:])
+
+	// Repeated and out-of-range axes are errors.
+	_, err = sum_axes(values, []int{0, 0})
+	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
+	_, err = mean_axes(values, []int{2, -1})
+	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
+	_, err = max_axes(values, []int{0, 3})
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+	_, err = min_axes_views(as_view(values), []int{-4})
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+
+	// A permuted view reduces along its own axes: view[k,i,j] = values[i,j,k].
+	permuted_shape, permuted_strides := [3]int{}, [3]int{}
+	permuted, view_err := permute_view(as_view(values), []int{2, 0, 1}, permuted_shape[:], permuted_strides[:])
+	testing.expect_value(t, view_err, Tensor_Error.None)
+	permuted_sums: Tensor(f64)
+	permuted_sums, err = sum_axes_views(permuted, []int{0, 1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&permuted_sums)
+	expect_f64_data(t, permuted_sums.data, []f64{60, 92, 124})
+	permuted_max: Tensor(f64)
+	permuted_max, err = max_axes_views(permuted, []int{1, 2}, true)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&permuted_max)
+	expect_shape(t, permuted_max.shape, []int{4, 1, 1})
+	expect_f64_data(t, permuted_max.data, []f64{20, 21, 22, 23})
+	permuted_mean: Tensor(f64)
+	permuted_mean, err = mean_axes_views(permuted, []int{0, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&permuted_mean)
+	expect_f64_data(t, permuted_mean.data, []f64{5.5, 17.5})
+
+	output: Tensor(f64)
+	output, err = new_tensor(f64, []int{3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&output)
+	testing.expect_value(t, sum_axes_into(&output, values, []int{0, -1}), Tensor_Error.None)
+	expect_f64_data(t, output.data, []f64{60, 92, 124})
+	testing.expect_value(t, mean_axes_into(&output, values, []int{0, 2}), Tensor_Error.None)
+	expect_f64_data(t, output.data, []f64{7.5, 11.5, 15.5})
+	testing.expect_value(t, min_axes_views_into(&output, permuted, []int{0, 1}), Tensor_Error.None)
+	expect_f64_data(t, output.data, []f64{0, 4, 8})
+	testing.expect_value(t, max_axes_views_into(&output, permuted, []int{1, 0}), Tensor_Error.None)
+	expect_f64_data(t, output.data, []f64{15, 19, 23})
+	kept: Tensor(f64)
+	kept, err = new_tensor(f64, []int{1, 3, 1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&kept)
+	testing.expect_value(t, max_axes_into(&kept, values, []int{0, 2}, true), Tensor_Error.None)
+	expect_f64_data(t, kept.data, []f64{15, 19, 23})
+
+	// Wrong output shapes, bad axes, and overlapping outputs are rejected without writing.
+	testing.expect_value(t, sum_axes_into(&kept, values, []int{0, 2}), Tensor_Error.Shape_Mismatch)
+	testing.expect_value(t, sum_axes_into(&output, values, []int{0, 2}, true), Tensor_Error.Shape_Mismatch)
+	testing.expect_value(t, sum_axes_into(&output, values, []int{1}), Tensor_Error.Shape_Mismatch)
+	testing.expect_value(t, sum_axes_into(&output, values, []int{0, 0}), Tensor_Error.Invalid_Shape)
+	testing.expect_value(t, sum_axes_views_into(&output, permuted, []int{3}), Tensor_Error.Out_Of_Bounds)
+	folded := Tensor_View(f64){data = output.data, shape = []int{3, 1, 1}, strides = []int{1, 1, 1}}
+	testing.expect_value(t, sum_axes_views_into(&output, folded, []int{1, 2}), Tensor_Error.Aliased_Output)
+	expect_f64_data(t, output.data, []f64{15, 19, 23})
+
+	// Empty reductions follow the single-axis forms.
+	empty: Tensor(f64)
+	empty, err = new_tensor(f64, []int{2, 0, 3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty)
+	empty_sums: Tensor(f64)
+	empty_sums, err = sum_axes(empty, []int{1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_sums)
+	expect_shape(t, empty_sums.shape, []int{2, 3})
+	expect_f64_data(t, empty_sums.data, []f64{0, 0, 0, 0, 0, 0})
+	_, err = mean_axes(empty, []int{0, 1})
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	_, err = max_axes_views(as_view(empty), []int{1})
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	testing.expect_value(t, min_axes_into(&output, empty, []int{0, 1}), Tensor_Error.Empty_Reduction)
+	nothing_kept: Tensor(f64)
+	nothing_kept, err = max_axes(empty, []int{0, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&nothing_kept)
+	expect_shape(t, nothing_kept.shape, []int{0})
+
+	// Integer sums accumulate in the element type.
+	integers: Tensor(i32)
+	integers, err = from_slice(i32, []i32{1, 2, 3, 4, 5, 6, 7, 8}, []int{2, 2, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&integers)
+	integer_sums: Tensor(i32)
+	integer_sums, err = sum_axes(integers, []int{0, 1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&integer_sums)
+	expect_i32_data(t, integer_sums.data, []i32{16, 20})
+}
+
+@(test)
 test_dot_vector_and_matrix_semantics :: proc(t: ^testing.T) {
 	vector, err := from_slice(f32, []f32{1, 2, 3}, []int{3})
 	testing.expect(t, err == .None)
@@ -1214,6 +1375,14 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&variance_total)
 	deviation_total := std_all(a, 1, allocator) or_return
 	defer release(&deviation_total)
+	plane_sums := sum_axes(a, []int{0, 1}, true, allocator) or_return
+	defer release(&plane_sums)
+	column_means := mean_axes_views(as_view(a), []int{0}, false, allocator) or_return
+	defer release(&column_means)
+	row_max := max_axes(a, []int{-1}, false, allocator) or_return
+	defer release(&row_max)
+	smallest_total := min_axes_views(as_view(a), []int{1, 0}, false, allocator) or_return
+	defer release(&smallest_total)
 	return .None
 }
 

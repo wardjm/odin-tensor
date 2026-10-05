@@ -5,8 +5,8 @@ package tensor
 import "base:intrinsics"
 import "core:math"
 
-// _Reduction_Operation selects the aggregation used by _reduce_axis_views* and
-// _reduce_all_views*.
+// _Reduction_Operation selects the aggregation used by _reduce_axis_views*,
+// _reduce_axes_views*, and _reduce_all_views*.
 _Reduction_Operation :: enum {
 	Sum,
 	Mean,
@@ -249,6 +249,164 @@ min_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: i
 	return _reduce_axis_views_into(output, source, axis, .Min, keep_dims)
 }
 
+// _reduced_axes_mask marks each axis in axes, normalizing negative ones. An
+// out-of-range axis returns Out_Of_Bounds and a repeated one Invalid_Shape.
+_reduced_axes_mask :: proc(axes: []int, rank: int) -> (mask: [MAX_RANK]bool, err: Tensor_Error) {
+	for axis in axes {
+		normalized := _normalize_axis(axis, rank) or_return
+		if mask[normalized] {
+			return mask, .Invalid_Shape
+		}
+		mask[normalized] = true
+	}
+	return mask, .None
+}
+
+// _reduced_axes_shape writes the shape of a reduction over the masked axes into
+// buffer.
+_reduced_axes_shape :: proc(shape: []int, mask: ^[MAX_RANK]bool, keep_dims: bool, buffer: []int) -> []int {
+	rank := 0
+	for dim, axis in shape {
+		if mask[axis] && !keep_dims {
+			continue
+		}
+		buffer[rank] = 1 if mask[axis] else dim
+		rank += 1
+	}
+	return buffer[:rank]
+}
+
+// _reduced_axes_count is the number of source elements folded into each output
+// element of a reduction over the masked axes.
+_reduced_axes_count :: proc(shape: []int, mask: ^[MAX_RANK]bool) -> int {
+	count := 1
+	for dim, axis in shape {
+		if mask[axis] {
+			count *= dim
+		}
+	}
+	return count
+}
+
+// _reduce_axes_views_into reduces source over every axis in axes into an
+// exactly shaped, contiguous output. Negative axes count from the end; a
+// repeated axis returns Invalid_Shape. keep_dims retains each reduced
+// dimension as a singleton. Output must not overlap source; an overlap returns
+// Aliased_Output.
+_reduce_axes_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axes: []int, $operation: _Reduction_Operation, keep_dims := false) -> Tensor_Error {
+	_validate_view(source) or_return
+	mask := _reduced_axes_mask(axes, len(source.shape)) or_return
+	shape_buffer: [MAX_RANK]int
+	if _validate_output(output^) != .None || !_shapes_match(output.shape, _reduced_axes_shape(source.shape, &mask, keep_dims, shape_buffer[:])) {
+		return .Shape_Mismatch
+	}
+	if _output_overlaps_view(output^, source) {
+		return .Aliased_Output
+	}
+
+	// Split the source into a view over the kept axes, which addresses the
+	// start of each output's block, and a view over the reduced axes, which
+	// walks that block.
+	kept_shape, kept_strides, reduced_shape, reduced_strides: [MAX_RANK]int
+	kept_rank, reduced_rank := 0, 0
+	for dim, axis in source.shape {
+		if mask[axis] {
+			reduced_shape[reduced_rank], reduced_strides[reduced_rank] = dim, source.strides[axis]
+			reduced_rank += 1
+		} else {
+			kept_shape[kept_rank], kept_strides[kept_rank] = dim, source.strides[axis]
+			kept_rank += 1
+		}
+	}
+	kept := Tensor_View(T){data = source.data, shape = kept_shape[:kept_rank], strides = kept_strides[:kept_rank], offset = source.offset}
+	reduced := Tensor_View(T){data = source.data, shape = reduced_shape[:reduced_rank], strides = reduced_strides[:reduced_rank]}
+	reduced_count, _ := _element_count(reduced.shape)
+	when operation != .Sum && operation != .Prod {
+		if reduced_count == 0 {
+			return .Empty_Reduction
+		}
+	}
+	for output_index in 0..<len(output.data) {
+		reduced.offset = _broadcast_offset(kept, kept.shape, output_index)
+		output.data[output_index] = _fold_view(reduced, reduced_count, operation)
+	}
+	return .None
+}
+
+// _reduce_axes_views returns a contiguous tensor reduced over every axis in axes.
+_reduce_axes_views :: proc(source: Tensor_View($T), axes: []int, $operation: _Reduction_Operation, keep_dims := false, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
+	_validate_view(source) or_return
+	mask := _reduced_axes_mask(axes, len(source.shape)) or_return
+	when operation != .Sum && operation != .Prod {
+		if _reduced_axes_count(source.shape, &mask) == 0 {
+			return result, .Empty_Reduction
+		}
+	}
+	shape_buffer: [MAX_RANK]int
+	result = new_tensor(T, _reduced_axes_shape(source.shape, &mask, keep_dims, shape_buffer[:]), allocator) or_return
+	if err = _reduce_axes_views_into(&result, source, axes, operation, keep_dims); err != .None {
+		release(&result)
+	}
+	return
+}
+
+// sum_axes, mean_axes, max_axes, and min_axes reduce over several axes at once,
+// like NumPy's axis=(0, 2). Negative axes count from the end; a repeated axis
+// returns Invalid_Shape and an out-of-range one Out_Of_Bounds. An empty axes
+// list reduces nothing and copies the source. Empty reductions follow the
+// single-axis forms.
+sum_axes :: proc(source: Tensor($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _reduce_axes_views(as_view(source), axes, .Sum, keep_dims, allocator)
+}
+mean_axes :: proc(source: Tensor($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _reduce_axes_views(as_view(source), axes, .Mean, keep_dims, allocator)
+}
+max_axes :: proc(source: Tensor($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views(as_view(source), axes, .Max, keep_dims, allocator)
+}
+min_axes :: proc(source: Tensor($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views(as_view(source), axes, .Min, keep_dims, allocator)
+}
+
+sum_axes_views :: proc(source: Tensor_View($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _reduce_axes_views(source, axes, .Sum, keep_dims, allocator)
+}
+mean_axes_views :: proc(source: Tensor_View($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _reduce_axes_views(source, axes, .Mean, keep_dims, allocator)
+}
+max_axes_views :: proc(source: Tensor_View($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views(source, axes, .Max, keep_dims, allocator)
+}
+min_axes_views :: proc(source: Tensor_View($T), axes: []int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views(source, axes, .Min, keep_dims, allocator)
+}
+
+sum_axes_into :: proc(output: ^Tensor($T), source: Tensor(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _reduce_axes_views_into(output, as_view(source), axes, .Sum, keep_dims)
+}
+mean_axes_into :: proc(output: ^Tensor($T), source: Tensor(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
+	return _reduce_axes_views_into(output, as_view(source), axes, .Mean, keep_dims)
+}
+max_axes_into :: proc(output: ^Tensor($T), source: Tensor(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views_into(output, as_view(source), axes, .Max, keep_dims)
+}
+min_axes_into :: proc(output: ^Tensor($T), source: Tensor(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views_into(output, as_view(source), axes, .Min, keep_dims)
+}
+
+sum_axes_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _reduce_axes_views_into(output, source, axes, .Sum, keep_dims)
+}
+mean_axes_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
+	return _reduce_axes_views_into(output, source, axes, .Mean, keep_dims)
+}
+max_axes_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views_into(output, source, axes, .Max, keep_dims)
+}
+min_axes_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axes: []int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_ordered_numeric(T) {
+	return _reduce_axes_views_into(output, source, axes, .Min, keep_dims)
+}
+
 // _arg_reduce_axis_views_into writes the index of the largest (.Max) or
 // smallest (.Min) element along axis into an exactly shaped, contiguous output.
 // Ties pick the first index and the first NaN wins, as in NumPy. Output must
@@ -404,25 +562,10 @@ argmin_all_views :: proc(source: Tensor_View($T), allocator := context.allocator
 	return _arg_reduce_all_views(source, .Min, allocator)
 }
 
-// _reduce_all_views aggregates every element into a new rank-zero tensor.
-// Summing an empty tensor yields zero and its product one; mean/max/min return
-// Empty_Reduction.
-// Rows of the source are folded with a fixed step, then combined.
-_reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operation, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
-	_validate_view(source) or_return
-	count, _ := _element_count(source.shape)
-	when operation != .Sum && operation != .Prod {
-		if count == 0 {
-			return result, .Empty_Reduction
-		}
-	}
-	result = new_tensor(T, []int{}, allocator) or_return
-	if count == 0 {
-		when operation == .Prod {
-			result.data[0] = 1
-		}
-		return result, .None
-	}
+// _fold_view aggregates the count elements of a validated view. Sums start
+// from zero and products from one; max/min require count > 0. Rows of the view
+// are folded with a fixed step, then combined.
+_fold_view :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_Operation) -> T {
 	row := _row_length(source.shape)
 	step := _inner_step(source, source.shape)
 	when operation == .Sum || operation == .Mean {
@@ -444,7 +587,22 @@ _reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operat
 			value = _combine(value, _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, operation), operation)
 		}
 	}
-	result.data[0] = value
+	return value
+}
+
+// _reduce_all_views aggregates every element into a new rank-zero tensor.
+// Summing an empty tensor yields zero and its product one; mean/max/min return
+// Empty_Reduction.
+_reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operation, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
+	_validate_view(source) or_return
+	count, _ := _element_count(source.shape)
+	when operation != .Sum && operation != .Prod {
+		if count == 0 {
+			return result, .Empty_Reduction
+		}
+	}
+	result = new_tensor(T, []int{}, allocator) or_return
+	result.data[0] = _fold_view(source, count, operation)
 	return result, .None
 }
 
