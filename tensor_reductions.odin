@@ -638,28 +638,36 @@ argmin_all_views :: proc(source: Tensor_View($T), allocator := context.allocator
 // from zero and products from one; max/min require count > 0. Rows of the view
 // are folded with a fixed step, then combined. A contiguous view is one row.
 _fold_view :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_Operation) -> T {
-	row := _row_length(source.shape)
-	step := _inner_step(source, source.shape)
-	if _is_contiguous_view(source) {
-		row, step = count, 1
-	}
+	row, row_count, step := _fold_layout(source, count)
 	when operation == .Sum || operation == .Mean {
-		value := _sum_rows(source, 0, count/row if row > 0 else 0, row, step, 0, false)
+		value := _sum_rows(source, 0, row_count, row, step, 0, false)
 		when operation == .Mean {
 			value /= T(count)
 		}
 	} else when operation == .Prod {
 		value: T = 1
-		for start := 0; start < count; start += row {
-			value *= _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, .Prod)
+		for r in 0..<row_count {
+			value *= _reduce_run(source.data, _broadcast_offset(source, source.shape, r*row), step, row, .Prod)
 		}
 	} else {
 		value := _reduce_run(source.data, source.offset, step, row, operation)
-		for start := row; start < count; start += row {
-			value = _combine(value, _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, operation), operation)
+		for r in 1..<row_count {
+			value = _combine(value, _reduce_run(source.data, _broadcast_offset(source, source.shape, r*row), step, row, operation), operation)
 		}
 	}
 	return value
+}
+
+// _fold_layout splits the count elements of a validated view into row_count
+// rows of row elements, each advancing by step. A contiguous view is one row.
+_fold_layout :: proc(source: Tensor_View($T), count: int) -> (row, row_count, step: int) {
+	row = _row_length(source.shape)
+	step = _inner_step(source, source.shape)
+	if _is_contiguous_view(source) {
+		row, step = count, 1
+	}
+	row_count = count/row if row > 0 else 0
+	return
 }
 
 // _sum_rows adds row_count rows of a validated view, starting at first_row. For
@@ -836,12 +844,8 @@ _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool
 	}
 	result = new_tensor(T, []int{}, allocator) or_return
 	mean := _fold_view(source, count, .Mean)
-	row := _row_length(source.shape)
-	step := _inner_step(source, source.shape)
-	if _is_contiguous_view(source) {
-		row, step = count, 1
-	}
-	squares := _sum_rows(source, 0, count/row, row, step, mean, true)
+	row, row_count, step := _fold_layout(source, count)
+	squares := _sum_rows(source, 0, row_count, row, step, mean, true)
 	value := squares / T(count-ddof)
 	when take_sqrt {
 		value = math.sqrt(value)

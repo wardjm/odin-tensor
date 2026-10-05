@@ -2301,6 +2301,14 @@ test_float_sums_are_pairwise :: proc(t: ^testing.T) {
 	expect_near(t, along_axis.data[0], 1e6)
 
 	// Many short rows: the rows are combined pairwise too, not just each row.
+	short_rows := Tensor_View(f32){data = values.data, shape = []int{COUNT/4, 2}, strides = []int{4, 1}}
+	short_rows_total: Tensor(f32)
+	short_rows_total, err = sum_all_views(short_rows)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&short_rows_total)
+	expect_near(t, short_rows_total.data[0], 5e5)
+
+	// A few long strided rows.
 	columns := Tensor_View(f32){data = values.data, shape = []int{COUNT/4, 4}, strides = []int{4, 1}}
 	shape_buffer, strides_buffer := [2]int{}, [2]int{}
 	rows, view_err := transpose_view(columns, shape_buffer[:], strides_buffer[:])
@@ -2379,6 +2387,15 @@ test_float_variances_are_pairwise :: proc(t: ^testing.T) {
 	expect_near(t, along_axis.data[0], 0.01)
 
 	// Many short rows: the rows are combined pairwise too, not just each row.
+	// Each row is one 0.9 and one 1.1.
+	short_rows := Tensor_View(f32){data = values.data, shape = []int{COUNT/4, 2}, strides = []int{4, 1}}
+	short_rows_variance: Tensor(f32)
+	short_rows_variance, err = var_all_views(short_rows)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&short_rows_variance)
+	expect_near(t, short_rows_variance.data[0], 0.01)
+
+	// A few long strided rows.
 	columns := Tensor_View(f32){data = values.data, shape = []int{COUNT/4, 4}, strides = []int{4, 1}}
 	shape_buffer, strides_buffer := [2]int{}, [2]int{}
 	rows, view_err := transpose_view(columns, shape_buffer[:], strides_buffer[:])
@@ -2388,6 +2405,16 @@ test_float_variances_are_pairwise :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&transposed_variance)
 	expect_near(t, transposed_variance.data[0], 0.01)
+
+	// A strided axis: with an odd stride each column still alternates.
+	fifths := Tensor_View(f32){data = values.data, shape = []int{COUNT/5, 5}, strides = []int{5, 1}}
+	strided_axis: Tensor(f32)
+	strided_axis, err = var_axis_views(fifths, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&strided_axis)
+	for column in strided_axis.data {
+		expect_near(t, column, 0.01)
+	}
 }
 
 @(test)
