@@ -31,7 +31,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when: a transposed view returns the index in the view's logical order, not the storage order.
 - [x] **`prod_axis` / `prod_all`.** The product of an empty reduction is 1.
   - Done when tests cover: `[[1,2],[3,4]]` gives `[3,8]` (axis 0) and 24 (all); an empty input gives 1; i8 overflow wraps (documented).
-- [ ] **`var_axis` / `std_axis` / `var_all` / `std_all`.** Floats only, with a `ddof := 0` parameter.
+- [x] **`var_axis` / `std_axis` / `var_all` / `std_all`.** Floats only, with a `ddof := 0` parameter.
   - Done when tests cover: `[1,2,3,4]` gives var 1.25 and std √1.25; `ddof=1` gives 5/3; `ddof >= count` gives `.Empty_Reduction`.
 - [ ] **Reduce over several axes.** Add `sum_axes(source, axes: []int, keep_dims)` and the same for mean, max and min. Repeated or out-of-range axes are an error.
   - Done when tests cover: shape `[2,3,4]` over axes `{0,2}` gives shape `[3]` and matches nested `sum_axis` calls; `{0,0}` gives `.Invalid_Shape`; `{-1}` equals `{2}`.

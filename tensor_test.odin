@@ -202,6 +202,119 @@ test_products_along_an_axis_and_over_all_elements :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_variance_and_standard_deviation :: proc(t: ^testing.T) {
+	values, err := from_slice(f64, []f64{1, 2, 3, 4}, []int{4})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&values)
+
+	variance: Tensor(f64)
+	variance, err = var_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&variance)
+	expect_shape(t, variance.shape, []int{})
+	expect_f64_data(t, variance.data, []f64{1.25})
+	deviation: Tensor(f64)
+	deviation, err = std_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&deviation)
+	expect_f64_data(t, deviation.data, []f64{math.sqrt(f64(1.25))})
+	sample_variance: Tensor(f64)
+	sample_variance, err = var_all(values, ddof = 1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&sample_variance)
+	expect_f64_data(t, sample_variance.data, []f64{5.0 / 3.0})
+
+	axis_variance: Tensor(f64)
+	axis_variance, err = var_axis(values, -1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&axis_variance)
+	expect_shape(t, axis_variance.shape, []int{})
+	expect_f64_data(t, axis_variance.data, []f64{1.25})
+	axis_deviation: Tensor(f64)
+	axis_deviation, err = std_axis(values, 0, ddof = 1, keep_dims = true)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&axis_deviation)
+	expect_shape(t, axis_deviation.shape, []int{1})
+	expect_f64_data(t, axis_deviation.data, []f64{math.sqrt(f64(5.0) / 3.0)})
+
+	// [[1,2],[3,6]]: columns [1,3] and [2,6] have variance 1 and 4; rows [1,2]
+	// and [3,6] have variance 0.25 and 2.25.
+	grid: Tensor(f32)
+	grid, err = from_slice(f32, []f32{1, 2, 3, 6}, []int{2, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&grid)
+	columns: Tensor(f32)
+	columns, err = var_axis(grid, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&columns)
+	expect_f32_close(t, columns.data, []f32{1, 4})
+	column_deviations: Tensor(f32)
+	column_deviations, err = std_axis(grid, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&column_deviations)
+	expect_f32_close(t, column_deviations.data, []f32{1, 2})
+
+	// A transposed view reduces along its own rows, which are the columns.
+	transposed_shape, transposed_strides := [2]int{}, [2]int{}
+	transposed, view_err := transpose_view(as_view(grid), transposed_shape[:], transposed_strides[:])
+	testing.expect_value(t, view_err, Tensor_Error.None)
+	transposed_rows: Tensor(f32)
+	transposed_rows, err = var_axis_views(transposed, 1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_rows)
+	expect_f32_close(t, transposed_rows.data, []f32{1, 4})
+	transposed_deviations: Tensor(f32)
+	transposed_deviations, err = std_axis_views(transposed, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_deviations)
+	expect_f32_close(t, transposed_deviations.data, []f32{0.5, 1.5})
+
+	output: Tensor(f32)
+	output, err = new_tensor(f32, []int{2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&output)
+	testing.expect_value(t, var_axis_into(&output, grid, 1), Tensor_Error.None)
+	expect_f32_close(t, output.data, []f32{0.25, 2.25})
+	testing.expect_value(t, std_axis_into(&output, grid, 1, 1), Tensor_Error.None)
+	expect_f32_close(t, output.data, []f32{math.sqrt(f32(0.5)), math.sqrt(f32(4.5))})
+	testing.expect_value(t, var_axis_views_into(&output, transposed, 0), Tensor_Error.None)
+	expect_f32_close(t, output.data, []f32{0.25, 2.25})
+	testing.expect_value(t, std_axis_views_into(&output, transposed, 1), Tensor_Error.None)
+	expect_f32_close(t, output.data, []f32{1, 2})
+
+	// The whole-tensor forms follow the view's elements, whatever their order:
+	// the mean of [1,2,3,6] is 3, so the variance is (4+1+0+9)/4 = 3.5.
+	transposed_total: Tensor(f32)
+	transposed_total, err = var_all_views(transposed)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_total)
+	expect_f32_close(t, transposed_total.data, []f32{3.5})
+	transposed_total_deviation: Tensor(f32)
+	transposed_total_deviation, err = std_all_views(transposed, 1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_total_deviation)
+	expect_f32_close(t, transposed_total_deviation.data, []f32{math.sqrt(f32(14.0) / 3.0)})
+
+	// ddof must leave at least one degree of freedom.
+	_, err = var_all(values, ddof = 4)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	_, err = std_all(values, ddof = 5)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	_, err = var_axis(grid, 0, ddof = 2)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+	testing.expect_value(t, std_axis_into(&output, grid, 1, 2), Tensor_Error.Empty_Reduction)
+	empty: Tensor(f64)
+	empty, err = new_tensor(f64, []int{0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty)
+	_, err = var_all(empty)
+	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
+
+	_, err = var_axis(grid, 2)
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+}
+
+@(test)
 test_dot_vector_and_matrix_semantics :: proc(t: ^testing.T) {
 	vector, err := from_slice(f32, []f32{1, 2, 3}, []int{3})
 	testing.expect(t, err == .None)
@@ -963,6 +1076,16 @@ expect_f64_data :: proc(t: ^testing.T, actual, expected: []f64, tolerance: f64 =
 	}
 }
 
+expect_f32_close :: proc(t: ^testing.T, actual, expected: []f32, tolerance: f32 = 1e-6) {
+	testing.expect_value(t, len(actual), len(expected))
+	if len(actual) != len(expected) {
+		return
+	}
+	for i in 0..<len(expected) {
+		testing.expectf(t, abs(actual[i]-expected[i]) <= tolerance, "index %d: got %v, want %v", i, actual[i], expected[i])
+	}
+}
+
 expect_shape :: proc(t: ^testing.T, actual, expected: []int) {
 	testing.expectf(t, _shapes_match(actual, expected), "shape %v, want %v", actual, expected)
 }
@@ -1038,6 +1161,14 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&column_products)
 	product_total := prod_all(a, allocator) or_return
 	defer release(&product_total)
+	column_variances := var_axis_views(as_view(a), 0, 1, false, allocator) or_return
+	defer release(&column_variances)
+	row_deviations := std_axis(a, 1, 0, true, allocator) or_return
+	defer release(&row_deviations)
+	variance_total := var_all_views(as_view(a), 0, allocator) or_return
+	defer release(&variance_total)
+	deviation_total := std_all(a, 1, allocator) or_return
+	defer release(&deviation_total)
 	return .None
 }
 

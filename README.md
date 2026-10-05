@@ -72,6 +72,7 @@ The directory name contains a hyphen, so the import needs an explicit name such 
 | `a += b` | `add_in_place(&a, b)` |
 | `a.sum(axis=-1, keepdims=True)` | `sum_axis(a, -1, true)` |
 | `a.prod(axis=0)` | `prod_axis(a, 0)` |
+| `a.std(axis=0, ddof=1)` | `std_axis(a, 0, ddof = 1)` |
 | `a.max()` | `max_all(a)` (returns a rank-zero tensor) |
 | `a.argmax(axis=1)` | `argmax_axis(a, 1)` (returns a `Tensor(int)`) |
 | `a.argmax()` | `argmax_all(a)` (returns a rank-zero `Tensor(int)`) |
@@ -80,7 +81,7 @@ The directory name contains a hyphen, so the import needs an explicit name such 
 Differences to keep in mind:
 
 - Errors are values. Every fallible procedure returns a `Tensor_Error`; nothing panics on bad shapes.
-- Results never change type. `mean` is only defined for floating-point tensors (it is a compile error on integers), and integer `sum` and `prod` accumulate in `T`, so they wrap on overflow where NumPy would widen.
+- Results never change type. `mean`, `var`, and `std` are only defined for floating-point tensors (they are a compile error on integers), and integer `sum` and `prod` accumulate in `T`, so they wrap on overflow where NumPy would widen.
 - Integer division truncates and returns `.Division_By_Zero` for a zero divisor, and `.Integer_Overflow` for signed `min(T) / -1`. Float division follows IEEE rules like NumPy: `x/0` is ±Inf or NaN.
 - `max` and `min` propagate NaN, like `np.max`.
 - Views are explicit. A view never owns memory, and procedures that build one take caller-provided shape and stride buffers.
@@ -120,7 +121,9 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 `sum_axis`, `mean_axis`, `prod_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `prod_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero and its product is one; mean/max/min of an empty reduction return `.Empty_Reduction`. Integer sums and products accumulate in the element type and wrap on overflow, so the product of seven `i8` 2s is -128.
 
-`argmax_axis` and `argmin_axis` take the same arguments, come in `_views`, `_into`, and `_views_into` forms (the output is a `Tensor(int)`), and return a `Tensor(int)` of indices along the axis. Ties pick the first index and the first NaN wins, as in NumPy; an empty axis returns `.Empty_Reduction`.
+`var_axis` and `std_axis` take `(source, axis, ddof, keep_dims, allocator)` and `var_all` and `std_all` take `(source, ddof, allocator)`, with the same `_views` and `_into` forms. They divide by `n - ddof` (`ddof` defaults to 0, as in NumPy) and return `.Empty_Reduction` when `ddof >= n`. The variance is computed in two passes, the mean first and then the squared deviations, so it does not lose precision when the mean is large compared with the spread.
+
+`argmax_axis` and `argmin_axis` take the same arguments as `sum_axis`, come in `_views`, `_into`, and `_views_into` forms (the output is a `Tensor(int)`), and return a `Tensor(int)` of indices along the axis. Ties pick the first index and the first NaN wins, as in NumPy; an empty axis returns `.Empty_Reduction`.
 
 `argmax_all` and `argmin_all` take `(source, allocator)`, come in `_views` forms, and return the flat row-major index as a rank-zero `Tensor(int)`. For a view the index follows the view's logical order, so a transposed view counts along its own rows, not its storage. Ties and NaN behave as for the axis forms; an empty tensor returns `.Empty_Reduction`.
 
@@ -194,7 +197,7 @@ Not differentiable yet: `exp`, `log`, `sqrt`, `max`/`min`, and slicing or broadc
 
 ## Limitations
 
-- No batched (rank > 2) `matmul`, no `var`/`std`, and no multi-axis reductions.
+- No batched (rank > 2) `matmul` and no multi-axis reductions.
 - Kernels are straightforward loops: contiguous inputs take a direct path and strided inputs advance by row, but there is no SIMD tuning, cache blocking for large matrix products, or pairwise summation, so large float sums accumulate rounding error faster than NumPy's.
 
 ## Tests

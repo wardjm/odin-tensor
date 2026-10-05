@@ -3,6 +3,7 @@ package tensor
 // Axis and whole-tensor reductions.
 
 import "base:intrinsics"
+import "core:math"
 
 // _Reduction_Operation selects the aggregation used by _reduce_axis_views* and
 // _reduce_all_views*.
@@ -476,4 +477,150 @@ max_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -
 }
 min_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(source, .Min, allocator)
+}
+
+// _variance_run returns the variance of count elements starting at offset and
+// advancing by step, dividing by count-ddof. It takes the mean first, then sums
+// squared deviations, which avoids the cancellation of the one-pass formula.
+// take_sqrt returns the standard deviation instead.
+_variance_run :: #force_inline proc(data: []$T, offset, step, count, ddof: int, $take_sqrt: bool) -> T {
+	mean := _reduce_run(data, offset, step, count, .Mean)
+	offset := offset
+	squares: T = 0
+	for _ in 0..<count {
+		deviation := data[offset] - mean
+		squares += deviation * deviation
+		offset += step
+	}
+	value := squares / T(count-ddof)
+	when take_sqrt {
+		value = math.sqrt(value)
+	}
+	return value
+}
+
+// _variance_axis_views_into writes the variance (or, with take_sqrt, the
+// standard deviation) along axis into an exactly shaped, contiguous output.
+// ddof >= the axis length returns Empty_Reduction. Output must not overlap
+// source; an overlap returns Aliased_Output.
+_variance_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis, ddof: int, $take_sqrt: bool, keep_dims := false) -> Tensor_Error {
+	_validate_view(source) or_return
+	reduced_axis := _normalize_axis(axis, len(source.shape)) or_return
+	if !_reduction_shape_matches(output^, source.shape, reduced_axis, keep_dims) {
+		return .Shape_Mismatch
+	}
+	if _output_overlaps_view(output^, source) {
+		return .Aliased_Output
+	}
+	reduced_count := source.shape[reduced_axis]
+	if reduced_count <= ddof {
+		return .Empty_Reduction
+	}
+	inner := _reduction_inner_count(source.shape, reduced_axis)
+	reduced_stride := source.strides[reduced_axis]
+	for output_index in 0..<len(output.data) {
+		base_offset := _reduction_base_offset(source, reduced_axis, inner, output_index)
+		output.data[output_index] = _variance_run(source.data, base_offset, reduced_stride, reduced_count, ddof, take_sqrt)
+	}
+	return .None
+}
+
+// _variance_axis_views returns a new tensor of variances or standard deviations
+// along axis.
+_variance_axis_views :: proc(source: Tensor_View($T), axis, ddof: int, $take_sqrt: bool, keep_dims := false, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
+	_validate_view(source) or_return
+	normalized := _normalize_axis(axis, len(source.shape)) or_return
+	if source.shape[normalized] <= ddof {
+		return result, .Empty_Reduction
+	}
+	shape_buffer: [MAX_RANK]int
+	result = new_tensor(T, _reduced_shape(source.shape, normalized, keep_dims, shape_buffer[:]), allocator) or_return
+	if err = _variance_axis_views_into(&result, source, normalized, ddof, take_sqrt, keep_dims); err != .None {
+		release(&result)
+	}
+	return
+}
+
+// var_axis and std_axis return the variance and standard deviation along one
+// axis, dividing by n-ddof as in NumPy. A negative axis counts from the end,
+// and keep_dims is NumPy's keepdims. ddof >= n returns Empty_Reduction. Both
+// require a floating-point type.
+var_axis :: proc(source: Tensor($T), axis: int, ddof := 0, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_axis_views(as_view(source), axis, ddof, false, keep_dims, allocator)
+}
+std_axis :: proc(source: Tensor($T), axis: int, ddof := 0, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_axis_views(as_view(source), axis, ddof, true, keep_dims, allocator)
+}
+
+var_axis_views :: proc(source: Tensor_View($T), axis: int, ddof := 0, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_axis_views(source, axis, ddof, false, keep_dims, allocator)
+}
+std_axis_views :: proc(source: Tensor_View($T), axis: int, ddof := 0, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_axis_views(source, axis, ddof, true, keep_dims, allocator)
+}
+
+var_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, ddof := 0, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
+	return _variance_axis_views_into(output, as_view(source), axis, ddof, false, keep_dims)
+}
+std_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, ddof := 0, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
+	return _variance_axis_views_into(output, as_view(source), axis, ddof, true, keep_dims)
+}
+
+var_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, ddof := 0, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
+	return _variance_axis_views_into(output, source, axis, ddof, false, keep_dims)
+}
+std_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, ddof := 0, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
+	return _variance_axis_views_into(output, source, axis, ddof, true, keep_dims)
+}
+
+// _variance_all_views returns the variance (or, with take_sqrt, the standard
+// deviation) of every element as a rank-zero tensor. ddof >= the element count
+// returns Empty_Reduction. Rows are folded with a fixed step in two passes: one
+// for the mean, one for the squared deviations.
+_variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
+	_validate_view(source) or_return
+	count, _ := _element_count(source.shape)
+	if count <= ddof {
+		return result, .Empty_Reduction
+	}
+	result = new_tensor(T, []int{}, allocator) or_return
+	row := _row_length(source.shape)
+	step := _inner_step(source, source.shape)
+	total: T = 0
+	for start := 0; start < count; start += row {
+		total += _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, .Sum)
+	}
+	mean := total / T(count)
+	squares: T = 0
+	for start := 0; start < count; start += row {
+		offset := _broadcast_offset(source, source.shape, start)
+		for _ in 0..<row {
+			deviation := source.data[offset] - mean
+			squares += deviation * deviation
+			offset += step
+		}
+	}
+	value := squares / T(count-ddof)
+	when take_sqrt {
+		value = math.sqrt(value)
+	}
+	result.data[0] = value
+	return result, .None
+}
+
+// var_all and std_all return the variance and standard deviation of every
+// element as a rank-zero tensor, dividing by n-ddof as in NumPy. ddof >= n
+// returns Empty_Reduction. Both require a floating-point type.
+var_all :: proc(source: Tensor($T), ddof := 0, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_all_views(as_view(source), ddof, false, allocator)
+}
+std_all :: proc(source: Tensor($T), ddof := 0, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_all_views(as_view(source), ddof, true, allocator)
+}
+
+var_all_views :: proc(source: Tensor_View($T), ddof := 0, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_all_views(source, ddof, false, allocator)
+}
+std_all_views :: proc(source: Tensor_View($T), ddof := 0, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _variance_all_views(source, ddof, true, allocator)
 }
