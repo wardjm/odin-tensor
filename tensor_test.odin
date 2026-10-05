@@ -2347,6 +2347,50 @@ test_float_sums_are_pairwise :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_float_variances_are_pairwise :: proc(t: ^testing.T) {
+	// Every squared deviation of 0.9, 1.1, 0.9, ... is about 0.01. Adding ten
+	// million of them to an f32 accumulator one by one finishes about 4% low;
+	// summed pairwise they stay within rounding of the exact variance.
+	COUNT :: 10_000_000
+	values, err := new_tensor(f32, []int{COUNT})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&values)
+	for &value, i in values.data {
+		value = 0.9 if i % 2 == 0 else 1.1
+	}
+	expect_near :: proc(t: ^testing.T, actual: f32, expected: f64, location := #caller_location) {
+		testing.expectf(t, abs(f64(actual)-expected) <= 1e-3*expected, "got %v, want %v", actual, expected, loc = location)
+	}
+
+	variance: Tensor(f32)
+	variance, err = var_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&variance)
+	expect_near(t, variance.data[0], 0.01)
+	deviation: Tensor(f32)
+	deviation, err = std_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&deviation)
+	expect_near(t, deviation.data[0], 0.1)
+	along_axis: Tensor(f32)
+	along_axis, err = var_axis(values, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&along_axis)
+	expect_near(t, along_axis.data[0], 0.01)
+
+	// Many short rows: the rows are combined pairwise too, not just each row.
+	columns := Tensor_View(f32){data = values.data, shape = []int{COUNT/4, 4}, strides = []int{4, 1}}
+	shape_buffer, strides_buffer := [2]int{}, [2]int{}
+	rows, view_err := transpose_view(columns, shape_buffer[:], strides_buffer[:])
+	testing.expect_value(t, view_err, Tensor_Error.None)
+	transposed_variance: Tensor(f32)
+	transposed_variance, err = var_all_views(rows)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_variance)
+	expect_near(t, transposed_variance.data[0], 0.01)
+}
+
+@(test)
 test_float_sums_across_block_boundaries :: proc(t: ^testing.T) {
 	// Whole numbers sum exactly in f64, so any element dropped or added twice
 	// around the eight-lane blocks, their leftovers or a split shows up.

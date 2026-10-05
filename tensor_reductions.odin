@@ -42,7 +42,7 @@ _combine :: #force_inline proc(accumulator, element: $T, $operation: _Reduction_
 _reduce_run :: #force_inline proc(data: []$T, offset, step, count: int, $operation: _Reduction_Operation) -> T {
 	offset := offset
 	when (operation == .Sum || operation == .Mean) && intrinsics.type_is_float(T) {
-		value := _pairwise_sum(data, offset, step, count)
+		value := _pairwise_sum(data, offset, step, count, 0, false)
 	} else when operation == .Sum || operation == .Mean {
 		value: T = 0
 		for _ in 0..<count {
@@ -76,36 +76,47 @@ PAIRWISE_BLOCK :: 128
 // Runs longer than PAIRWISE_BLOCK are split in half and the halves summed
 // recursively, so rounding error grows with log(count) rather than count. Within
 // a block, eight interleaved accumulators keep each partial sum short, as
-// NumPy's pairwise_sum does.
-_pairwise_sum :: proc(data: []$T, offset, step, count: int) -> T {
+// NumPy's pairwise_sum does. With squared, it adds (element - center)² instead.
+_pairwise_sum :: proc(data: []$T, offset, step, count: int, center: T, $squared: bool) -> T {
 	if count < 8 {
 		value: T = 0
 		for i in 0..<count {
-			value += data[offset + i*step]
+			value += _pairwise_term(data[offset + i*step], center, squared)
 		}
 		return value
 	}
 	if count <= PAIRWISE_BLOCK {
 		partial: [8]T
 		for lane in 0..<8 {
-			partial[lane] = data[offset + lane*step]
+			partial[lane] = _pairwise_term(data[offset + lane*step], center, squared)
 		}
 		i := 8
 		for ; i <= count-8; i += 8 {
 			base := offset + i*step
 			for lane in 0..<8 {
-				partial[lane] += data[base + lane*step]
+				partial[lane] += _pairwise_term(data[base + lane*step], center, squared)
 			}
 		}
 		value := ((partial[0]+partial[1]) + (partial[2]+partial[3])) + ((partial[4]+partial[5]) + (partial[6]+partial[7]))
 		for ; i < count; i += 1 {
-			value += data[offset + i*step]
+			value += _pairwise_term(data[offset + i*step], center, squared)
 		}
 		return value
 	}
 	half := count/2
 	half -= half % 8
-	return _pairwise_sum(data, offset, step, half) + _pairwise_sum(data, offset + half*step, step, count-half)
+	return _pairwise_sum(data, offset, step, half, center, squared) + _pairwise_sum(data, offset + half*step, step, count-half, center, squared)
+}
+
+// _pairwise_term is the element _pairwise_sum adds: element itself, or with
+// squared, its squared deviation from center.
+_pairwise_term :: #force_inline proc(element, center: $T, $squared: bool) -> T {
+	when squared {
+		deviation := element - center
+		return deviation * deviation
+	} else {
+		return element
+	}
 }
 
 // _reduction_shape_matches validates an exactly shaped contiguous output.
@@ -633,7 +644,7 @@ _fold_view :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_O
 		row, step = count, 1
 	}
 	when operation == .Sum || operation == .Mean {
-		value := _sum_rows(source, 0, count/row if row > 0 else 0, row, step)
+		value := _sum_rows(source, 0, count/row if row > 0 else 0, row, step, 0, false)
 		when operation == .Mean {
 			value /= T(count)
 		}
@@ -653,17 +664,23 @@ _fold_view :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_O
 
 // _sum_rows adds row_count rows of a validated view, starting at first_row. For
 // floats the row sums are themselves combined pairwise, so a view of many short
-// rows keeps the accuracy of one long run.
-_sum_rows :: proc(source: Tensor_View($T), first_row, row_count, row, step: int) -> T {
+// rows keeps the accuracy of one long run. With squared (floats only), it adds
+// squared deviations from center instead, as _pairwise_sum does.
+_sum_rows :: proc(source: Tensor_View($T), first_row, row_count, row, step: int, center: T, $squared: bool) -> T {
 	when intrinsics.type_is_float(T) {
 		if row_count > 8 {
 			half := row_count/2
-			return _sum_rows(source, first_row, half, row, step) + _sum_rows(source, first_row+half, row_count-half, row, step)
+			return _sum_rows(source, first_row, half, row, step, center, squared) + _sum_rows(source, first_row+half, row_count-half, row, step, center, squared)
 		}
 	}
 	value: T = 0
 	for r in first_row..<first_row+row_count {
-		value += _reduce_run(source.data, _broadcast_offset(source, source.shape, r*row), step, row, .Sum)
+		offset := _broadcast_offset(source, source.shape, r*row)
+		when squared {
+			value += _pairwise_sum(source.data, offset, step, row, center, true)
+		} else {
+			value += _reduce_run(source.data, offset, step, row, .Sum)
+		}
 	}
 	return value
 }
@@ -722,16 +739,10 @@ min_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -
 // _variance_run returns the variance of count elements starting at offset and
 // advancing by step, dividing by count-ddof. It takes the mean first, then sums
 // squared deviations, which avoids the cancellation of the one-pass formula.
-// take_sqrt returns the standard deviation instead.
+// Both sums are pairwise. take_sqrt returns the standard deviation instead.
 _variance_run :: #force_inline proc(data: []$T, offset, step, count, ddof: int, $take_sqrt: bool) -> T {
 	mean := _reduce_run(data, offset, step, count, .Mean)
-	offset := offset
-	squares: T = 0
-	for _ in 0..<count {
-		deviation := data[offset] - mean
-		squares += deviation * deviation
-		offset += step
-	}
+	squares := _pairwise_sum(data, offset, step, count, mean, true)
 	value := squares / T(count-ddof)
 	when take_sqrt {
 		value = math.sqrt(value)
@@ -816,7 +827,7 @@ std_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: i
 // _variance_all_views returns the variance (or, with take_sqrt, the standard
 // deviation) of every element as a rank-zero tensor. An empty source, or ddof
 // >= the element count, returns Empty_Reduction. It makes two passes: a
-// pairwise mean, then a sum of squared deviations.
+// pairwise mean, then a pairwise sum of squared deviations.
 _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
 	count, _ := _element_count(source.shape)
@@ -827,15 +838,10 @@ _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool
 	mean := _fold_view(source, count, .Mean)
 	row := _row_length(source.shape)
 	step := _inner_step(source, source.shape)
-	squares: T = 0
-	for start := 0; start < count; start += row {
-		offset := _broadcast_offset(source, source.shape, start)
-		for _ in 0..<row {
-			deviation := source.data[offset] - mean
-			squares += deviation * deviation
-			offset += step
-		}
+	if _is_contiguous_view(source) {
+		row, step = count, 1
 	}
+	squares := _sum_rows(source, 0, count/row, row, step, mean, true)
 	value := squares / T(count-ddof)
 	when take_sqrt {
 		value = math.sqrt(value)
