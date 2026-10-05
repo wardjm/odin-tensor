@@ -1853,3 +1853,8 @@ test_shapes_above_max_rank_are_rejected :: proc(t: ^testing.T) {
 	_, err = copy_view(too_deep)
 	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
 }
+
+@(test)
+test_ci_should_fail :: proc(t: ^testing.T) {
+	testing.expect_value(t, 1 + 1, 3)
+}
