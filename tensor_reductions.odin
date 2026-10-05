@@ -9,6 +9,7 @@ import "base:intrinsics"
 _Reduction_Operation :: enum {
 	Sum,
 	Mean,
+	Prod,
 	Max,
 	Min,
 }
@@ -18,6 +19,8 @@ _Reduction_Operation :: enum {
 _combine :: #force_inline proc(accumulator, element: $T, $operation: _Reduction_Operation) -> T {
 	when operation == .Sum || operation == .Mean {
 		return accumulator + element
+	} else when operation == .Prod {
+		return accumulator * element
 	} else {
 		when intrinsics.type_is_float(T) {
 			if element != element || accumulator != accumulator {
@@ -33,13 +36,19 @@ _combine :: #force_inline proc(accumulator, element: $T, $operation: _Reduction_
 }
 
 // _reduce_run folds count elements starting at offset and advancing by step.
-// Sums start from zero; max/min start from the first element.
+// Sums start from zero, products from one; max/min start from the first element.
 _reduce_run :: #force_inline proc(data: []$T, offset, step, count: int, $operation: _Reduction_Operation) -> T {
 	offset := offset
 	when operation == .Sum || operation == .Mean {
 		value: T = 0
 		for _ in 0..<count {
 			value += data[offset]
+			offset += step
+		}
+	} else when operation == .Prod {
+		value: T = 1
+		for _ in 0..<count {
+			value *= data[offset]
 			offset += step
 		}
 	} else {
@@ -94,7 +103,7 @@ _reduce_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axi
 		return .Aliased_Output
 	}
 	reduced_count := source.shape[reduced_axis]
-	when operation != .Sum {
+	when operation != .Sum && operation != .Prod {
 		if reduced_count == 0 {
 			return .Empty_Reduction
 		}
@@ -157,7 +166,7 @@ _reduced_shape :: proc(shape: []int, axis: int, keep_dims: bool, buffer: []int) 
 _reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _Reduction_Operation, keep_dims := false, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
 	normalized := _normalize_axis(axis, len(source.shape)) or_return
-	when operation != .Sum {
+	when operation != .Sum && operation != .Prod {
 		if source.shape[normalized] == 0 {
 			return result, .Empty_Reduction
 		}
@@ -170,14 +179,19 @@ _reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _Redu
 	return
 }
 
-// sum_axis, mean_axis, max_axis, and min_axis reduce one axis. A negative axis
-// counts from the end, and keep_dims is NumPy's keepdims. Mean/max/min of an
-// empty axis return Empty_Reduction. mean requires a floating-point type.
+// sum_axis, mean_axis, prod_axis, max_axis, and min_axis reduce one axis. A
+// negative axis counts from the end, and keep_dims is NumPy's keepdims. The
+// product of an empty axis is 1; mean/max/min of an empty axis return
+// Empty_Reduction. mean requires a floating-point type. Integer sums and
+// products wrap on overflow.
 sum_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views(as_view(source), axis, .Sum, keep_dims, allocator)
 }
 mean_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _reduce_axis_views(as_view(source), axis, .Mean, keep_dims, allocator)
+}
+prod_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _reduce_axis_views(as_view(source), axis, .Prod, keep_dims, allocator)
 }
 max_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views(as_view(source), axis, .Max, keep_dims, allocator)
@@ -192,6 +206,9 @@ sum_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, a
 mean_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _reduce_axis_views(source, axis, .Mean, keep_dims, allocator)
 }
+prod_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _reduce_axis_views(source, axis, .Prod, keep_dims, allocator)
+}
 max_axis_views :: proc(source: Tensor_View($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views(source, axis, .Max, keep_dims, allocator)
 }
@@ -205,6 +222,9 @@ sum_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_di
 mean_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
 	return _reduce_axis_views_into(output, as_view(source), axis, .Mean, keep_dims)
 }
+prod_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _reduce_axis_views_into(output, as_view(source), axis, .Prod, keep_dims)
+}
 max_axis_into :: proc(output: ^Tensor($T), source: Tensor(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views_into(output, as_view(source), axis, .Max, keep_dims)
 }
@@ -217,6 +237,9 @@ sum_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: i
 }
 mean_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_float(T) {
 	return _reduce_axis_views_into(output, source, axis, .Mean, keep_dims)
+}
+prod_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
+	return _reduce_axis_views_into(output, source, axis, .Prod, keep_dims)
 }
 max_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, keep_dims := false) -> Tensor_Error where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views_into(output, source, axis, .Max, keep_dims)
@@ -377,18 +400,22 @@ argmin_all_views :: proc(source: Tensor_View($T), allocator := context.allocator
 }
 
 // _reduce_all_views aggregates every element into a new rank-zero tensor.
-// Summing an empty tensor yields zero; mean/max/min return Empty_Reduction.
+// Summing an empty tensor yields zero and its product one; mean/max/min return
+// Empty_Reduction.
 // Rows of the source are folded with a fixed step, then combined.
 _reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operation, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
 	count, _ := _element_count(source.shape)
-	when operation != .Sum {
+	when operation != .Sum && operation != .Prod {
 		if count == 0 {
 			return result, .Empty_Reduction
 		}
 	}
 	result = new_tensor(T, []int{}, allocator) or_return
 	if count == 0 {
+		when operation == .Prod {
+			result.data[0] = 1
+		}
 		return result, .None
 	}
 	row := _row_length(source.shape)
@@ -401,6 +428,11 @@ _reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operat
 		when operation == .Mean {
 			value /= T(count)
 		}
+	} else when operation == .Prod {
+		value: T = 1
+		for start := 0; start < count; start += row {
+			value *= _reduce_run(source.data, _broadcast_offset(source, source.shape, start), step, row, .Prod)
+		}
 	} else {
 		value := _reduce_run(source.data, source.offset, step, row, operation)
 		for start := row; start < count; start += row {
@@ -411,13 +443,17 @@ _reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operat
 	return result, .None
 }
 
-// sum_all, mean_all, max_all, and min_all reduce every element to a rank-zero
-// tensor. Max and min propagate NaN. mean requires a floating-point type.
+// sum_all, mean_all, prod_all, max_all, and min_all reduce every element to a
+// rank-zero tensor. Max and min propagate NaN. mean requires a floating-point
+// type. Integer sums and products wrap on overflow.
 sum_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(as_view(source), .Sum, allocator)
 }
 mean_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _reduce_all_views(as_view(source), .Mean, allocator)
+}
+prod_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _reduce_all_views(as_view(source), .Prod, allocator)
 }
 max_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(as_view(source), .Max, allocator)
@@ -431,6 +467,9 @@ sum_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -
 }
 mean_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _reduce_all_views(source, .Mean, allocator)
+}
+prod_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return _reduce_all_views(source, .Prod, allocator)
 }
 max_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(source, .Max, allocator)

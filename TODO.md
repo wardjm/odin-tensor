@@ -29,7 +29,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when tests cover: `[[1,5,5],[7,2,7]]` axis 1 gives `[1,0]`; axis 0 gives `[1,0,1]`; NaN at index 2 gives 2; an empty axis gives `.Empty_Reduction`.
 - [x] **`argmax_all` / `argmin_all`.** Return the flat row-major index as a rank-zero `Tensor(int)`.
   - Done when: a transposed view returns the index in the view's logical order, not the storage order.
-- [ ] **`prod_axis` / `prod_all`.** The product of an empty reduction is 1.
+- [x] **`prod_axis` / `prod_all`.** The product of an empty reduction is 1.
   - Done when tests cover: `[[1,2],[3,4]]` gives `[3,8]` (axis 0) and 24 (all); an empty input gives 1; i8 overflow wraps (documented).
 - [ ] **`var_axis` / `std_axis` / `var_all` / `std_all`.** Floats only, with a `ddof := 0` parameter.
   - Done when tests cover: `[1,2,3,4]` gives var 1.25 and std √1.25; `ddof=1` gives 5/3; `ddof >= count` gives `.Empty_Reduction`.

@@ -110,6 +110,98 @@ test_reductions_on_empty_dimensions :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_products_along_an_axis_and_over_all_elements :: proc(t: ^testing.T) {
+	values, err := from_slice(f64, []f64{1, 2, 3, 4}, []int{2, 2})
+	testing.expect(t, err == .None)
+	defer release(&values)
+
+	columns: Tensor(f64)
+	columns, err = prod_axis(values, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&columns)
+	expect_shape(t, columns.shape, []int{2})
+	expect_f64_data(t, columns.data, []f64{3, 8})
+
+	kept_rows: Tensor(f64)
+	kept_rows, err = prod_axis(values, -1, true)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&kept_rows)
+	expect_shape(t, kept_rows.shape, []int{2, 1})
+	expect_f64_data(t, kept_rows.data, []f64{2, 12})
+
+	// A transposed view multiplies along its own rows: [[1,3],[2,4]].
+	transposed_shape, transposed_strides := [2]int{}, [2]int{}
+	transposed, view_err := transpose_view(as_view(values), transposed_shape[:], transposed_strides[:])
+	testing.expect(t, view_err == .None)
+	transposed_rows: Tensor(f64)
+	transposed_rows, err = prod_axis_views(transposed, 1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_rows)
+	expect_f64_data(t, transposed_rows.data, []f64{3, 8})
+
+	output: Tensor(f64)
+	output, err = new_tensor(f64, []int{2})
+	testing.expect(t, err == .None)
+	defer release(&output)
+	testing.expect_value(t, prod_axis_into(&output, values, 1), Tensor_Error.None)
+	expect_f64_data(t, output.data, []f64{2, 12})
+	testing.expect_value(t, prod_axis_views_into(&output, transposed, 0), Tensor_Error.None)
+	expect_f64_data(t, output.data, []f64{2, 12})
+
+	total: Tensor(f64)
+	total, err = prod_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&total)
+	expect_shape(t, total.shape, []int{})
+	expect_f64_data(t, total.data, []f64{24})
+	transposed_total: Tensor(f64)
+	transposed_total, err = prod_all_views(transposed)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&transposed_total)
+	expect_f64_data(t, transposed_total.data, []f64{24})
+
+	// The product of an empty reduction is 1.
+	empty: Tensor(f64)
+	empty, err = new_tensor(f64, []int{2, 0})
+	testing.expect(t, err == .None)
+	defer release(&empty)
+	empty_rows: Tensor(f64)
+	empty_rows, err = prod_axis(empty, 1)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_rows)
+	expect_f64_data(t, empty_rows.data, []f64{1, 1})
+	empty_total: Tensor(f64)
+	empty_total, err = prod_all(empty)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_total)
+	expect_f64_data(t, empty_total.data, []f64{1})
+
+	// Integer products wrap on overflow: 16 * 16 = 256 wraps to 0 in i8, and
+	// 2^7 = 128 wraps to -128.
+	small: Tensor(i8)
+	small, err = from_slice(i8, []i8{16, 16, 2, 2, 2, 2, 2, 2, 2}, []int{9})
+	testing.expect(t, err == .None)
+	defer release(&small)
+	small_total: Tensor(i8)
+	small_total, err = prod_all(small)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&small_total)
+	testing.expect_value(t, small_total.data[0], i8(0))
+	powers: Tensor(i8)
+	powers, err = from_slice(i8, []i8{2, 2, 2, 2, 2, 2, 2}, []int{7})
+	testing.expect(t, err == .None)
+	defer release(&powers)
+	powers_total: Tensor(i8)
+	powers_total, err = prod_axis(powers, 0)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&powers_total)
+	testing.expect_value(t, powers_total.data[0], i8(-128))
+
+	_, err = prod_axis(values, 2)
+	testing.expect_value(t, err, Tensor_Error.Out_Of_Bounds)
+}
+
+@(test)
 test_dot_vector_and_matrix_semantics :: proc(t: ^testing.T) {
 	vector, err := from_slice(f32, []f32{1, 2, 3}, []int{3})
 	testing.expect(t, err == .None)
@@ -942,6 +1034,10 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&largest_index)
 	smallest_index := argmin_all_views(as_view(a), allocator) or_return
 	defer release(&smallest_index)
+	column_products := prod_axis_views(as_view(a), 0, false, allocator) or_return
+	defer release(&column_products)
+	product_total := prod_all(a, allocator) or_return
+	defer release(&product_total)
 	return .None
 }
 
