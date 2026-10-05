@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # The Odin commit the library is developed against. Odin has no stable
+  # releases, so bump this deliberately (and fix any breakage) rather than
+  # tracking master.
+  ODIN_COMMIT: 90c44058bda022813cc236d0e280fdba91bde12f
+  LLVM_VERSION: 18
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore Odin
+        id: odin-cache
+        uses: actions/cache@v4
+        with:
+          path: odin-compiler
+          key: odin-${{ env.ODIN_COMMIT }}-llvm${{ env.LLVM_VERSION }}
+
+      - name: Install LLVM
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$LLVM_VERSION"
+          echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Check out Odin
+        if: steps.odin-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: odin-lang/Odin
+          ref: ${{ env.ODIN_COMMIT }}
+          path: odin-compiler
+
+      - name: Build Odin
+        if: steps.odin-cache.outputs.cache-hit != 'true'
+        working-directory: odin-compiler
+        run: ./build_odin.sh release
+
+      - name: Add Odin to PATH
+        run: |
+          echo "$GITHUB_WORKSPACE/odin-compiler" >> "$GITHUB_PATH"
+
+      - name: Odin version
+        run: odin version
+
+      - name: Tests
+        run: odin test . -vet -strict-style -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+
+      - name: README examples
+        run: scripts/check_readme.sh
+
+      - name: Benchmarks compile
+        run: odin check bench -vet -strict-style
