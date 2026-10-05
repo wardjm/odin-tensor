@@ -76,31 +76,25 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) {
 	}
 }
 
-// _product_views_into validates operands and output, then writes a @ b.
-_product_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_Error {
-	_validate_dot_view(a) or_return
-	_validate_dot_view(b) or_return
-	shape_buffer := [2]int{}
-	result_rank := _dot_result_shape(a.shape, b.shape, shape_buffer[:]) or_return
-	_validate_output(output^) or_return
-	if !_shapes_match(output.shape, shape_buffer[:result_rank]) {
-		return .Shape_Mismatch
+// _validate_dot_ranks enforces dot's rank-one/rank-two rule. On those ranks
+// matmul's shape rules and kernel agree with dot, so the products below defer
+// to the matmul paths after this check.
+_validate_dot_ranks :: proc(a, b: Tensor_View($T)) -> Tensor_Error {
+	a_rank, b_rank := len(a.shape), len(b.shape)
+	if (a_rank != 1 && a_rank != 2) || (b_rank != 1 && b_rank != 2) {
+		return .Invalid_Shape
 	}
-	if _output_overlaps_view(output^, a) || _output_overlaps_view(output^, b) {
-		return .Aliased_Output
-	}
-	_product_kernel(output.data, a, b)
 	return .None
 }
 
+_product_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_Error {
+	_validate_dot_ranks(a, b) or_return
+	return _matmul_views_into(output, a, b)
+}
+
 _product_views :: proc(a, b: Tensor_View($T), allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
-	_validate_dot_view(a) or_return
-	_validate_dot_view(b) or_return
-	shape_buffer := [2]int{}
-	result_rank := _dot_result_shape(a.shape, b.shape, shape_buffer[:]) or_return
-	result = new_tensor(T, shape_buffer[:result_rank], allocator) or_return
-	_product_kernel(result.data, a, b)
-	return result, .None
+	_validate_dot_ranks(a, b) or_return
+	return _matmul_views(a, b, allocator)
 }
 
 // dot returns the NumPy-style product of rank-one and rank-two tensors:

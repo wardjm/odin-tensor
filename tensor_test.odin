@@ -799,7 +799,7 @@ expect_batch_matches_matmul :: proc(t: ^testing.T, output: Tensor(f64), batch: i
 	expected, err = matmul(a_matrix, b_matrix)
 	testing.expect_value(t, err, Tensor_Error.None, loc)
 	defer release(&expected)
-	expect_f64_data(t, output.data[batch*m*n:][:m*n], expected.data)
+	expect_f64_data(t, output.data[batch*m*n:][:m*n], expected.data, loc = loc)
 }
 
 // counting_values returns 1, 2, ..., count scaled by factor, for test operands.
@@ -908,6 +908,72 @@ test_batched_matmul_broadcasts_batch_axes :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&view_product)
 	expect_f64_data(t, view_product.data, product.data)
+}
+
+@(test)
+test_batched_matmul_edge_cases :: proc(t: ^testing.T) {
+	// k = 0: every batch is a sum over nothing, so the output must be zeroed
+	// even when it starts out holding other values.
+	a, err := new_tensor(f64, []int{2, 3, 0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&a)
+	b: Tensor(f64)
+	b, err = new_tensor(f64, []int{0, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&b)
+	output: Tensor(f64)
+	output, err = new_tensor(f64, []int{2, 3, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&output)
+	for &value in output.data {
+		value = 7
+	}
+	testing.expect_value(t, matmul_into(&output, a, b), Tensor_Error.None)
+	for value in output.data {
+		testing.expect_value(t, value, 0)
+	}
+
+	// Integers, with a size-1 batch axis on each side: [3,1,1,2] @ [4,2,1] is
+	// [3,4,1,1], and element [i,j] is row i of a times column j of b.
+	ints_a: Tensor(int)
+	ints_a, err = from_slice(int, []int{1, 2, 3, 4, 5, 6}, []int{3, 1, 1, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&ints_a)
+	ints_b: Tensor(int)
+	ints_b, err = from_slice(int, []int{1, 0, 0, 1, 1, 1, 2, -1}, []int{4, 2, 1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&ints_b)
+	ints_product: Tensor(int)
+	ints_product, err = matmul(ints_a, ints_b)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&ints_product)
+	expect_shape(t, ints_product.shape, []int{3, 4, 1, 1})
+	expect_int_data(t, ints_product.data, []int{1, 2, 3, 0, 3, 4, 7, 2, 5, 6, 11, 4})
+
+	// A batch axis from broadcast_view has zero stride, so every batch reads
+	// the same matrix.
+	base: Tensor(f64)
+	base, err = from_slice(f64, []f64{1, 2, 3, 4}, []int{2, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&base)
+	shape_buffer, strides_buffer: [3]int
+	repeated: Tensor_View(f64)
+	repeated, err = broadcast_view(as_view(base), []int{3, 2, 2}, shape_buffer[:], strides_buffer[:])
+	testing.expect_value(t, err, Tensor_Error.None)
+	stack_values := counting_values(12, 1)
+	defer delete(stack_values)
+	stack: Tensor(f64)
+	stack, err = from_slice(f64, stack_values, []int{3, 2, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&stack)
+	repeated_product: Tensor(f64)
+	repeated_product, err = matmul_views(repeated, as_view(stack))
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&repeated_product)
+	expect_shape(t, repeated_product.shape, []int{3, 2, 2})
+	for batch in 0..<3 {
+		expect_batch_matches_matmul(t, repeated_product, batch, base, 0, stack, batch)
+	}
 }
 
 @(test)
@@ -1535,13 +1601,13 @@ test_unary_math_and_activations :: proc(t: ^testing.T) {
 	testing.expect(t, view_result.data[0] == 0 && view_result.data[1] == 1 && view_result.data[2] == 0 && view_result.data[3] == 2)
 }
 
-expect_f64_data :: proc(t: ^testing.T, actual, expected: []f64, tolerance: f64 = 1e-12) {
-	testing.expect_value(t, len(actual), len(expected))
+expect_f64_data :: proc(t: ^testing.T, actual, expected: []f64, tolerance: f64 = 1e-12, loc := #caller_location) {
+	testing.expect_value(t, len(actual), len(expected), loc)
 	if len(actual) != len(expected) {
 		return
 	}
 	for i in 0..<len(expected) {
-		testing.expectf(t, abs(actual[i]-expected[i]) <= tolerance, "index %d: got %v, want %v", i, actual[i], expected[i])
+		testing.expectf(t, abs(actual[i]-expected[i]) <= tolerance, "index %d: got %v, want %v", i, actual[i], expected[i], loc = loc)
 	}
 }
 

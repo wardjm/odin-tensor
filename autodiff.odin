@@ -87,10 +87,10 @@ _tape_binary :: proc(tape: ^Tape($T), a, b: Tape_Value(T), operation: Tape_Opera
 		output = mul_views(a_view, b_view, tape.allocator) or_return
 	case .Div:
 		output = div_views(a_view, b_view, tape.allocator) or_return
-	case .Dot:
+	case .Dot, .Matmul:
+		// dot rejects batched operands before computing anything; on ranks 1-2
+		// it equals matmul. Batched matmul has no reverse rule yet.
 		output = dot_views(a_view, b_view, tape.allocator) or_return
-	case .Matmul:
-		output = matmul_views(a_view, b_view, tape.allocator) or_return
 	case:
 		return result, .Unsupported_Operation
 	}
