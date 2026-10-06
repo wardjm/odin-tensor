@@ -19,7 +19,6 @@ test_tape_copy_leaf_snapshots_strided_source :: proc(t: ^testing.T) {
 	defer tape_release(&tape)
 	leaf, leaf_err := tape_add_leaf_copy(&tape, reversed)
 	require_ok(t, leaf_err)
-	testing.expect_value(t, tape.nodes[leaf.id].owns_value, true)
 	owner.data[0], owner.data[1], owner.data[2] = 100, 200, 300
 
 	leaf_view, value_err := tape_value(&tape, leaf)
@@ -99,7 +98,7 @@ test_tape_records_reductions_and_validates_ownership :: proc(t: ^testing.T) {
 	global_sum_value, sum_record_err := tape_record_sum_all(&tape, &global_sum, parent)
 	require_ok(t, sum_record_err)
 	testing.expect_value(t, len(global_sum.data), 0)
-	testing.expect_value(t, tape.nodes[global_sum_value.id].operation, .Sum_All)
+	expect_parent_gradient(t, &tape, global_sum_value, []f64{2}, []int{}, parent, []f64{2, 2, 2, 2, 2, 2})
 
 	global_mean, mean_err := mean_all(input)
 	require_ok(t, mean_err)
@@ -107,7 +106,7 @@ test_tape_records_reductions_and_validates_ownership :: proc(t: ^testing.T) {
 	global_mean_value, mean_record_err := tape_record_mean_all(&tape, &global_mean, parent)
 	require_ok(t, mean_record_err)
 	testing.expect_value(t, len(global_mean.data), 0)
-	testing.expect_value(t, tape.nodes[global_mean_value.id].operation, .Mean_All)
+	expect_parent_gradient(t, &tape, global_mean_value, []f64{6}, []int{}, parent, []f64{1, 1, 1, 1, 1, 1})
 
 	axis_sum, axis_sum_err := sum_axis(input, 1)
 	require_ok(t, axis_sum_err)
@@ -116,9 +115,8 @@ test_tape_records_reductions_and_validates_ownership :: proc(t: ^testing.T) {
 	axis_sum_value, axis_sum_record_err := tape_record_sum_axis(&tape, &axis_sum, parent, 1)
 	require_ok(t, axis_sum_record_err)
 	testing.expect_value(t, len(axis_sum.data), 0)
-	testing.expect_value(t, tape.nodes[axis_sum_value.id].operation, .Sum_Axis)
-	testing.expect_value(t, tape.nodes[axis_sum_value.id].axis, 1)
-	testing.expect_value(t, tape.nodes[axis_sum_value.id].keep_dims, false)
+	// A seed of shape [2] spreads each row's value across that row only.
+	expect_parent_gradient(t, &tape, axis_sum_value, []f64{1, 2}, []int{2}, parent, []f64{1, 1, 1, 2, 2, 2})
 
 	axis_mean, axis_mean_err := mean_axis(input, 1, true)
 	require_ok(t, axis_mean_err)
@@ -127,9 +125,8 @@ test_tape_records_reductions_and_validates_ownership :: proc(t: ^testing.T) {
 	axis_mean_value, axis_mean_record_err := tape_record_mean_axis(&tape, &axis_mean, parent, 1, true)
 	require_ok(t, axis_mean_record_err)
 	testing.expect_value(t, len(axis_mean.data), 0)
-	testing.expect_value(t, tape.nodes[axis_mean_value.id].operation, .Mean_Axis)
-	testing.expect_value(t, tape.nodes[axis_mean_value.id].axis, 1)
-	testing.expect_value(t, tape.nodes[axis_mean_value.id].keep_dims, true)
+	// The kept axis makes the seed shape [2,1]; each row's value is divided by 3.
+	expect_parent_gradient(t, &tape, axis_mean_value, []f64{3, 6}, []int{2, 1}, parent, []f64{1, 1, 1, 2, 2, 2})
 	testing.expect_value(t, len(tape.nodes), 5)
 
 	invalid_axis_output, invalid_axis_err := sum_axis(input, 0)
@@ -173,6 +170,19 @@ test_tape_records_reductions_and_validates_ownership :: proc(t: ^testing.T) {
 	require_ok(t, grown_record_err)
 	testing.expect_value(t, len(grown_tape.nodes), 2)
 	testing.expect_value(t, len(grown_output.data), 0)
+}
+
+// expect_parent_gradient clears the tape's gradients, runs backward from root
+// with the given seed and checks the gradient that reaches parent.
+expect_parent_gradient :: proc(t: ^testing.T, tape: ^Tape(f64), root: Tape_Value(f64), seed_values: []f64, seed_shape: []int, parent: Tape_Value(f64), expected: []f64, loc := #caller_location) {
+	seed, seed_err := from_slice(f64, seed_values, seed_shape)
+	require_ok(t, seed_err, loc)
+	defer release(&seed)
+	tape_zero_grad(tape)
+	require_ok(t, tape_backward_with_seed(tape, root, seed), loc)
+	gradient, grad_err := tape_gradient(tape, parent)
+	require_ok(t, grad_err, loc)
+	expect_f64_data(t, gradient.data, expected, loc = loc)
 }
 
 @(test)
@@ -649,9 +659,6 @@ test_tape_records_owned_operation_and_checks_graph_identity :: proc(t: ^testing.
 	child, child_err := tape_record_binary(&tape, &output, .Add, parent, parent)
 	require_ok(t, child_err)
 	testing.expect_value(t, len(output.data), 0)
-	testing.expect_value(t, tape.nodes[child.id].operation, .Add)
-	testing.expect_value(t, tape.nodes[child.id].parent_a, parent.id)
-	testing.expect_value(t, tape.nodes[child.id].parent_count, 2)
 	forward, forward_err := tape_value(&tape, child)
 	require_ok(t, forward_err)
 	testing.expect_value(t, forward.data[1], 4)

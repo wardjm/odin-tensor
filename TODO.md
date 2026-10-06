@@ -77,5 +77,5 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when: a deliberately failing `from_slice` in a test reports one failure instead of an index panic.
 - [x] **Pass the allocator through every call in the tensor allocation scenario.** `tensor_allocation_scenario` calls `add`, `sum_axis`, `matmul`, `dot`, `exp` and `mean_all` without `allocator`, so those calls never see the failing allocator and their partial-failure cleanup is untested.
   - Done when: every allocating call in the scenario passes `allocator`, and the tests still pass.
-- [ ] **Remove the remaining reads of `tape.nodes[...]` in tests.** Test recorded operation, axis and parent through behaviour (values and gradients) instead.
+- [x] **Remove the remaining reads of `tape.nodes[...]` in tests.** Test recorded operation, axis and parent through behaviour (values and gradients) instead.
   - Done when: `grep -n 'tape.nodes\[' autodiff_test.odin` returns no lines.
