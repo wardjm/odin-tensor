@@ -102,6 +102,10 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			err = _backward_sum_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims)
 		case .Mean_Axis:
 			err = _backward_mean_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims)
+		case .Prod_All:
+			err = _backward_prod_all(&scratch[a], scratch[node_id], tape.nodes[a].value, tape.allocator)
+		case .Prod_Axis:
+			err = _backward_prod_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, tape.allocator)
 		case .Max_All:
 			err = _backward_extreme_all(&scratch[a], scratch[node_id], tape.nodes[a].value, .Max)
 		case .Min_All:
@@ -238,6 +242,85 @@ _backward_mean_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input:
 		gradient.data[linear] += contribution
 	}
 	return .None
+}
+
+// _backward_prod_all copies the input into logical order, then adds the
+// scalar upstream gradient times the product of every other element.
+_backward_prod_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), allocator := context.allocator) -> Tensor_Error where intrinsics.type_is_float(T) {
+	if len(output_grad.shape) != 0 || len(output_grad.data) != 1 {
+		return .Shape_Mismatch
+	}
+	if !_shapes_match(gradient.shape, input.shape) {
+		return .Shape_Mismatch
+	}
+	_validate_view(input) or_return
+	count, valid := _element_count(input.shape)
+	if !valid || count != len(gradient.data) {
+		return .Invalid_Shape
+	}
+	if count == 0 {
+		return .None
+	}
+	buffer, alloc_err := make([]T, 2*count, allocator)
+	if alloc_err != nil {
+		return .Allocation_Failed
+	}
+	defer delete(buffer, allocator)
+	values, prefix := buffer[:count], buffer[count:]
+	_copy_into(values, input)
+	_backward_prod_run(gradient.data, 0, 1, values, 0, 1, count, output_grad.data[0], prefix)
+	return .None
+}
+
+// _backward_prod_axis adds each upstream value times, for every element along
+// axis, the product of the other elements in its run.
+_backward_prod_axis :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), axis: int, keep_dims: bool, allocator := context.allocator) -> Tensor_Error where intrinsics.type_is_float(T) {
+	_validate_view(input) or_return
+	if axis < 0 || axis >= len(input.shape) {
+		return .Out_Of_Bounds
+	}
+	if !_shapes_match(gradient.shape, input.shape) || !_reduction_shape_matches(output_grad, input.shape, axis, keep_dims) {
+		return .Shape_Mismatch
+	}
+	input_count, valid := _element_count(input.shape)
+	if !valid || input_count != len(gradient.data) {
+		return .Invalid_Shape
+	}
+	if input_count == 0 {
+		return .None
+	}
+	reduced_count := input.shape[axis]
+	prefix, alloc_err := make([]T, reduced_count, allocator)
+	if alloc_err != nil {
+		return .Allocation_Failed
+	}
+	defer delete(prefix, allocator)
+	inner := _reduction_inner_count(input.shape, axis)
+	for output_index in 0..<len(output_grad.data) {
+		offset := _reduction_base_offset(input, axis, inner, output_index)
+		// The gradient is contiguous, so the reduced axis advances by inner.
+		outer_index := output_index / inner
+		inner_index := output_index - outer_index*inner
+		_backward_prod_run(gradient.data, outer_index*reduced_count*inner + inner_index, inner, input.data, offset, input.strides[axis], reduced_count, output_grad.data[output_index], prefix)
+	}
+	return .None
+}
+
+// _backward_prod_run adds upstream times the product of the other count-1
+// elements to each element's gradient. A forward pass stores the product of
+// the elements before each one in prefix, and a backward pass multiplies in
+// the product of those after it, so no division is needed.
+_backward_prod_run :: proc(gradient: []$T, gradient_start, gradient_step: int, data: []T, offset, step, count: int, upstream: T, prefix: []T) {
+	running: T = 1
+	for i in 0..<count {
+		prefix[i] = running
+		running *= data[offset + i*step]
+	}
+	running = 1
+	for i := count-1; i >= 0; i -= 1 {
+		gradient[gradient_start + i*gradient_step] += upstream * (prefix[i]*running)
+		running *= data[offset + i*step]
+	}
 }
 
 // _backward_extreme_all adds the scalar upstream gradient to the one element

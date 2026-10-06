@@ -91,6 +91,17 @@ tape_mean_axis :: proc(tape: ^Tape($T), x: Tape_Value(T), axis: int, keep_dims :
 	return _tape_reduce(tape, x, .Mean_Axis, axis, keep_dims)
 }
 
+// tape_prod_all and tape_prod_axis give each element the product of the others
+// as its derivative, built from prefix and suffix products rather than by
+// dividing the result, so zeros get exact gradients. An empty product is 1.
+tape_prod_all :: proc(tape: ^Tape($T), x: Tape_Value(T)) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_reduce(tape, x, .Prod_All, -1, false)
+}
+
+tape_prod_axis :: proc(tape: ^Tape($T), x: Tape_Value(T), axis: int, keep_dims := false) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_reduce(tape, x, .Prod_Axis, axis, keep_dims)
+}
+
 // tape_max_all, tape_min_all, tape_max_axis, and tape_min_axis send each
 // upstream value to the single element argmax or argmin picks: the first on a
 // tie, and the first NaN if there is one. An empty reduction returns
@@ -194,6 +205,10 @@ _tape_reduce :: proc(tape: ^Tape($T), x: Tape_Value(T), operation: Tape_Operatio
 		output = sum_axis_views(view, axis, keep_dims, tape.allocator) or_return
 	case .Mean_Axis:
 		output = mean_axis_views(view, axis, keep_dims, tape.allocator) or_return
+	case .Prod_All:
+		output = prod_all_views(view, tape.allocator) or_return
+	case .Prod_Axis:
+		output = prod_axis_views(view, axis, keep_dims, tape.allocator) or_return
 	case .Max_All:
 		output = max_all_views(view, tape.allocator) or_return
 	case .Min_All:

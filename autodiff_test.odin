@@ -1277,6 +1277,9 @@ test_reduction_gradients_match_finite_differences :: proc(t: ^testing.T) {
 	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Mean_All, -1, false, false)
 	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9, 0.8, 0.1}, []int{2, 2, 2}, .Sum_Axis, 1, true, false)
 	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Mean_Axis, 1, false, true)
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Prod_All, -1, false, true)
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9, 0.8, 0.1}, []int{2, 2, 2}, .Prod_Axis, 1, true, false)
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Prod_Axis, 1, false, true)
 	// Max and min have no ties here, so the gradient is unique. The transposed
 	// cases check that the chosen element is found in logical order.
 	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Max_All, -1, false, true)
@@ -1346,6 +1349,8 @@ reduction_output :: proc(source: Tensor_View(f64), operation: Tape_Operation, ax
 	case .Mean_All: return mean_all_views(source)
 	case .Sum_Axis: return sum_axis_views(source, axis, keep_dims)
 	case .Mean_Axis: return mean_axis_views(source, axis, keep_dims)
+	case .Prod_All: return prod_all_views(source)
+	case .Prod_Axis: return prod_axis_views(source, axis, keep_dims)
 	case .Max_All: return max_all_views(source)
 	case .Min_All: return min_all_views(source)
 	case .Max_Axis: return max_axis_views(source, axis, keep_dims)
@@ -1360,6 +1365,8 @@ record_reduction :: proc(tape: ^Tape(f64), output: ^Tensor(f64), operation: Tape
 	case .Mean_All: return tape_record_mean_all(tape, output, parent)
 	case .Sum_Axis: return tape_record_sum_axis(tape, output, parent, axis, keep_dims)
 	case .Mean_Axis: return tape_record_mean_axis(tape, output, parent, axis, keep_dims)
+	case .Prod_All: return tape_record_prod_all(tape, output, parent)
+	case .Prod_Axis: return tape_record_prod_axis(tape, output, parent, axis, keep_dims)
 	case .Max_All: return tape_record_max_all(tape, output, parent)
 	case .Min_All: return tape_record_min_all(tape, output, parent)
 	case .Max_Axis: return tape_record_max_axis(tape, output, parent, axis, keep_dims)
@@ -1762,14 +1769,16 @@ tape_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	reshaped_value := tape_reshape(&tape, transposed_value, []int{1, 4}) or_return
 	sliced_value := tape_slice(&tape, reshaped_value, 1, 0, 2, 2) or_return
 	peaks_value := tape_max_axis(&tape, sliced_value, 0, true) or_return
-	peaks_view := tape_value(&tape, peaks_value) or_return
-	means := mean_axis_views(peaks_view, 1, false, allocator) or_return
+	peak_products_value := tape_prod_axis(&tape, peaks_value, 1, true) or_return
+	peak_products_view := tape_value(&tape, peak_products_value) or_return
+	means := mean_axis_views(peak_products_view, 1, false, allocator) or_return
 	defer release(&means)
-	means_value := tape_record_mean_axis(&tape, &means, peaks_value, 1) or_return
-	means_view := tape_value(&tape, means_value) or_return
-	lowest := min_all_views(means_view, allocator) or_return
+	means_value := tape_record_mean_axis(&tape, &means, peak_products_value, 1) or_return
+	mean_product_value := tape_prod_all(&tape, means_value) or_return
+	mean_product_view := tape_value(&tape, mean_product_value) or_return
+	lowest := min_all_views(mean_product_view, allocator) or_return
 	defer release(&lowest)
-	lowest_value := tape_record_min_all(&tape, &lowest, means_value) or_return
+	lowest_value := tape_record_min_all(&tape, &lowest, mean_product_value) or_return
 	lowest_view := tape_value(&tape, lowest_value) or_return
 	total := sum_all_views(lowest_view, allocator) or_return
 	defer release(&total)
@@ -1818,6 +1827,10 @@ apply_tape_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Ta
 		return tape_sum_axis(tape, a, -1)
 	case .Mean_Axis:
 		return tape_mean_axis(tape, a, 0, true)
+	case .Prod_All:
+		return tape_prod_all(tape, a)
+	case .Prod_Axis:
+		return tape_prod_axis(tape, a, -1, true)
 	case .Max_All:
 		return tape_max_all(tape, a)
 	case .Min_All:
@@ -1926,7 +1939,7 @@ test_every_tape_helper_matches_finite_differences :: proc(t: ^testing.T) {
 	// matmul promotes a vector left operand to a row, as in NumPy.
 	check_tape_helper(t, .Matmul, row_values, []int{3}, matrix_values, []int{3, 2})
 	// matrix_values has no ties, so max and min are differentiable there.
-	for operation in ([]Tape_Operation{.Relu, .Sigmoid, .Tanh, .Sum_All, .Mean_All, .Sum_Axis, .Mean_Axis, .Max_All, .Min_All, .Max_Axis, .Min_Axis}) {
+	for operation in ([]Tape_Operation{.Relu, .Sigmoid, .Tanh, .Sum_All, .Mean_All, .Sum_Axis, .Mean_Axis, .Prod_All, .Prod_Axis, .Max_All, .Min_All, .Max_Axis, .Min_Axis}) {
 		check_tape_helper(t, operation, matrix_values, []int{2, 3}, row_values, []int{3})
 	}
 	// log and sqrt are only differentiable for positive inputs.
@@ -2122,6 +2135,58 @@ test_tape_max_and_min_reject_empty_reductions :: proc(t: ^testing.T) {
 	_, axis_record_err := tape_record_max_axis(&tape, &manual_rows, x_value, 1)
 	testing.expect_value(t, axis_record_err, Tensor_Error.Empty_Reduction)
 	testing.expect_value(t, len(manual_rows.data), 2)
+}
+
+@(test)
+test_tape_prod_gradients_handle_zeros_and_empty_products :: proc(t: ^testing.T) {
+	// Each row has one zero, two zeros, or none. Only a single zero leaves a
+	// nonzero gradient, at the zero itself.
+	rows, err := from_slice(f64, []f64{2, 0, 3, 0, 5, 0, 1, 4, 0.5}, []int{3, 3})
+	require_ok(t, err)
+	defer release(&rows)
+	empty: Tensor(f64)
+	empty, err = new_tensor(f64, []int{2, 0})
+	require_ok(t, err)
+	defer release(&empty)
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	require_ok(t, err)
+	defer tape_release(&tape)
+
+	x_value, x_err := tape_add_leaf_borrow(&tape, &rows)
+	require_ok(t, x_err)
+	row_products, row_err := tape_prod_axis(&tape, x_value, 1)
+	require_ok(t, row_err)
+	row_view, row_view_err := tape_value(&tape, row_products)
+	require_ok(t, row_view_err)
+	expect_f64_data(t, row_view.data, []f64{0, 0, 2})
+	expect_parent_gradient(t, &tape, row_products, []f64{1, 1, 1}, []int{3}, x_value, []f64{0, 6, 0, 0, 0, 0, 2, 0.5, 4})
+
+	// The whole matrix holds three zeros, so every gradient is zero.
+	total, total_err := tape_prod_all(&tape, x_value)
+	require_ok(t, total_err)
+	expect_parent_gradient(t, &tape, total, []f64{1}, []int{}, x_value, []f64{0, 0, 0, 0, 0, 0, 0, 0, 0})
+	first_row, slice_err := tape_slice(&tape, x_value, 0, 0, 1)
+	require_ok(t, slice_err)
+	first_total, first_total_err := tape_prod_all(&tape, first_row)
+	require_ok(t, first_total_err)
+	expect_parent_gradient(t, &tape, first_total, []f64{2}, []int{}, x_value, []f64{0, 12, 0, 0, 0, 0, 0, 0, 0})
+
+	// Empty products are 1 and send nothing back.
+	empty_value, empty_err := tape_add_leaf_borrow(&tape, &empty)
+	require_ok(t, empty_err)
+	empty_total, empty_total_err := tape_prod_all(&tape, empty_value)
+	require_ok(t, empty_total_err)
+	empty_total_view, empty_total_view_err := tape_value(&tape, empty_total)
+	require_ok(t, empty_total_view_err)
+	expect_f64_data(t, empty_total_view.data, []f64{1})
+	testing.expect_value(t, tape_backward(&tape, empty_total), Tensor_Error.None)
+	empty_rows, empty_rows_err := tape_prod_axis(&tape, empty_value, 1)
+	require_ok(t, empty_rows_err)
+	empty_rows_view, empty_rows_view_err := tape_value(&tape, empty_rows)
+	require_ok(t, empty_rows_view_err)
+	expect_f64_data(t, empty_rows_view.data, []f64{1, 1})
+	expect_parent_gradient(t, &tape, empty_rows, []f64{1, 1}, []int{2}, empty_value, []f64{})
 }
 
 @(test)
