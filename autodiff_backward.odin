@@ -562,7 +562,9 @@ _backward_matmul :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a,
 // With a as [m,k], b as [k,n] and upstream as [m,n], grad_a += upstream @ bᵀ
 // and grad_b += aᵀ @ upstream, each run through the blocked forward kernel on
 // transposed views. Each gradient element adds its terms in the same order as
-// an element-by-element loop, so the result matches one exactly.
+// an element-by-element loop, so the result matches one exactly, except when
+// grad_a and grad_b are the same buffer (a @ a): all of grad_a's terms then
+// land before grad_b's, which can change the last bits.
 _backward_matrix_product :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T)) -> Tensor_Error {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	k := a.shape[a_rank-1]

@@ -1079,6 +1079,85 @@ test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) 
 	expect_f64_data(t, view_b_grad.data, copy_b_grad.data)
 }
 
+// The other matmul backward tests use matrices small enough that the product
+// kernel never blocks. Here a transposed [9,70] a, whose inner axis is strided,
+// broadcasts against a [2,70,10] b: both gradient products take the register
+// tiles plus the row and column tails, k spans two strided blocks, and the
+// second batch accumulates onto a gradient the first already filled.
+@(test)
+test_tape_blocked_matmul_backward_matches_naive :: proc(t: ^testing.T) {
+	M, K, N, BATCHES :: 9, 70, 10, 2
+	a, err := new_tensor(f64, []int{K, M})
+	require_ok(t, err)
+	defer release(&a)
+	for &value, i in a.data {
+		value = math.sin(0.37*f64(i))
+	}
+	b: Tensor(f64)
+	b, err = new_tensor(f64, []int{BATCHES, K, N})
+	require_ok(t, err)
+	defer release(&b)
+	for &value, i in b.data {
+		value = math.cos(0.23*f64(i))
+	}
+	seed: Tensor(f64)
+	seed, err = new_tensor(f64, []int{BATCHES, M, N})
+	require_ok(t, err)
+	defer release(&seed)
+	for &value, i in seed.data {
+		value = 1 + math.sin(f64(i))
+	}
+
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	require_ok(t, err)
+	defer tape_release(&tape)
+	av, bv, a_transposed, product: Tape_Value(f64)
+	av, err = tape_add_leaf_borrow(&tape, &a)
+	require_ok(t, err)
+	bv, err = tape_add_leaf_borrow(&tape, &b)
+	require_ok(t, err)
+	a_transposed, err = tape_transpose(&tape, av)
+	require_ok(t, err)
+	product, err = tape_matmul(&tape, a_transposed, bv)
+	require_ok(t, err)
+	testing.expect_value(t, tape_backward_with_seed(&tape, product, seed), Tensor_Error.None)
+
+	// a's gradient is laid out as a, [K,M]; each element sums over both batches.
+	expected_a := make([]f64, K*M)
+	defer delete(expected_a)
+	for p in 0..<K {
+		for i in 0..<M {
+			sum: f64 = 0
+			for batch in 0..<BATCHES {
+				for j in 0..<N {
+					sum += seed.data[(batch*M + i)*N + j] * b.data[(batch*K + p)*N + j]
+				}
+			}
+			expected_a[p*M + i] = sum
+		}
+	}
+	expected_b := make([]f64, BATCHES*K*N)
+	defer delete(expected_b)
+	for batch in 0..<BATCHES {
+		for p in 0..<K {
+			for j in 0..<N {
+				sum: f64 = 0
+				for i in 0..<M {
+					sum += a.data[p*M + i] * seed.data[(batch*M + i)*N + j]
+				}
+				expected_b[(batch*K + p)*N + j] = sum
+			}
+		}
+	}
+	a_grad, a_grad_err := tape_gradient(&tape, av)
+	require_ok(t, a_grad_err)
+	expect_f64_data(t, a_grad.data, expected_a)
+	b_grad, b_grad_err := tape_gradient(&tape, bv)
+	require_ok(t, b_grad_err)
+	expect_f64_data(t, b_grad.data, expected_b)
+}
+
 @(test)
 test_tape_dot_rejects_batched_operands :: proc(t: ^testing.T) {
 	a, err := new_tensor(f64, []int{2, 2, 3})

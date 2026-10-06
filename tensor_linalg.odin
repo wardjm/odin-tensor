@@ -52,9 +52,10 @@ _PRODUCT_TILE_ROWS :: 2
 _PRODUCT_TILE_BYTES :: 64
 _PRODUCT_BLOCK_DEPTH :: 256
 // When a's inner elements are not adjacent, as for a transposed view in the
-// matmul backward, each step along k reads a fresh cache line of a. With
-// power-of-two row lengths those lines alias in L1, so a shallower block keeps
-// them resident; on the backward bench this cut the aᵀ @ b product by a quarter.
+// matmul backward or a forward transpose(x) @ y, each step along k reads a
+// fresh cache line of a. With power-of-two row lengths those lines alias in L1,
+// so a shallower block keeps them resident; on the backward bench this cut the
+// aᵀ @ b product by a quarter.
 _PRODUCT_STRIDED_BLOCK_DEPTH :: 64
 _PRODUCT_MIN_BLOCKED_DEPTH :: 8
 
