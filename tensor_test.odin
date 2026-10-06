@@ -1859,6 +1859,12 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&column_products)
 	product_total := prod_all(a, allocator) or_return
 	defer release(&product_total)
+	counts := from_slice(i8, []i8{1, 2, 3, 4}, []int{2, 2}, allocator) or_return
+	defer release(&counts)
+	wide_total := sum_all(counts, i64, allocator) or_return
+	defer release(&wide_total)
+	wide_view_total := sum_all_views(as_view(counts), i32, allocator) or_return
+	defer release(&wide_view_total)
 	column_variances := var_axis_views(as_view(a), 0, 1, false, allocator) or_return
 	defer release(&column_variances)
 	row_deviations := std_axis(a, 1, 0, true, allocator) or_return
@@ -2757,6 +2763,53 @@ test_float_sums_are_pairwise :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&count_total)
 	testing.expect_value(t, count_total.data[0], i32(3_000_000))
+}
+
+@(test)
+test_integer_sums_accept_a_wider_accumulator :: proc(t: ^testing.T) {
+	values, err := from_slice(i8, []i8{100, 100}, []int{2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&values)
+
+	wide: Tensor(i64)
+	wide, err = sum_all(values, i64)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&wide)
+	expect_shape(t, wide.shape, []int{})
+	testing.expect_value(t, wide.data[0], i64(200))
+
+	// Without an accumulator type the sum stays in i8 and wraps.
+	narrow: Tensor(i8)
+	narrow, err = sum_all(values)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&narrow)
+	testing.expect_value(t, narrow.data[0], i8(-56))
+
+	// Strided views are accepted, negative elements sign-extend, and an
+	// empty view sums to zero.
+	grid: Tensor(i8)
+	grid, err = from_slice(i8, []i8{100, -100, 100, 100, 100, 100}, []int{2, 3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&grid)
+	shape_buf, strides_buf: [2]int
+	transposed: Tensor_View(i8)
+	transposed, err = transpose_view(as_view(grid), shape_buf[:], strides_buf[:])
+	testing.expect_value(t, err, Tensor_Error.None)
+	view_total: Tensor(i32)
+	view_total, err = sum_all_views(transposed, i32)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&view_total)
+	testing.expect_value(t, view_total.data[0], i32(400))
+
+	empty: Tensor(u8)
+	empty, err = new_tensor(u8, []int{3, 0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty)
+	empty_total: Tensor(u64)
+	empty_total, err = sum_all(empty, Acc = u64)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty_total)
+	testing.expect_value(t, empty_total.data[0], u64(0))
 }
 
 @(test)

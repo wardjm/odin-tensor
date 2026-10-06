@@ -726,9 +726,17 @@ _reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operat
 
 // sum_all, mean_all, prod_all, max_all, and min_all reduce every element to a
 // rank-zero tensor. Max and min propagate NaN. mean requires a floating-point
-// type. Integer sums and products wrap on overflow.
-sum_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+// type. Integer sums and products wrap on overflow. sum_all and sum_all_views
+// also accept an integer accumulator type, as in sum_all(source, i64): each
+// element converts to Acc before it is added, and the result is a Tensor(Acc).
+sum_all :: proc{sum_all_same_type, sum_all_as}
+sum_all_views :: proc{sum_all_views_same_type, sum_all_views_as}
+
+sum_all_same_type :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(as_view(source), .Sum, allocator)
+}
+sum_all_as :: proc(source: Tensor($T), $Acc: typeid, allocator := context.allocator) -> (Tensor(Acc), Tensor_Error) where intrinsics.type_is_integer(T) && intrinsics.type_is_integer(Acc) {
+	return _sum_all_as_views(as_view(source), Acc, allocator)
 }
 mean_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _reduce_all_views(as_view(source), .Mean, allocator)
@@ -743,8 +751,11 @@ min_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T
 	return _reduce_all_views(as_view(source), .Min, allocator)
 }
 
-sum_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+sum_all_views_same_type :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(source, .Sum, allocator)
+}
+sum_all_views_as :: proc(source: Tensor_View($T), $Acc: typeid, allocator := context.allocator) -> (Tensor(Acc), Tensor_Error) where intrinsics.type_is_integer(T) && intrinsics.type_is_integer(Acc) {
+	return _sum_all_as_views(source, Acc, allocator)
 }
 mean_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _reduce_all_views(source, .Mean, allocator)
@@ -757,6 +768,25 @@ max_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -
 }
 min_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _reduce_all_views(source, .Min, allocator)
+}
+
+// _sum_all_as_views adds every element of a view into a new rank-zero
+// Tensor(Acc), converting each element to Acc first.
+_sum_all_as_views :: proc(source: Tensor_View($T), $Acc: typeid, allocator := context.allocator) -> (result: Tensor(Acc), err: Tensor_Error) {
+	_validate_view(source) or_return
+	count, _ := _element_count(source.shape)
+	row, row_count, step := _fold_layout(source, count)
+	value: Acc = 0
+	for r in 0..<row_count {
+		offset := _broadcast_offset(source, source.shape, r*row)
+		for _ in 0..<row {
+			value += Acc(source.data[offset])
+			offset += step
+		}
+	}
+	result = new_tensor(Acc, []int{}, allocator) or_return
+	result.data[0] = value
+	return result, .None
 }
 
 // _variance_run returns the variance of count elements starting at offset and

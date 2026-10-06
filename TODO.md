@@ -66,7 +66,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when: the signature changes and the callers in tests compile.
 - [x] **Decide `keep_dims` vs `keepdims`.** Either rename to NumPy's spelling or record the decision in the README.
   - Done when: one name is used everywhere (grep finds no mix).
-- [ ] **Optional wider accumulator for integer sums.** For example `sum_all(source, Acc = i64)`, returning `Tensor(Acc)`.
+- [x] **Optional wider accumulator for integer sums.** For example `sum_all(source, Acc = i64)`, returning `Tensor(Acc)`.
   - Done when: an i8 `[100,100]` sum into i64 gives 200, and the default still returns i8 (wrapping to -56).
 
 ## Test hygiene

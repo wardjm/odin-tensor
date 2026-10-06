@@ -72,6 +72,7 @@ The directory name contains a hyphen, so the import needs an explicit name such 
 | `a += b` | `add_in_place(&a, b)` |
 | `a.sum(axis=-1, keepdims=True)` | `sum_axis(a, -1, keep_dims = true)` |
 | `a.prod(axis=0)` | `prod_axis(a, 0)` |
+| `a.sum(dtype=np.int64)` | `sum_all(a, i64)` |
 | `a.sum(axis=(0, 2))` | `sum_axes(a, []int{0, 2})` |
 | `a.std(axis=0, ddof=1)` | `std_axis(a, 0, ddof = 1)` |
 | `a.max()` | `max_all(a)` (returns a rank-zero tensor) |
@@ -82,7 +83,7 @@ The directory name contains a hyphen, so the import needs an explicit name such 
 Differences to keep in mind:
 
 - Errors are values. Every fallible procedure returns a `Tensor_Error`; nothing panics on bad shapes.
-- Results never change type. `mean`, `var`, and `std` are only defined for floating-point tensors (they are a compile error on integers), and integer `sum` and `prod` accumulate in `T`, so they wrap on overflow where NumPy would widen.
+- Results never change type. `mean`, `var`, and `std` are only defined for floating-point tensors (they are a compile error on integers), and integer `sum` and `prod` accumulate in `T`, so they wrap on overflow where NumPy would widen. `sum_all(a, i64)` opts into a wider accumulator, like NumPy's `dtype=` argument.
 - Integer division truncates and returns `.Division_By_Zero` for a zero divisor, and `.Integer_Overflow` for signed `min(T) / -1`. Float division follows IEEE rules like NumPy: `x/0` is ±Inf or NaN.
 - `max` and `min` propagate NaN, like `np.max`.
 - Float `sum` and `mean` use pairwise summation, so rounding error grows with the log of the element count. NumPy only sums pairwise along the innermost contiguous axis; here every float sum is pairwise, including strided axes and whole-tensor sums over views. Integer sums add in order. `var` and `std` sum both the values and the squared deviations pairwise, in the same way.
@@ -122,7 +123,7 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 ### Reductions
 
-`sum_axis`, `mean_axis`, `prod_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `prod_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero and its product is one; mean/max/min of an empty reduction return `.Empty_Reduction`. Integer sums and products accumulate in the element type and wrap on overflow, so the product of seven `i8` 2s is -128.
+`sum_axis`, `mean_axis`, `prod_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `prod_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero and its product is one; mean/max/min of an empty reduction return `.Empty_Reduction`. Integer sums and products accumulate in the element type and wrap on overflow, so the product of seven `i8` 2s is -128. To sum integers in a wider type, pass it as the accumulator: `sum_all(source, i64)` and `sum_all_views(view, i64)` return a `Tensor(i64)`, so two `i8` 100s give 200 instead of -56. The accumulator must be an integer type, and each element converts to it before it is added.
 
 `sum_axes`, `mean_axes`, `prod_axes`, `max_axes`, and `min_axes` reduce several axes at once and take `(source, axes, keep_dims, allocator)`, with the same `_views`, `_into`, and `_views_into` forms. Negative axes count from the end, a repeated axis returns `.Invalid_Shape`, and an out-of-range one `.Out_Of_Bounds`. An empty `axes` list reduces nothing and copies the source, as NumPy's `axis=()` does.
 
