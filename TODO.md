@@ -57,7 +57,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when tests cover: finite differences pass on inputs without ties, and the gradient of `[3,3]` is `[1,0]`.
 - [x] **Differentiable views: `tape_transpose`, `tape_slice`, `tape_reshape`.**
   - Done when: finite differences pass through a transpose → matmul chain and a slice → sum chain.
-- [x] **Per-row offsets in the backward kernels.** `_backward_activation` and `_backward_binary_elementwise` still compute a full index per element.
+- [x] **Per-row offsets in the backward kernels.** `_backward_activation` and `_backward_binary_elementwise` find offsets once per row and step along it instead of computing a full index per element.
   - Done when: all autodiff tests pass unchanged, and `odin run bench -o:speed` reports PASS for `tape_mul + backward 1000x1000` (5× faster than its 130 ms baseline).
 
 ## API cleanups

@@ -1462,6 +1462,96 @@ test_tape_broadcast_gradients_through_strided_parent :: proc(t: ^testing.T) {
 	expect_f64_data(t, row_grad.data, []f64{-9.0/100, -26.0/400, -51.0/900})
 }
 
+@(test)
+test_tape_binary_backward_broadcasts_scalars_and_missing_axes :: proc(t: ^testing.T) {
+	scalar, err := from_slice(f64, []f64{3}, []int{})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&scalar)
+	grid: Tensor(f64)
+	grid, err = from_slice(f64, []f64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}, []int{2, 2, 3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&grid)
+	// column has shape [2, 1], so it is missing the leading axis of grid and is
+	// broadcast along the last one.
+	column: Tensor(f64)
+	column, err = from_slice(f64, []f64{2, 3}, []int{2, 1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&column)
+
+	tape, tape_err := tape_init(f64, 8)
+	testing.expect_value(t, tape_err, Tensor_Error.None)
+	defer tape_release(&tape)
+	scalar_value, scalar_err := tape_add_leaf_borrow(&tape, &scalar)
+	testing.expect_value(t, scalar_err, Tensor_Error.None)
+	grid_value, grid_err := tape_add_leaf_borrow(&tape, &grid)
+	testing.expect_value(t, grid_err, Tensor_Error.None)
+	column_value, column_err := tape_add_leaf_borrow(&tape, &column)
+	testing.expect_value(t, column_err, Tensor_Error.None)
+
+	scaled, scaled_err := tape_mul(&tape, scalar_value, grid_value)
+	testing.expect_value(t, scaled_err, Tensor_Error.None)
+	scaled_total, scaled_total_err := tape_sum_all(&tape, scaled)
+	testing.expect_value(t, scaled_total_err, Tensor_Error.None)
+	testing.expect_value(t, tape_backward(&tape, scaled_total), Tensor_Error.None)
+	scalar_grad, scalar_grad_err := tape_gradient(&tape, scalar_value)
+	testing.expect_value(t, scalar_grad_err, Tensor_Error.None)
+	expect_f64_data(t, scalar_grad.data, []f64{78})
+	grid_grad, grid_grad_err := tape_gradient(&tape, grid_value)
+	testing.expect_value(t, grid_grad_err, Tensor_Error.None)
+	expect_f64_data(t, grid_grad.data, []f64{3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3})
+
+	// The column is the second operand here, so the b-side gradient index
+	// must stay put along each row.
+	tape_zero_grad(&tape)
+	product, product_err := tape_mul(&tape, grid_value, column_value)
+	testing.expect_value(t, product_err, Tensor_Error.None)
+	product_total, product_total_err := tape_sum_all(&tape, product)
+	testing.expect_value(t, product_total_err, Tensor_Error.None)
+	testing.expect_value(t, tape_backward(&tape, product_total), Tensor_Error.None)
+	column_grad, column_grad_err := tape_gradient(&tape, column_value)
+	testing.expect_value(t, column_grad_err, Tensor_Error.None)
+	expect_f64_data(t, column_grad.data, []f64{30, 48})
+	expect_f64_data(t, grid_grad.data, []f64{2, 2, 2, 3, 3, 3, 2, 2, 2, 3, 3, 3})
+}
+
+@(test)
+test_tape_binary_backward_through_reversed_view :: proc(t: ^testing.T) {
+	storage, err := from_slice(f64, []f64{1, 2, 3, 4, 5}, []int{1, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&storage)
+	shape_buffer, strides_buffer := [2]int{}, [2]int{}
+	// reversed is [[5, 4, 3, 2, 1]] with strides {5, -1}.
+	reversed, view_err := slice_view(as_view(storage), 1, -1, 5, -1, shape_buffer[:], strides_buffer[:])
+	testing.expect_value(t, view_err, Tensor_Error.None)
+	column: Tensor(f64)
+	column, err = from_slice(f64, []f64{10, 20, 30}, []int{3, 1})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&column)
+	// A non-uniform seed makes both gradients depend on element order.
+	seed: Tensor(f64)
+	seed, err = from_slice(f64, []f64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}, []int{3, 5})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&seed)
+
+	tape, tape_err := tape_init(f64, 3)
+	testing.expect_value(t, tape_err, Tensor_Error.None)
+	defer tape_release(&tape)
+	reversed_value, reversed_err := tape_add_leaf_view(&tape, reversed)
+	testing.expect_value(t, reversed_err, Tensor_Error.None)
+	column_value, column_err := tape_add_leaf_borrow(&tape, &column)
+	testing.expect_value(t, column_err, Tensor_Error.None)
+	product, product_err := tape_mul(&tape, reversed_value, column_value)
+	testing.expect_value(t, product_err, Tensor_Error.None)
+	testing.expect_value(t, tape_backward_with_seed(&tape, product, seed), Tensor_Error.None)
+
+	reversed_grad, reversed_grad_err := tape_gradient(&tape, reversed_value)
+	testing.expect_value(t, reversed_grad_err, Tensor_Error.None)
+	expect_f64_data(t, reversed_grad.data, []f64{460, 520, 580, 640, 700})
+	column_grad, column_grad_err := tape_gradient(&tape, column_value)
+	testing.expect_value(t, column_grad_err, Tensor_Error.None)
+	expect_f64_data(t, column_grad.data, []f64{35, 110, 185})
+}
+
 tape_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	tape := tape_init(f64, 8, allocator) or_return
 	defer tape_release(&tape)
