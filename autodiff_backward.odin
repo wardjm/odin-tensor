@@ -121,8 +121,9 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 
 	for i in 0..<node_count {
 		if reached[i] && tape.nodes[i].requires_grad {
-			for j in 0..<len(tape.nodes[i].grad.data) {
-				tape.nodes[i].grad.data[j] += scratch[i].data[j]
+			gradient, contribution := tape.nodes[i].grad.data, scratch[i].data
+			for j in 0..<len(gradient) {
+				gradient[j] += contribution[j]
 			}
 		}
 	}
@@ -347,31 +348,55 @@ _backward_activation :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), inpu
 	if len(gradient.data) != len(output_grad.data) {
 		return .Shape_Mismatch
 	}
-	for linear in 0..<len(output_grad.data) {
-		input_offset := _broadcast_offset(input, input.shape, linear)
-		output_offset := _broadcast_offset(output, output.shape, linear)
-		derivative: T = 0
-		#partial switch operation {
-		case .Relu:
-			if input.data[input_offset] > 0 {
-				derivative = 1
-			}
-		case .Sigmoid:
-			value := output.data[output_offset]
-			derivative = value * (1-value)
-		case .Tanh:
-			value := output.data[output_offset]
-			derivative = 1 - value*value
-		case .Exp:
-			derivative = output.data[output_offset]
-		case .Log:
-			derivative = 1 / input.data[input_offset]
-		case .Sqrt:
-			derivative = 1 / (2*output.data[output_offset])
-		}
-		gradient.data[linear] += output_grad.data[linear] * derivative
+	#partial switch operation {
+	case .Relu:
+		_backward_activation_kernel(gradient.data, output_grad.data, input, output, .Relu)
+	case .Sigmoid:
+		_backward_activation_kernel(gradient.data, output_grad.data, input, output, .Sigmoid)
+	case .Tanh:
+		_backward_activation_kernel(gradient.data, output_grad.data, input, output, .Tanh)
+	case .Exp:
+		_backward_activation_kernel(gradient.data, output_grad.data, input, output, .Exp)
+	case .Log:
+		_backward_activation_kernel(gradient.data, output_grad.data, input, output, .Log)
+	case .Sqrt:
+		_backward_activation_kernel(gradient.data, output_grad.data, input, output, .Sqrt)
 	}
 	return .None
+}
+
+// _backward_activation_kernel is specialized per operation at compile time and
+// finds storage offsets once per row, stepping along it. Both views must be
+// validated and share the shape of the contiguous gradient and upstream.
+_backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Tensor_View(T), $operation: Tape_Operation) {
+	row := _row_length(input.shape)
+	input_step := _inner_step(input, input.shape)
+	output_step := _inner_step(output, output.shape)
+	for start := 0; start < len(upstream); start += row {
+		input_offset := _broadcast_offset(input, input.shape, start)
+		output_offset := _broadcast_offset(output, output.shape, start)
+		for i in start..<start+row {
+			derivative: T
+			when operation == .Relu {
+				derivative = 1 if input.data[input_offset] > 0 else 0
+			} else when operation == .Sigmoid {
+				value := output.data[output_offset]
+				derivative = value * (1-value)
+			} else when operation == .Tanh {
+				value := output.data[output_offset]
+				derivative = 1 - value*value
+			} else when operation == .Exp {
+				derivative = output.data[output_offset]
+			} else when operation == .Log {
+				derivative = 1 / input.data[input_offset]
+			} else when operation == .Sqrt {
+				derivative = 1 / (2*output.data[output_offset])
+			}
+			gradient[i] += upstream[i] * derivative
+			input_offset += input_step
+			output_offset += output_step
+		}
+	}
 }
 
 // _backward_binary_elementwise applies one binary VJP and reduces broadcasted
@@ -382,39 +407,77 @@ _backward_binary_elementwise :: proc(grad_a, grad_b: ^Tensor($T), output_grad: T
 	if !_broadcast_shapes_match(a.shape, b.shape, output_grad.shape) {
 		return .Shape_Mismatch
 	}
-	for linear in 0..<len(output_grad.data) {
-		a_offset := _broadcast_offset(a, output_grad.shape, linear)
-		b_offset := _broadcast_offset(b, output_grad.shape, linear)
-		a_grad_index, a_grad_ok := _broadcast_gradient_index(a.shape, output_grad.shape, linear)
-		b_grad_index, b_grad_ok := _broadcast_gradient_index(b.shape, output_grad.shape, linear)
+	#partial switch operation {
+	case .Add:
+		return _backward_binary_kernel(grad_a.data, grad_b.data, output_grad, a, b, .Add)
+	case .Sub:
+		return _backward_binary_kernel(grad_a.data, grad_b.data, output_grad, a, b, .Sub)
+	case .Mul:
+		return _backward_binary_kernel(grad_a.data, grad_b.data, output_grad, a, b, .Mul)
+	case .Div:
+		return _backward_binary_kernel(grad_a.data, grad_b.data, output_grad, a, b, .Div)
+	}
+	return .Unsupported_Operation
+}
+
+// _binary_vjp returns the contributions of one upstream value to each operand,
+// specialized per operation at compile time.
+_binary_vjp :: #force_inline proc(upstream, a, b: $T, $operation: Tape_Operation) -> (contribution_a, contribution_b: T) {
+	when operation == .Add {
+		return upstream, upstream
+	} else when operation == .Sub {
+		return upstream, -upstream
+	} else when operation == .Mul {
+		return upstream*b, upstream*a
+	} else {
+		return upstream / b, -(upstream * a) / (b * b)
+	}
+}
+
+// _backward_binary_kernel is specialized per operation at compile time. It
+// finds storage offsets and gradient indices once per row of the output and
+// steps along it; a parent broadcast along the last axis steps by zero, so its
+// contributions sum in place. grad_a or grad_b is nil when not tracked.
+_backward_binary_kernel :: proc(grad_a, grad_b: []$T, output_grad: Tensor(T), a, b: Tensor_View(T), $operation: Tape_Operation) -> Tensor_Error {
+	shape := output_grad.shape
+	row := _row_length(shape)
+	a_step := _inner_step(a, shape)
+	b_step := _inner_step(b, shape)
+	a_grad_step := _gradient_inner_step(a.shape)
+	b_grad_step := _gradient_inner_step(b.shape)
+	for start := 0; start < len(output_grad.data); start += row {
+		a_offset := _broadcast_offset(a, shape, start)
+		b_offset := _broadcast_offset(b, shape, start)
+		a_grad_index, a_grad_ok := _broadcast_gradient_index(a.shape, shape, start)
+		b_grad_index, b_grad_ok := _broadcast_gradient_index(b.shape, shape, start)
 		if !a_grad_ok || !b_grad_ok {
 			return .Invalid_Shape
 		}
-		upstream := output_grad.data[linear]
-		a_value := a.data[a_offset]
-		b_value := b.data[b_offset]
-		contribution_a, contribution_b := T(0), T(0)
-		#partial switch operation {
-		case .Add:
-			contribution_a, contribution_b = upstream, upstream
-		case .Sub:
-			contribution_a, contribution_b = upstream, -upstream
-		case .Mul:
-			contribution_a, contribution_b = upstream*b_value, upstream*a_value
-		case .Div:
-			contribution_a = upstream / b_value
-			contribution_b = -(upstream * a_value) / (b_value * b_value)
-		case:
-			return .Unsupported_Operation
-		}
-		if grad_a.data != nil {
-			grad_a.data[a_grad_index] += contribution_a
-		}
-		if grad_b.data != nil {
-			grad_b.data[b_grad_index] += contribution_b
+		for i in start..<start+row {
+			contribution_a, contribution_b := _binary_vjp(output_grad.data[i], a.data[a_offset], b.data[b_offset], operation)
+			if grad_a != nil {
+				grad_a[a_grad_index] += contribution_a
+			}
+			if grad_b != nil {
+				grad_b[b_grad_index] += contribution_b
+			}
+			a_offset += a_step
+			b_offset += b_step
+			a_grad_index += a_grad_step
+			b_grad_index += b_grad_step
 		}
 	}
 	return .None
+}
+
+// _gradient_inner_step is the step between consecutive output elements along
+// the last axis in a parent's contiguous gradient, or zero when the parent is
+// broadcast along that axis.
+_gradient_inner_step :: proc(shape: []int) -> int {
+	if len(shape) == 0 || shape[len(shape)-1] == 1 {
+		return 0
+	}
+	return 1
 }
 
 // _backward_dot applies vector/vector, matrix/vector, vector/matrix, or

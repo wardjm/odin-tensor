@@ -742,6 +742,33 @@ test_tape_activation_reverse_rules :: proc(t: ^testing.T) {
 	}
 }
 
+@(test)
+test_tape_activation_backward_through_strided_parent :: proc(t: ^testing.T) {
+	storage, err := from_slice(f64, []f64{1, 2, 4, 5, 8, 10}, []int{3, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&storage)
+	shape_buffer, strides_buffer := [2]int{}, [2]int{}
+	// transposed is [[1, 4, 8], [2, 5, 10]] with strides {1, 2}.
+	transposed, view_err := transpose_view(as_view(storage), shape_buffer[:], strides_buffer[:])
+	testing.expect_value(t, view_err, Tensor_Error.None)
+
+	tape, tape_err := tape_init(f64, 3)
+	testing.expect_value(t, tape_err, Tensor_Error.None)
+	defer tape_release(&tape)
+	parent, parent_err := tape_add_leaf_view(&tape, transposed)
+	testing.expect_value(t, parent_err, Tensor_Error.None)
+	logarithm, log_err := tape_log(&tape, parent)
+	testing.expect_value(t, log_err, Tensor_Error.None)
+	loss, loss_err := tape_sum_all(&tape, logarithm)
+	testing.expect_value(t, loss_err, Tensor_Error.None)
+	testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
+	// The log rule reads the strided input, so each gradient is 1/x in the
+	// view's logical order.
+	gradient, gradient_err := tape_gradient(&tape, parent)
+	testing.expect_value(t, gradient_err, Tensor_Error.None)
+	expect_f64_data(t, gradient.data, []f64{1, 0.25, 0.125, 0.5, 0.2, 0.1})
+}
+
 activation_forward :: proc(input: Tensor(f64), operation: Tape_Operation) -> (output: Tensor(f64), err: Tensor_Error) {
 	#partial switch operation {
 	case .Relu: return relu(input)
