@@ -60,6 +60,9 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
 - [x] **Per-row offsets in the backward kernels.** `_backward_activation` and `_backward_binary_elementwise` find offsets once per row and step along it instead of computing a full index per element.
   - Done when: all autodiff tests pass unchanged, and `odin run bench -o:speed` reports PASS for `tape_mul + backward 1000x1000` (5× faster than its 130 ms baseline).
 
+- [ ] **Blocked matmul backward.** `_backward_matrix_product` is a naive triple loop with strided reads and a checked index per multiply-add, so at 512×512 the backward takes about 570 ms against about 10 ms forward. Compute `grad_a += upstream @ bᵀ` and `grad_b += aᵀ @ upstream` with `_product_kernel` over transposed views, adding into the gradient (an accumulate flag on the kernel, or a scratch product then add).
+  - Done when: all autodiff tests pass unchanged, including the batched and broadcast `check_tape_helper(.Matmul, …)` cases, and a new bench case `tape_matmul + backward 512` reports PASS (10× faster than its baseline, measured before the change with `-define:BENCH_BASELINE=true`).
+
 ## API cleanups
 
 - [x] **`scale_in_place` returns nothing.** It can only ever return `.None`. Also decide whether `add_scaled_in_place` should accept a broadcast `source` (it currently requires the same shape).
