@@ -73,7 +73,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
 
 - [x] **Messages on bare `testing.expect`.** Give each one a message, or switch to `expect_value`, so failures say what differed.
   - Done when: `grep -n 'testing.expect(t, ' *_test.odin` returns no lines.
-- [ ] **Stop setup failures from cascading into panics.** Stop the test immediately when setup fails.
+- [x] **Stop setup failures from cascading into panics.** Stop the test immediately when setup fails.
   - Done when: a deliberately failing `from_slice` in a test reports one failure instead of an index panic.
 - [ ] **Pass the allocator through every call in the tensor allocation scenario.** `tensor_allocation_scenario` calls `add`, `sum_axis`, `matmul`, `dot`, `exp` and `mean_all` without `allocator`, so those calls never see the failing allocator and their partial-failure cleanup is untested.
   - Done when: every allocating call in the scenario passes `allocator`, and the tests still pass.
