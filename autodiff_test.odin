@@ -1068,6 +1068,13 @@ test_reduction_gradients_match_finite_differences :: proc(t: ^testing.T) {
 	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Mean_All, -1, false, false)
 	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9, 0.8, 0.1}, []int{2, 2, 2}, .Sum_Axis, 1, true, false)
 	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Mean_Axis, 1, false, true)
+	// Max and min have no ties here, so the gradient is unique. The transposed
+	// cases check that the chosen element is found in logical order.
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Max_All, -1, false, true)
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Min_All, -1, false, false)
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9, 0.8, 0.1}, []int{2, 2, 2}, .Max_Axis, 1, true, false)
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Min_Axis, 1, false, true)
+	check_reduction_finite_difference(t, []f64{0.2, -0.7, 1.1, 0.4, -0.3, 0.9}, []int{2, 3}, .Max_Axis, 0, false, true)
 }
 
 check_reduction_finite_difference :: proc(t: ^testing.T, values: []f64, shape: []int, operation: Tape_Operation, axis: int, keep_dims, transpose: bool) {
@@ -1130,6 +1137,10 @@ reduction_output :: proc(source: Tensor_View(f64), operation: Tape_Operation, ax
 	case .Mean_All: return mean_all_views(source)
 	case .Sum_Axis: return sum_axis_views(source, axis, keep_dims)
 	case .Mean_Axis: return mean_axis_views(source, axis, keep_dims)
+	case .Max_All: return max_all_views(source)
+	case .Min_All: return min_all_views(source)
+	case .Max_Axis: return max_axis_views(source, axis, keep_dims)
+	case .Min_Axis: return min_axis_views(source, axis, keep_dims)
 	case: return {}, .Unsupported_Operation
 	}
 }
@@ -1140,6 +1151,10 @@ record_reduction :: proc(tape: ^Tape(f64), output: ^Tensor(f64), operation: Tape
 	case .Mean_All: return tape_record_mean_all(tape, output, parent)
 	case .Sum_Axis: return tape_record_sum_axis(tape, output, parent, axis, keep_dims)
 	case .Mean_Axis: return tape_record_mean_axis(tape, output, parent, axis, keep_dims)
+	case .Max_All: return tape_record_max_all(tape, output, parent)
+	case .Min_All: return tape_record_min_all(tape, output, parent)
+	case .Max_Axis: return tape_record_max_axis(tape, output, parent, axis, keep_dims)
+	case .Min_Axis: return tape_record_min_axis(tape, output, parent, axis, keep_dims)
 	case: return {}, .Unsupported_Operation
 	}
 }
@@ -1440,15 +1455,16 @@ tape_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	exponential_value := tape_exp(&tape, activated_value) or_return
 	root_value := tape_sqrt(&tape, exponential_value) or_return
 	logged_value := tape_log(&tape, root_value) or_return
-	logged_view := tape_value(&tape, logged_value) or_return
-	means := mean_axis_views(logged_view, 1, false, allocator) or_return
+	peaks_value := tape_max_axis(&tape, logged_value, 0, true) or_return
+	peaks_view := tape_value(&tape, peaks_value) or_return
+	means := mean_axis_views(peaks_view, 1, false, allocator) or_return
 	defer release(&means)
-	means_value := tape_record_mean_axis(&tape, &means, logged_value, 1) or_return
+	means_value := tape_record_mean_axis(&tape, &means, peaks_value, 1) or_return
 	means_view := tape_value(&tape, means_value) or_return
-	total := sum_all_views(means_view, allocator) or_return
-	defer release(&total)
-	total_value := tape_record_sum_all(&tape, &total, means_value) or_return
-	return tape_backward(&tape, total_value)
+	lowest := min_all_views(means_view, allocator) or_return
+	defer release(&lowest)
+	lowest_value := tape_record_min_all(&tape, &lowest, means_value) or_return
+	return tape_backward(&tape, lowest_value)
 }
 
 @(test)
@@ -1492,6 +1508,14 @@ apply_tape_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Ta
 		return tape_sum_axis(tape, a, -1)
 	case .Mean_Axis:
 		return tape_mean_axis(tape, a, 0, true)
+	case .Max_All:
+		return tape_max_all(tape, a)
+	case .Min_All:
+		return tape_min_all(tape, a)
+	case .Max_Axis:
+		return tape_max_axis(tape, a, -1)
+	case .Min_Axis:
+		return tape_min_axis(tape, a, 0, true)
 	}
 	return {}, .Unsupported_Operation
 }
@@ -1575,7 +1599,8 @@ test_every_tape_helper_matches_finite_differences :: proc(t: ^testing.T) {
 	check_tape_helper(t, .Dot, matrix_values, []int{2, 3}, row_values, []int{3})
 	// matmul promotes a vector left operand to a row, as in NumPy.
 	check_tape_helper(t, .Matmul, row_values, []int{3}, matrix_values, []int{3, 2})
-	for operation in ([]Tape_Operation{.Relu, .Sigmoid, .Tanh, .Sum_All, .Mean_All, .Sum_Axis, .Mean_Axis}) {
+	// matrix_values has no ties, so max and min are differentiable there.
+	for operation in ([]Tape_Operation{.Relu, .Sigmoid, .Tanh, .Sum_All, .Mean_All, .Sum_Axis, .Mean_Axis, .Max_All, .Min_All, .Max_Axis, .Min_Axis}) {
 		check_tape_helper(t, operation, matrix_values, []int{2, 3}, row_values, []int{3})
 	}
 	// log and sqrt are only differentiable for positive inputs.
@@ -1583,6 +1608,81 @@ test_every_tape_helper_matches_finite_differences :: proc(t: ^testing.T) {
 	for operation in ([]Tape_Operation{.Exp, .Log, .Sqrt}) {
 		check_tape_helper(t, operation, positive_values, []int{2, 3}, row_values, []int{3})
 	}
+}
+
+@(test)
+test_tape_max_and_min_send_tied_gradient_to_first_index :: proc(t: ^testing.T) {
+	tied, err := from_slice(f64, []f64{3, 3}, []int{2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&tied)
+	// A NaN wins over every number, as in argmax and argmin.
+	with_nan, nan_err := from_slice(f64, []f64{1, math.nan_f64(), 2, math.nan_f64()}, []int{2, 2})
+	testing.expect_value(t, nan_err, Tensor_Error.None)
+	defer release(&with_nan)
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer tape_release(&tape)
+
+	for operation in ([]Tape_Operation{.Max_All, .Min_All, .Max_Axis, .Min_Axis}) {
+		tape_reset(&tape)
+		x_value, x_err := tape_add_leaf_borrow(&tape, &tied)
+		testing.expect_value(t, x_err, Tensor_Error.None)
+		y, y_err := apply_tape_helper(&tape, x_value, x_value, operation)
+		testing.expectf(t, y_err == .None, "%v: %v", operation, y_err)
+		loss, loss_err := tape_sum_all(&tape, y)
+		testing.expect_value(t, loss_err, Tensor_Error.None)
+		testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
+		x_grad, _ := tape_gradient(&tape, x_value)
+		testing.expectf(t, x_grad.data[0] == 1 && x_grad.data[1] == 0, "%v: gradient of [3,3] is %v, want [1,0]", operation, x_grad.data)
+
+		tape_reset(&tape)
+		nan_value, nan_value_err := tape_add_leaf_borrow(&tape, &with_nan)
+		testing.expect_value(t, nan_value_err, Tensor_Error.None)
+		y, y_err = apply_tape_helper(&tape, nan_value, nan_value, operation)
+		testing.expectf(t, y_err == .None, "%v: %v", operation, y_err)
+		loss, loss_err = tape_sum_all(&tape, y)
+		testing.expect_value(t, loss_err, Tensor_Error.None)
+		testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
+		nan_grad, _ := tape_gradient(&tape, nan_value)
+		// Global reductions pick the first NaN; axis -1 picks it in each row,
+		// and axis 0 picks it in the second column only.
+		want := []f64{0, 1, 0, 0}
+		#partial switch operation {
+		case .Max_Axis: want = []f64{0, 1, 0, 1}
+		case .Min_Axis: want = []f64{1, 1, 0, 0}
+		}
+		expect_f64_data(t, nan_grad.data, want)
+	}
+}
+
+@(test)
+test_tape_max_and_min_reject_empty_reductions :: proc(t: ^testing.T) {
+	empty, err := new_tensor(f64, []int{2, 0})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&empty)
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer tape_release(&tape)
+	x_value, x_err := tape_add_leaf_borrow(&tape, &empty)
+	testing.expect_value(t, x_err, Tensor_Error.None)
+
+	_, max_err := tape_max_all(&tape, x_value)
+	testing.expect_value(t, max_err, Tensor_Error.Empty_Reduction)
+	_, min_err := tape_min_axis(&tape, x_value, 1)
+	testing.expect_value(t, min_err, Tensor_Error.Empty_Reduction)
+	// Reducing the non-empty axis leaves an empty result, which is fine.
+	_, columns_err := tape_max_axis(&tape, x_value, 0)
+	testing.expect_value(t, columns_err, Tensor_Error.None)
+
+	// The record procedures check too, and leave the output with the caller.
+	manual, manual_err := new_tensor(f64, []int{})
+	testing.expect_value(t, manual_err, Tensor_Error.None)
+	defer release(&manual)
+	_, record_err := tape_record_min_all(&tape, &manual, x_value)
+	testing.expect_value(t, record_err, Tensor_Error.Empty_Reduction)
+	testing.expect_value(t, len(manual.data), 1)
 }
 
 @(test)

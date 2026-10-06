@@ -102,6 +102,14 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			err = _backward_sum_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims)
 		case .Mean_Axis:
 			err = _backward_mean_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims)
+		case .Max_All:
+			err = _backward_extreme_all(&scratch[a], scratch[node_id], tape.nodes[a].value, .Max)
+		case .Min_All:
+			err = _backward_extreme_all(&scratch[a], scratch[node_id], tape.nodes[a].value, .Min)
+		case .Max_Axis:
+			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Max)
+		case .Min_Axis:
+			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Min)
 		case .Leaf:
 		}
 		if err != .None {
@@ -225,6 +233,54 @@ _backward_mean_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input:
 	contribution := output_grad.data[0] / T(count)
 	for linear in 0..<count {
 		gradient.data[linear] += contribution
+	}
+	return .None
+}
+
+// _backward_extreme_all adds the scalar upstream gradient to the one element
+// argmax_all (.Max) or argmin_all (.Min) picks, found again from the input.
+_backward_extreme_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), $operation: _Reduction_Operation) -> Tensor_Error where intrinsics.type_is_float(T) {
+	if len(output_grad.shape) != 0 || len(output_grad.data) != 1 {
+		return .Shape_Mismatch
+	}
+	if !_shapes_match(gradient.shape, input.shape) {
+		return .Shape_Mismatch
+	}
+	_validate_view(input) or_return
+	count, valid := _element_count(input.shape)
+	if !valid || count != len(gradient.data) {
+		return .Invalid_Shape
+	}
+	if count == 0 {
+		return .Empty_Reduction
+	}
+	gradient.data[_arg_all_index(input, count, operation)] += output_grad.data[0]
+	return .None
+}
+
+// _backward_extreme_axis adds each upstream value to the element along axis
+// that argmax_axis (.Max) or argmin_axis (.Min) picks, found again from the
+// input.
+_backward_extreme_axis :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), axis: int, keep_dims: bool, $operation: _Reduction_Operation) -> Tensor_Error where intrinsics.type_is_float(T) {
+	_validate_view(input) or_return
+	if axis < 0 || axis >= len(input.shape) {
+		return .Out_Of_Bounds
+	}
+	if !_shapes_match(gradient.shape, input.shape) || !_reduction_shape_matches(output_grad, input.shape, axis, keep_dims) {
+		return .Shape_Mismatch
+	}
+	reduced_count := input.shape[axis]
+	if reduced_count == 0 {
+		return .Empty_Reduction
+	}
+	inner := _reduction_inner_count(input.shape, axis)
+	for output_index in 0..<len(output_grad.data) {
+		offset := _reduction_base_offset(input, axis, inner, output_index)
+		best := _arg_run(input.data, offset, input.strides[axis], reduced_count, operation)
+		// The gradient is contiguous, so the reduced axis advances by inner.
+		outer_index := output_index / inner
+		inner_index := output_index - outer_index*inner
+		gradient.data[(outer_index*reduced_count + best)*inner + inner_index] += output_grad.data[output_index]
 	}
 	return .None
 }

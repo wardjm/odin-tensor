@@ -24,6 +24,10 @@ Tape_Operation :: enum {
 	Mean_All,
 	Sum_Axis,
 	Mean_Axis,
+	Max_All,
+	Min_All,
+	Max_Axis,
+	Min_Axis,
 }
 
 _Tape_Node :: struct($T: typeid) {
@@ -224,8 +228,28 @@ tape_record_mean_axis :: proc(tape: ^Tape($T), output: ^Tensor(T), parent: Tape_
 	return _tape_record_reduction(tape, output, .Mean_Axis, parent, axis, keep_dims)
 }
 
+// tape_record_max_all, tape_record_min_all, tape_record_max_axis, and
+// tape_record_min_axis transfer eager max/min results. Backward sends each
+// upstream value to the element argmax or argmin picks.
+tape_record_max_all :: proc(tape: ^Tape($T), output: ^Tensor(T), parent: Tape_Value(T)) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_record_reduction(tape, output, .Max_All, parent, -1, false)
+}
+
+tape_record_min_all :: proc(tape: ^Tape($T), output: ^Tensor(T), parent: Tape_Value(T)) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_record_reduction(tape, output, .Min_All, parent, -1, false)
+}
+
+tape_record_max_axis :: proc(tape: ^Tape($T), output: ^Tensor(T), parent: Tape_Value(T), axis: int, keep_dims := false) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_record_reduction(tape, output, .Max_Axis, parent, axis, keep_dims)
+}
+
+tape_record_min_axis :: proc(tape: ^Tape($T), output: ^Tensor(T), parent: Tape_Value(T), axis: int, keep_dims := false) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_record_reduction(tape, output, .Min_Axis, parent, axis, keep_dims)
+}
+
 // _tape_record_reduction transfers a correctly shaped eager result only after
-// all parent, operation, and shape checks succeed.
+// all parent, operation, and shape checks succeed. Only sums accept an empty
+// reduction.
 _tape_record_reduction :: proc(tape: ^Tape($T), output: ^Tensor(T), operation: Tape_Operation, parent: Tape_Value(T), axis: int, keep_dims: bool) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
 	parent_node := _tape_node(tape, parent)
 	if parent_node == nil {
@@ -236,11 +260,11 @@ _tape_record_reduction :: proc(tape: ^Tape($T), output: ^Tensor(T), operation: T
 	}
 	parent_value := parent_node.value
 	normalized_axis := axis
-	if operation == .Sum_All || operation == .Mean_All {
+	if operation == .Sum_All || operation == .Mean_All || operation == .Max_All || operation == .Min_All {
 		if len(output.shape) != 0 || len(output.data) != 1 {
 			return result, .Shape_Mismatch
 		}
-		if operation == .Mean_All {
+		if operation != .Sum_All {
 			count, _ := _element_count(parent_value.shape)
 			if count == 0 {
 				return result, .Empty_Reduction
@@ -251,7 +275,7 @@ _tape_record_reduction :: proc(tape: ^Tape($T), output: ^Tensor(T), operation: T
 		if !_reduction_shape_matches(output^, parent_value.shape, normalized_axis, keep_dims) {
 			return result, .Shape_Mismatch
 		}
-		if operation == .Mean_Axis && parent_value.shape[normalized_axis] == 0 {
+		if operation != .Sum_Axis && parent_value.shape[normalized_axis] == 0 {
 			return result, .Empty_Reduction
 		}
 	}

@@ -9,7 +9,7 @@ A small, generic, row-major tensor library for Odin, with strided views, NumPy-s
 - `sum`/`mean`/`max`/`min` over one axis or the whole tensor, with negative axes and `keep_dims`.
 - `dot` for vectors and matrices; `matmul` also for stacks of matrices, with broadcast batch axes.
 - Allocation-free `_into` and `_in_place` forms for hot loops.
-- Reverse-mode autodiff for add/sub/mul/div, dot/matmul, ReLU/sigmoid/tanh, exp/log/sqrt, and sum/mean reductions.
+- Reverse-mode autodiff for add/sub/mul/div, dot/matmul, ReLU/sigmoid/tanh, exp/log/sqrt, and sum/mean/max/min reductions.
 
 ## Quick start
 
@@ -193,13 +193,13 @@ main :: proc() {
 ```
 
 - **Leaves.** `tape_add_leaf_borrow` and `tape_add_leaf_view` borrow data, which must stay alive and unchanged until the tape is reset or released. `tape_add_leaf_copy` snapshots a view into tape-owned storage. Pass `false` as `requires_grad` for constants such as targets.
-- **Operations.** `tape_add`, `tape_sub`, `tape_mul`, `tape_div`, `tape_dot`, `tape_matmul`, `tape_relu`, `tape_sigmoid`, `tape_tanh`, `tape_exp`, `tape_log`, `tape_sqrt`, `tape_sum_all`, `tape_mean_all`, `tape_sum_axis`, and `tape_mean_axis` compute the forward value and record it in one call. `tape_dot` keeps `dot`'s rank-one/rank-two rule, while `tape_matmul` accepts batched operands like `matmul`. Their result is tape-owned; read it with `tape_value`, which returns a view usable with any `_views` procedure. `tape_log` and `tape_sqrt` of zero give an infinite gradient rather than an error (NaN where the upstream gradient is zero, which then stays in the input's gradient until `tape_zero_grad`), and negative inputs give NaN, as in `log` and `sqrt`.
+- **Operations.** `tape_add`, `tape_sub`, `tape_mul`, `tape_div`, `tape_dot`, `tape_matmul`, `tape_relu`, `tape_sigmoid`, `tape_tanh`, `tape_exp`, `tape_log`, `tape_sqrt`, `tape_sum_all`, `tape_mean_all`, `tape_sum_axis`, `tape_mean_axis`, `tape_max_all`, `tape_min_all`, `tape_max_axis`, and `tape_min_axis` compute the forward value and record it in one call. `tape_dot` keeps `dot`'s rank-one/rank-two rule, while `tape_matmul` accepts batched operands like `matmul`. Their result is tape-owned; read it with `tape_value`, which returns a view usable with any `_views` procedure. `tape_log` and `tape_sqrt` of zero give an infinite gradient rather than an error (NaN where the upstream gradient is zero, which then stays in the input's gradient until `tape_zero_grad`), and negative inputs give NaN, as in `log` and `sqrt`. Max and min send the whole gradient to the one element `argmax`/`argmin` picks: the first on a tie, or the first NaN. PyTorch instead splits a tie's gradient evenly between the tied elements.
 - **Recording eager results.** The lower-level `tape_record_unary`, `tape_record_binary`, and `tape_record_*` reduction procedures move a result you computed yourself onto the tape. They check shapes but trust that the result matches the named operation. On success they take ownership of the output; on failure the caller keeps it.
 - **Gradients.** `tape_backward(&tape, loss)` seeds a rank-zero value with one; `tape_backward_with_seed` takes an explicit seed for other shapes. Only nodes the loss depends on are visited. Gradients accumulate across calls until `tape_zero_grad`; `tape_gradient` returns a view of a node's gradient, or `.Gradient_Not_Tracked` for constants.
 - **Handles.** A `Tape_Value` is an id, not a pointer, so a `Tape` can be moved freely. Every call takes the tape explicitly. A handle from another tape, or from before `tape_reset`/`tape_release`, returns `.Invalid_Tape`.
 - **Lifetime.** The tape grows as needed (`tape_init(T, reserve)` preallocates). `tape_reset` releases every node but keeps the storage, for rebuilding the graph each training step.
 
-Not differentiable yet: `max`/`min`, `prod`, `var`/`std`, and slicing or broadcasting views (broadcasting inside `tape_add`, `tape_matmul` etc. is differentiable).
+Not differentiable yet: `prod`, `var`/`std`, and slicing or broadcasting views (broadcasting inside `tape_add`, `tape_matmul` etc. is differentiable).
 
 ## Limitations
 

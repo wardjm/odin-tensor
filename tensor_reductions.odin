@@ -501,23 +501,31 @@ _arg_reduce_axis_views_into :: proc(output: ^Tensor(int), source: Tensor_View($T
 	reduced_stride := source.strides[reduced_axis]
 	for output_index in 0..<len(output.data) {
 		offset := _reduction_base_offset(source, reduced_axis, inner, output_index)
-		best := source.data[offset]
-		best_index := 0
-		for index in 1..<reduced_count {
-			when intrinsics.type_is_float(T) {
-				if best != best {
-					break
-				}
-			}
-			offset += reduced_stride
-			element := source.data[offset]
-			if _arg_is_better(element, best, operation) {
-				best, best_index = element, index
-			}
-		}
-		output.data[output_index] = best_index
+		output.data[output_index] = _arg_run(source.data, offset, reduced_stride, reduced_count, operation)
 	}
 	return .None
+}
+
+// _arg_run returns the position, among count > 0 elements starting at offset
+// and advancing by step, of the largest (.Max) or smallest (.Min) one. Ties
+// pick the first and the first NaN wins.
+_arg_run :: #force_inline proc(data: []$T, offset, step, count: int, $operation: _Reduction_Operation) -> int {
+	offset := offset
+	best := data[offset]
+	best_index := 0
+	for index in 1..<count {
+		when intrinsics.type_is_float(T) {
+			if best != best {
+				break
+			}
+		}
+		offset += step
+		element := data[offset]
+		if _arg_is_better(element, best, operation) {
+			best, best_index = element, index
+		}
+	}
+	return best_index
 }
 
 // _arg_is_better reports whether element should replace best in an argmax
@@ -593,6 +601,14 @@ _arg_reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Op
 		return result, .Empty_Reduction
 	}
 	result = new_tensor(int, []int{}, allocator) or_return
+	result.data[0] = _arg_all_index(source, count, operation)
+	return result, .None
+}
+
+// _arg_all_index returns the flat logical index of the largest (.Max) or
+// smallest (.Min) of the count > 0 elements of a validated view. Ties pick the
+// first index and the first NaN wins.
+_arg_all_index :: proc(source: Tensor_View($T), count: int, $operation: _Reduction_Operation) -> int {
 	row := _row_length(source.shape)
 	step := _inner_step(source, source.shape)
 	best := source.data[source.offset]
@@ -612,8 +628,7 @@ _arg_reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Op
 			offset += step
 		}
 	}
-	result.data[0] = best_index
-	return result, .None
+	return best_index
 }
 
 // argmax_all and argmin_all return the flat row-major index of the largest or
