@@ -1464,7 +1464,11 @@ tape_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	lowest := min_all_views(means_view, allocator) or_return
 	defer release(&lowest)
 	lowest_value := tape_record_min_all(&tape, &lowest, means_value) or_return
-	return tape_backward(&tape, lowest_value)
+	lowest_view := tape_value(&tape, lowest_value) or_return
+	total := sum_all_views(lowest_view, allocator) or_return
+	defer release(&total)
+	total_value := tape_record_sum_all(&tape, &total, lowest_value) or_return
+	return tape_backward(&tape, total_value)
 }
 
 @(test)
@@ -1611,7 +1615,7 @@ test_every_tape_helper_matches_finite_differences :: proc(t: ^testing.T) {
 }
 
 @(test)
-test_tape_max_and_min_send_tied_gradient_to_first_index :: proc(t: ^testing.T) {
+test_tape_max_and_min_route_gradient_like_argmax :: proc(t: ^testing.T) {
 	tied, err := from_slice(f64, []f64{3, 3}, []int{2})
 	testing.expect_value(t, err, Tensor_Error.None)
 	defer release(&tied)
@@ -1673,8 +1677,15 @@ test_tape_max_and_min_reject_empty_reductions :: proc(t: ^testing.T) {
 	_, min_err := tape_min_axis(&tape, x_value, 1)
 	testing.expect_value(t, min_err, Tensor_Error.Empty_Reduction)
 	// Reducing the non-empty axis leaves an empty result, which is fine.
-	_, columns_err := tape_max_axis(&tape, x_value, 0)
+	columns, columns_err := tape_max_axis(&tape, x_value, 0)
 	testing.expect_value(t, columns_err, Tensor_Error.None)
+	empty_seed, empty_seed_err := new_tensor(f64, []int{0})
+	testing.expect_value(t, empty_seed_err, Tensor_Error.None)
+	defer release(&empty_seed)
+	testing.expect_value(t, tape_backward_with_seed(&tape, columns, empty_seed), Tensor_Error.None)
+	empty_grad, empty_grad_err := tape_gradient(&tape, x_value)
+	testing.expect_value(t, empty_grad_err, Tensor_Error.None)
+	testing.expect_value(t, len(empty_grad.data), 0)
 
 	// The record procedures check too, and leave the output with the caller.
 	manual, manual_err := new_tensor(f64, []int{})
@@ -1683,6 +1694,65 @@ test_tape_max_and_min_reject_empty_reductions :: proc(t: ^testing.T) {
 	_, record_err := tape_record_min_all(&tape, &manual, x_value)
 	testing.expect_value(t, record_err, Tensor_Error.Empty_Reduction)
 	testing.expect_value(t, len(manual.data), 1)
+	manual_rows, manual_rows_err := new_tensor(f64, []int{2})
+	testing.expect_value(t, manual_rows_err, Tensor_Error.None)
+	defer release(&manual_rows)
+	_, axis_record_err := tape_record_max_axis(&tape, &manual_rows, x_value, 1)
+	testing.expect_value(t, axis_record_err, Tensor_Error.Empty_Reduction)
+	testing.expect_value(t, len(manual_rows.data), 2)
+}
+
+@(test)
+test_tape_max_and_min_axis_gradients_through_permuted_view :: proc(t: ^testing.T) {
+	storage, err := from_slice(f64, []f64{0.3, -1.2, 0.8, 1.5, -0.4, 0.9, 0.7, -0.5, 1.3, -0.2, 1.1, 0.6}, []int{2, 2, 3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&storage)
+	shape_buffer, strides_buffer := [3]int{}, [3]int{}
+	// permuted has shape {3, 2, 2} and strides {1, 6, 3}, so reducing the
+	// middle axis walks a non-contiguous outer and inner index at once.
+	permuted, view_err := permute_view(as_view(storage), []int{2, 0, 1}, shape_buffer[:], strides_buffer[:])
+	testing.expect_value(t, view_err, Tensor_Error.None)
+	contiguous: Tensor(f64)
+	contiguous, err = copy_view(permuted)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&contiguous)
+	seed: Tensor(f64)
+	seed, err = new_tensor(f64, []int{3, 2})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&seed)
+	for &value, i in seed.data {
+		value = f64(i + 1)
+	}
+
+	extreme_middle_axis :: proc(tape: ^Tape(f64), x: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
+		if operation == .Max_Axis {
+			return tape_max_axis(tape, x, 1)
+		}
+		return tape_min_axis(tape, x, 1)
+	}
+	for operation in ([]Tape_Operation{.Max_Axis, .Min_Axis}) {
+		view_tape, view_tape_err := tape_init(f64)
+		testing.expect_value(t, view_tape_err, Tensor_Error.None)
+		defer tape_release(&view_tape)
+		view_x, view_x_err := tape_add_leaf_view(&view_tape, permuted)
+		testing.expect_value(t, view_x_err, Tensor_Error.None)
+		view_y, view_y_err := extreme_middle_axis(&view_tape, view_x, operation)
+		testing.expectf(t, view_y_err == .None, "%v: %v", operation, view_y_err)
+		testing.expect_value(t, tape_backward_with_seed(&view_tape, view_y, seed), Tensor_Error.None)
+
+		copy_tape, copy_tape_err := tape_init(f64)
+		testing.expect_value(t, copy_tape_err, Tensor_Error.None)
+		defer tape_release(&copy_tape)
+		copy_x, copy_x_err := tape_add_leaf_borrow(&copy_tape, &contiguous)
+		testing.expect_value(t, copy_x_err, Tensor_Error.None)
+		copy_y, copy_y_err := extreme_middle_axis(&copy_tape, copy_x, operation)
+		testing.expectf(t, copy_y_err == .None, "%v: %v", operation, copy_y_err)
+		testing.expect_value(t, tape_backward_with_seed(&copy_tape, copy_y, seed), Tensor_Error.None)
+
+		view_grad, _ := tape_gradient(&view_tape, view_x)
+		copy_grad, _ := tape_gradient(&copy_tape, copy_x)
+		expect_f64_data(t, view_grad.data, copy_grad.data)
+	}
 }
 
 @(test)

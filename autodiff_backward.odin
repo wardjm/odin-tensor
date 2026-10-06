@@ -269,6 +269,10 @@ _backward_extreme_axis :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), in
 	if !_shapes_match(gradient.shape, input.shape) || !_reduction_shape_matches(output_grad, input.shape, axis, keep_dims) {
 		return .Shape_Mismatch
 	}
+	input_count, valid := _element_count(input.shape)
+	if !valid || input_count != len(gradient.data) {
+		return .Invalid_Shape
+	}
 	reduced_count := input.shape[axis]
 	if reduced_count == 0 {
 		return .Empty_Reduction
