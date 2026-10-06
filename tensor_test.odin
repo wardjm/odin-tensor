@@ -1961,6 +1961,8 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&row_max)
 	smallest_total := min_axes_views(as_view(a), []int{1, 0}, false, allocator) or_return
 	defer release(&smallest_total)
+	plane_products := prod_axes(a, []int{0, 1}, false, allocator) or_return
+	defer release(&plane_products)
 	return .None
 }
 
