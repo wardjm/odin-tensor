@@ -1912,20 +1912,20 @@ tensor_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	defer release(&a)
 	row := from_slice(f64, []f64{1, 2, 3}, []int{3}, allocator) or_return
 	defer release(&row)
-	sum := add(a, row) or_return
+	sum := add(a, row, allocator) or_return
 	defer release(&sum)
 	reshape(&sum, []int{6}) or_return
-	axis_sum := sum_axis(a, 1, true) or_return
+	axis_sum := sum_axis(a, 1, true, allocator) or_return
 	defer release(&axis_sum)
 	transposed := transpose_copy(as_view(a), allocator) or_return
 	defer release(&transposed)
-	product := matmul(a, transposed) or_return
+	product := matmul(a, transposed, allocator) or_return
 	defer release(&product)
-	vector := dot(a, row) or_return
+	vector := dot(a, row, allocator) or_return
 	defer release(&vector)
-	exponentials := exp(a) or_return
+	exponentials := exp(a, allocator) or_return
 	defer release(&exponentials)
-	mean := mean_all(a) or_return
+	mean := mean_all(a, allocator) or_return
 	defer release(&mean)
 	indices := argmax_axis(a, 1, true, allocator) or_return
 	defer release(&indices)
