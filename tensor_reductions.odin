@@ -235,9 +235,9 @@ _reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _Redu
 }
 
 // sum_axis, mean_axis, prod_axis, max_axis, and min_axis reduce one axis. A
-// negative axis counts from the end, and keep_dims is NumPy's keepdims. The
-// product of an empty axis is 1; mean/max/min of an empty axis return
-// Empty_Reduction. mean requires a floating-point type. Integer sums and
+// negative axis counts from the end, and keep_dims keeps the reduced axis with
+// size 1. The product of an empty axis is 1; mean/max/min of an empty axis
+// return Empty_Reduction. mean requires a floating-point type. Integer sums and
 // products wrap on overflow.
 sum_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_axis_views(as_view(source), axis, .Sum, keep_dims, allocator)
@@ -559,7 +559,7 @@ _arg_reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _
 
 // argmax_axis and argmin_axis return the index of the largest or smallest
 // element along one axis as a Tensor(int). A negative axis counts from the end,
-// and keep_dims is NumPy's keepdims. Ties pick the first index, a NaN wins, and
+// and keep_dims keeps the reduced axis with size 1. Ties pick the first index, a NaN wins, and
 // an empty axis returns Empty_Reduction.
 argmax_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views(as_view(source), axis, .Max, keep_dims, allocator)
@@ -817,7 +817,7 @@ _variance_axis_views :: proc(source: Tensor_View($T), axis, ddof: int, $take_sqr
 
 // var_axis and std_axis return the variance and standard deviation along one
 // axis, dividing by n-ddof as in NumPy. A negative axis counts from the end,
-// and keep_dims is NumPy's keepdims. n == 0 or ddof >= n returns
+// and keep_dims keeps the reduced axis with size 1. n == 0 or ddof >= n returns
 // Empty_Reduction. Both require a floating-point type.
 var_axis :: proc(source: Tensor($T), axis: int, ddof := 0, keep_dims := false, allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _variance_axis_views(as_view(source), axis, ddof, false, keep_dims, allocator)

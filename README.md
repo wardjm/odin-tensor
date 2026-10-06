@@ -70,7 +70,7 @@ The directory name contains a hyphen, so the import needs an explicit name such 
 | `a + b`, `a / b` | `add(a, b)`, `div(a, b)` |
 | `np.add(a, b, out=c)` | `add_into(&c, a, b)` |
 | `a += b` | `add_in_place(&a, b)` |
-| `a.sum(axis=-1, keepdims=True)` | `sum_axis(a, -1, true)` |
+| `a.sum(axis=-1, keepdims=True)` | `sum_axis(a, -1, keep_dims = true)` |
 | `a.prod(axis=0)` | `prod_axis(a, 0)` |
 | `a.sum(axis=(0, 2))` | `sum_axes(a, []int{0, 2})` |
 | `a.std(axis=0, ddof=1)` | `std_axis(a, 0, ddof = 1)` |
@@ -86,6 +86,7 @@ Differences to keep in mind:
 - Integer division truncates and returns `.Division_By_Zero` for a zero divisor, and `.Integer_Overflow` for signed `min(T) / -1`. Float division follows IEEE rules like NumPy: `x/0` is ±Inf or NaN.
 - `max` and `min` propagate NaN, like `np.max`.
 - Float `sum` and `mean` use pairwise summation, so rounding error grows with the log of the element count. NumPy only sums pairwise along the innermost contiguous axis; here every float sum is pairwise, including strided axes and whole-tensor sums over views. Integer sums add in order. `var` and `std` sum both the values and the squared deviations pairwise, in the same way.
+- Names follow Odin's snake_case, so NumPy's `keepdims` is spelled `keep_dims` everywhere.
 - Views are explicit. A view never owns memory, and procedures that build one take caller-provided shape and stride buffers.
 - `slice_view` takes a count instead of a stop index, so reverse and empty slices are unambiguous.
 - Element types must be numeric (`add` on `Tensor(bool)` is a compile error); unary math requires floats.
