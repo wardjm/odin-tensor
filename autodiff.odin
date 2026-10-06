@@ -58,16 +58,18 @@ tape_tanh :: proc(tape: ^Tape($T), x: Tape_Value(T)) -> (Tape_Value(T), Tensor_E
 	return _tape_unary(tape, x, .Tanh)
 }
 
-// tape_log of zero records -Inf and gives an Inf gradient; tape_sqrt of zero
-// likewise gives an Inf gradient. Negative inputs give NaN, as in log and sqrt.
 tape_exp :: proc(tape: ^Tape($T), x: Tape_Value(T)) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _tape_unary(tape, x, .Exp)
 }
 
+// tape_log of zero records -Inf and gives an infinite gradient (NaN where the
+// upstream gradient is zero). Negative inputs give NaN, as in log.
 tape_log :: proc(tape: ^Tape($T), x: Tape_Value(T)) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _tape_unary(tape, x, .Log)
 }
 
+// tape_sqrt of zero gives an infinite gradient (NaN where the upstream gradient
+// is zero). Negative inputs give NaN, as in sqrt.
 tape_sqrt :: proc(tape: ^Tape($T), x: Tape_Value(T)) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _tape_unary(tape, x, .Sqrt)
 }

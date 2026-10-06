@@ -701,10 +701,16 @@ test_tape_elementwise_broadcast_gradient_reduction :: proc(t: ^testing.T) {
 
 @(test)
 test_tape_activation_reverse_rules :: proc(t: ^testing.T) {
-	input_values := []f64{-1.1, 0.4, 1.7}
+	signed_values := []f64{-1.1, 0.4, 1.7}
+	// log and sqrt are only differentiable for positive inputs.
+	positive_values := []f64{0.3, 0.4, 1.7}
 	seed_values := []f64{0.5, -1.25, 2}
-	operations := [3]Tape_Operation{.Relu, .Sigmoid, .Tanh}
+	operations := [6]Tape_Operation{.Relu, .Sigmoid, .Tanh, .Exp, .Log, .Sqrt}
 	for operation in operations {
+		input_values := signed_values
+		if operation == .Log || operation == .Sqrt {
+			input_values = positive_values
+		}
 		input, input_err := from_slice(f64, input_values, []int{3})
 		testing.expect(t, input_err == .None)
 		defer release(&input)
@@ -741,6 +747,9 @@ activation_forward :: proc(input: Tensor(f64), operation: Tape_Operation) -> (ou
 	case .Relu: return relu(input)
 	case .Sigmoid: return sigmoid(input)
 	case .Tanh: return tanh(input)
+	case .Exp: return exp(input)
+	case .Log: return log(input)
+	case .Sqrt: return sqrt(input)
 	case: return output, .Unsupported_Operation
 	}
 }
@@ -753,6 +762,9 @@ activation_scalar :: proc(value: f64, operation: Tape_Operation) -> f64 {
 		e := math.exp(value)
 		return e/(1+e)
 	case .Tanh: return math.tanh(value)
+	case .Exp: return math.exp(value)
+	case .Log: return math.ln(value)
+	case .Sqrt: return math.sqrt(value)
 	case: return 0
 	}
 }
