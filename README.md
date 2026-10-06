@@ -6,7 +6,7 @@ A small, generic, row-major tensor library for Odin, with strided views, NumPy-s
 
 - Owned tensors with explicit allocators, plus borrowed strided views (transpose, axis permutation, slicing, broadcasting) that never copy.
 - Element-wise `add`/`sub`/`mul`/`div` with NumPy broadcasting; `exp`, `log`, `sqrt`, `relu`, `sigmoid`, and `tanh` for floats.
-- `sum`/`mean`/`max`/`min` over one axis or the whole tensor, with negative axes and `keep_dims`.
+- `sum`/`mean`/`prod`/`max`/`min` and `var`/`std` (with `ddof`) over one axis, several axes, or the whole tensor, with negative axes and `keep_dims`; `argmax`/`argmin` over one axis or the whole tensor.
 - `dot` for vectors and matrices; `matmul` also for stacks of matrices, with broadcast batch axes.
 - Allocation-free `_into` and `_in_place` forms for hot loops.
 - Reverse-mode autodiff for add/sub/mul/div, dot/matmul, ReLU/sigmoid/tanh, exp/log/sqrt, sum/mean/max/min reductions, and transpose/slice/reshape views.
@@ -123,7 +123,7 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 ### Reductions
 
-`sum_axis`, `mean_axis`, `prod_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `prod_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero and its product is one; mean/max/min of an empty reduction return `.Empty_Reduction`. Integer sums and products accumulate in the element type and wrap on overflow, so the product of seven `i8` 2s is -128. To sum integers in a wider type, pass it as the accumulator: `sum_all(source, i64)` and `sum_all_views(view, i64)` return a `Tensor(i64)`, so two `i8` 100s give 200 instead of -56. The accumulator must be an integer type, and each element converts to it before it is added.
+`sum_axis`, `mean_axis`, `prod_axis`, `max_axis`, and `min_axis` take `(source, axis, keep_dims, allocator)` and come in `_views`, `_into`, and `_views_into` forms. `sum_all`, `mean_all`, `prod_all`, `max_all`, and `min_all` return a rank-zero tensor and come in `_views` forms. Summing an empty tensor gives zero and its product is one; mean/max/min of an empty reduction return `.Empty_Reduction`. Integer sums and products accumulate in the element type and wrap on overflow, so the product of seven `i8` 2s is -128. To sum integers in a wider type, pass it as the accumulator: `sum_all(source, i64)` and `sum_all_views(view, i64)` return a `Tensor(i64)`, so two `i8` 100s give 200 instead of -56. The accumulator must be an integer type that holds every value of the element type (as wide with the same signedness, or wider and signed for an unsigned source), so `sum_all(source_i32, u8)` is a compile error, and each element converts to it before it is added.
 
 `sum_axes`, `mean_axes`, `prod_axes`, `max_axes`, and `min_axes` reduce several axes at once and take `(source, axes, keep_dims, allocator)`, with the same `_views`, `_into`, and `_views_into` forms. Negative axes count from the end, a repeated axis returns `.Invalid_Shape`, and an out-of-range one `.Out_Of_Bounds`. An empty `axes` list reduces nothing and copies the source, as NumPy's `axis=()` does.
 
@@ -202,7 +202,7 @@ main :: proc() {
 - **Handles.** A `Tape_Value` is an id, not a pointer, so a `Tape` can be moved freely. Every call takes the tape explicitly. A handle from another tape, or from before `tape_reset`/`tape_release`, returns `.Invalid_Tape`.
 - **Lifetime.** The tape grows as needed (`tape_init(T, reserve)` preallocates). `tape_reset` releases every node but keeps the storage, for rebuilding the graph each training step.
 
-Not differentiable yet: `prod`, `var`/`std`, `permute_view`, and `broadcast_view` (broadcasting inside `tape_add`, `tape_matmul` etc. is differentiable).
+Not differentiable yet: `prod`, `var`/`std`, the several-axes `*_axes` reductions, `permute_view`, and `broadcast_view` (broadcasting inside `tape_add`, `tape_matmul` etc. is differentiable).
 
 ## Limitations
 
