@@ -1791,6 +1791,62 @@ test_tape_allocation_failures_release_partial_results :: proc(t: ^testing.T) {
 	expect_clean_allocation_failures(t, tape_allocation_scenario)
 }
 
+// long_prod_root multiplies three products of x, each too long for the
+// backward pass's stack scratch: along a contiguous axis, over a strided view,
+// and over the contiguous whole.
+long_prod_root :: proc(tape: ^Tape(f64), x: Tape_Value(f64)) -> (root: Tape_Value(f64), err: Tensor_Error) {
+	rows := tape_prod_axis(tape, x, 1) or_return
+	row_product := tape_prod_all(tape, rows) or_return
+	transposed := tape_transpose(tape, x) or_return
+	strided_product := tape_prod_all(tape, transposed) or_return
+	product := tape_prod_all(tape, x) or_return
+	partial := tape_mul(tape, row_product, strided_product) or_return
+	return tape_mul(tape, partial, product)
+}
+
+long_prod_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
+	tape := tape_init(f64, 8, allocator) or_return
+	defer tape_release(&tape)
+	x := new_tensor(f64, []int{2, _PROD_STACK_COUNT+1}, allocator) or_return
+	defer release(&x)
+	x_value := tape_add_leaf_borrow(&tape, &x) or_return
+	root := long_prod_root(&tape, x_value) or_return
+	return tape_backward(&tape, root)
+}
+
+@(test)
+test_tape_long_prod_gradients_allocate_scratch :: proc(t: ^testing.T) {
+	expect_clean_allocation_failures(t, long_prod_allocation_scenario)
+
+	count := 2*(_PROD_STACK_COUNT+1)
+	values := make([]f64, count)
+	defer delete(values)
+	for &value in values {
+		value = 1
+	}
+	values[0] = 2
+	x, err := from_slice(f64, values, []int{2, _PROD_STACK_COUNT+1})
+	require_ok(t, err)
+	defer release(&x)
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	require_ok(t, err)
+	defer tape_release(&tape)
+	x_value, x_err := tape_add_leaf_borrow(&tape, &x)
+	require_ok(t, x_err)
+	root, root_err := long_prod_root(&tape, x_value)
+	require_ok(t, root_err)
+	// Each of the three products is 2, so the root is 8. Through each one,
+	// x[0] gets 1 * 4 and every other element 2 * 4.
+	expected := make([]f64, count)
+	defer delete(expected)
+	for &value in expected {
+		value = 24
+	}
+	expected[0] = 12
+	expect_parent_gradient(t, &tape, root, []f64{1}, []int{}, x_value, expected)
+}
+
 // apply_tape_helper runs one tape_<op> helper. b is ignored by unary and
 // reduction operations.
 apply_tape_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
@@ -2162,6 +2218,14 @@ test_tape_prod_gradients_handle_zeros_and_empty_products :: proc(t: ^testing.T) 
 	expect_f64_data(t, row_view.data, []f64{0, 0, 2})
 	expect_parent_gradient(t, &tape, row_products, []f64{1, 1, 1}, []int{3}, x_value, []f64{0, 6, 0, 0, 0, 0, 2, 0.5, 4})
 
+	// Down the columns, the reduced axis and its gradient both step by 3.
+	column_products, column_err := tape_prod_axis(&tape, x_value, 0)
+	require_ok(t, column_err)
+	column_view, column_view_err := tape_value(&tape, column_products)
+	require_ok(t, column_view_err)
+	expect_f64_data(t, column_view.data, []f64{0, 0, 0})
+	expect_parent_gradient(t, &tape, column_products, []f64{1, 1, 1}, []int{3}, x_value, []f64{0, 20, 0, 2, 0, 1.5, 0, 0, 0})
+
 	// The whole matrix holds three zeros, so every gradient is zero.
 	total, total_err := tape_prod_all(&tape, x_value)
 	require_ok(t, total_err)
@@ -2171,6 +2235,16 @@ test_tape_prod_gradients_handle_zeros_and_empty_products :: proc(t: ^testing.T) 
 	first_total, first_total_err := tape_prod_all(&tape, first_row)
 	require_ok(t, first_total_err)
 	expect_parent_gradient(t, &tape, first_total, []f64{2}, []int{}, x_value, []f64{0, 12, 0, 0, 0, 0, 0, 0, 0})
+
+	// A product of one element passes the upstream gradient straight through.
+	single, single_err := tape_slice(&tape, x_value, 1, 1, 1)
+	require_ok(t, single_err)
+	single_products, single_products_err := tape_prod_axis(&tape, single, 1)
+	require_ok(t, single_products_err)
+	single_view, single_view_err := tape_value(&tape, single_products)
+	require_ok(t, single_view_err)
+	expect_f64_data(t, single_view.data, []f64{0, 5, 4})
+	expect_parent_gradient(t, &tape, single_products, []f64{3, 4, 7}, []int{3}, x_value, []f64{0, 3, 0, 0, 4, 0, 0, 7, 0})
 
 	// Empty products are 1 and send nothing back.
 	empty_value, empty_err := tape_add_leaf_borrow(&tape, &empty)

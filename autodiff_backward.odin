@@ -244,8 +244,8 @@ _backward_mean_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input:
 	return .None
 }
 
-// _backward_prod_all copies the input into logical order, then adds the
-// scalar upstream gradient times the product of every other element.
+// _backward_prod_all adds the scalar upstream gradient times the product of
+// every other element. A strided input is first copied into logical order.
 _backward_prod_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), allocator := context.allocator) -> Tensor_Error where intrinsics.type_is_float(T) {
 	if len(output_grad.shape) != 0 || len(output_grad.data) != 1 {
 		return .Shape_Mismatch
@@ -261,14 +261,18 @@ _backward_prod_all :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input:
 	if count == 0 {
 		return .None
 	}
-	buffer, alloc_err := make([]T, 2*count, allocator)
-	if alloc_err != nil {
-		return .Allocation_Failed
+	contiguous := _is_contiguous_view(input)
+	stack: [_PROD_STACK_COUNT]T
+	scratch, owned := _prod_scratch(stack[:], count if contiguous else 2*count, allocator) or_return
+	defer if owned {
+		delete(scratch, allocator)
 	}
-	defer delete(buffer, allocator)
-	values, prefix := buffer[:count], buffer[count:]
-	_copy_into(values, input)
-	_backward_prod_run(gradient.data, 0, 1, values, 0, 1, count, output_grad.data[0], prefix)
+	data, offset := input.data, input.offset
+	if !contiguous {
+		data, offset = scratch[count:], 0
+		_copy_into(data, input)
+	}
+	_backward_prod_run(gradient.data, 0, 1, data, offset, 1, count, output_grad.data[0], scratch[:count])
 	return .None
 }
 
@@ -290,11 +294,11 @@ _backward_prod_axis :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input
 		return .None
 	}
 	reduced_count := input.shape[axis]
-	prefix, alloc_err := make([]T, reduced_count, allocator)
-	if alloc_err != nil {
-		return .Allocation_Failed
+	stack: [_PROD_STACK_COUNT]T
+	prefix, owned := _prod_scratch(stack[:], reduced_count, allocator) or_return
+	defer if owned {
+		delete(prefix, allocator)
 	}
-	defer delete(prefix, allocator)
 	inner := _reduction_inner_count(input.shape, axis)
 	for output_index in 0..<len(output_grad.data) {
 		offset := _reduction_base_offset(input, axis, inner, output_index)
@@ -304,6 +308,23 @@ _backward_prod_axis :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input
 		_backward_prod_run(gradient.data, outer_index*reduced_count*inner + inner_index, inner, input.data, offset, input.strides[axis], reduced_count, output_grad.data[output_index], prefix)
 	}
 	return .None
+}
+
+// Product backward passes keep up to _PROD_STACK_COUNT scratch elements on the
+// stack, so short products need no allocation.
+_PROD_STACK_COUNT :: 64
+
+// _prod_scratch returns the first count elements of stack, or allocates count
+// elements when stack is too short. owned reports whether to delete them.
+_prod_scratch :: proc(stack: []$T, count: int, allocator := context.allocator) -> (scratch: []T, owned: bool, err: Tensor_Error) {
+	if count <= len(stack) {
+		return stack[:count], false, .None
+	}
+	buffer, alloc_err := make([]T, count, allocator)
+	if alloc_err != nil {
+		return nil, false, .Allocation_Failed
+	}
+	return buffer, true, .None
 }
 
 // _backward_prod_run adds upstream times the product of the other count-1
