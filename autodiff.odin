@@ -235,9 +235,6 @@ _tape_view :: proc(tape: ^Tape($T), x: Tape_Value(T), operation: Tape_Operation,
 	case .Slice:
 		template.axis = _normalize_axis(axis, len(parent.shape)) or_return
 		template.start = start
-		if start < 0 {
-			template.start += parent.shape[template.axis]
-		}
 		template.step = step
 		storage = _new_view_storage(T, len(parent.shape), tape.allocator) or_return
 		value = slice_view(parent, template.axis, template.start, count, step, storage.shape, storage.strides) or_return

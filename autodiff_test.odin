@@ -1703,6 +1703,8 @@ test_tape_views_borrow_and_validate :: proc(t: ^testing.T) {
 
 	_, bad_slice := tape_slice(&tape, x_value, 1, 2, 2)
 	testing.expect_value(t, bad_slice, Tensor_Error.Out_Of_Bounds)
+	_, bad_negative_start := tape_slice(&tape, x_value, 1, -4, 1)
+	testing.expect_value(t, bad_negative_start, Tensor_Error.Out_Of_Bounds)
 	_, bad_axis := tape_slice(&tape, x_value, 2, 0, 1)
 	testing.expect_value(t, bad_axis, Tensor_Error.Out_Of_Bounds)
 	_, bad_reshape := tape_reshape(&tape, x_value, []int{4, -1})
