@@ -51,16 +51,22 @@ _dot_result_shape :: proc(a_shape, b_shape, shape_buffer: []int) -> (rank: int, 
 _PRODUCT_TILE_ROWS :: 2
 _PRODUCT_TILE_BYTES :: 64
 _PRODUCT_BLOCK_DEPTH :: 256
+// When a's inner elements are not adjacent, as for a transposed view in the
+// matmul backward, each step along k reads a fresh cache line of a. With
+// power-of-two row lengths those lines alias in L1, so a shallower block keeps
+// them resident; on the backward bench this cut the aᵀ @ b product by a quarter.
+_PRODUCT_STRIDED_BLOCK_DEPTH :: 64
 _PRODUCT_MIN_BLOCKED_DEPTH :: 8
 
 // _product_kernel computes output = a @ b with vectors treated as a single row
-// (a) or column (b). The outer loop walks k blocks; within each, column tiles
-// pack their panel of b and then sweep the row tiles, and columns past the
-// last full tile take the unpacked i-k-j loop. Each output element still sums
-// its k products in order from zero, so blocking does not change the result.
-// The inlining directives on the _product_strip calls are measured choices:
-// either way round, narrow or tail-heavy products lose 10-15%.
-_product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
+// (a) or column (b), or output += a @ b when accumulate is set. The outer loop
+// walks k blocks; within each, column tiles pack their panel of b and then
+// sweep the row tiles, and columns past the last full tile take the unpacked
+// i-k-j loop. Each output element still adds its k products in order onto its
+// starting value (zero unless accumulating), so blocking does not change the
+// result. The inlining directives on the _product_strip calls are measured
+// choices: either way round, narrow or tail-heavy products lose 10-15%.
+_product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) #no_bounds_check {
 	TILE_COLUMNS :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
@@ -70,8 +76,10 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 	a_inner_stride := a.strides[a_rank-1]
 	b_row_stride := b.strides[0]
 	b_column_stride := b.strides[1] if b_rank == 2 else 0
-	for &value in output {
-		value = 0
+	if !accumulate {
+		for &value in output {
+			value = 0
+		}
 	}
 	if m < _PRODUCT_TILE_ROWS || k < _PRODUCT_MIN_BLOCKED_DEPTH || n < TILE_COLUMNS {
 		#force_inline _product_strip(output, a, b, 0, k, 0, n)
@@ -80,8 +88,9 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 	full_rows := m - m%_PRODUCT_TILE_ROWS
 	full_columns := n - n%TILE_COLUMNS
 	panel: [_PRODUCT_BLOCK_DEPTH*TILE_COLUMNS]T = ---
-	for k0 := 0; k0 < k; k0 += _PRODUCT_BLOCK_DEPTH {
-		depth := min(_PRODUCT_BLOCK_DEPTH, k-k0)
+	block_depth := _PRODUCT_BLOCK_DEPTH if a_inner_stride == 1 else _PRODUCT_STRIDED_BLOCK_DEPTH
+	for k0 := 0; k0 < k; k0 += block_depth {
+		depth := min(block_depth, k-k0)
 		a_block := a
 		a_block.offset += k0*a_inner_stride
 		block_panel := panel[:depth*TILE_COLUMNS]

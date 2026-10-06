@@ -38,6 +38,7 @@ State :: struct {
 	square_256_out:                 tensor.Tensor(f32),
 	row_out, narrow, narrow_out:    tensor.Tensor(f32),
 	grad_left, grad_right:          tensor.Tensor(f64),
+	grad_512_a, grad_512_b:         tensor.Tensor(f64),
 }
 
 N :: 1000
@@ -59,6 +60,8 @@ CASES := []Case{
 	{name = "matmul_into 1000x1000 @ 1000x15", run = bench_matmul_narrow, repetitions = 20},
 	// TODO.md: per-row offsets in backward kernels, at least 5x faster.
 	{name = "tape_mul + backward 1000x1000", run = bench_tape_mul_backward, repetitions = 5, baseline_ms = 130, target_speedup = 5},
+	// TODO.md: blocked matmul backward, at least 10x faster.
+	{name = "tape_matmul + backward 512", run = bench_tape_matmul_backward, repetitions = 5, baseline_ms = 547, target_speedup = 10},
 }
 
 main :: proc() {
@@ -133,6 +136,8 @@ setup :: proc(s: ^State) {
 	s.narrow_out = filled(f32, []int{N, 15}, 0)
 	s.grad_left = filled(f64, []int{N, N}, 0.5)
 	s.grad_right = filled(f64, []int{N, N}, 2)
+	s.grad_512_a = filled(f64, []int{512, 512}, 0.5)
+	s.grad_512_b = filled(f64, []int{512, 512}, 2)
 }
 
 teardown :: proc(s: ^State) {
@@ -141,6 +146,8 @@ teardown :: proc(s: ^State) {
 	}
 	tensor.release(&s.grad_left)
 	tensor.release(&s.grad_right)
+	tensor.release(&s.grad_512_a)
+	tensor.release(&s.grad_512_b)
 }
 
 bench_add :: proc(s: ^State) {
@@ -207,6 +214,21 @@ bench_tape_mul_backward :: proc(s: ^State) {
 	right, right_err := tensor.tape_add_leaf_borrow(&tape, &s.grad_right)
 	must(right_err)
 	product, product_err := tensor.tape_mul(&tape, left, right)
+	must(product_err)
+	loss, loss_err := tensor.tape_sum_all(&tape, product)
+	must(loss_err)
+	must(tensor.tape_backward(&tape, loss))
+}
+
+bench_tape_matmul_backward :: proc(s: ^State) {
+	tape, err := tensor.tape_init(f64)
+	must(err)
+	defer tensor.tape_release(&tape)
+	left, left_err := tensor.tape_add_leaf_borrow(&tape, &s.grad_512_a)
+	must(left_err)
+	right, right_err := tensor.tape_add_leaf_borrow(&tape, &s.grad_512_b)
+	must(right_err)
+	product, product_err := tensor.tape_matmul(&tape, left, right)
 	must(product_err)
 	loss, loss_err := tensor.tape_sum_all(&tape, product)
 	must(loss_err)

@@ -559,42 +559,40 @@ _backward_matmul :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a,
 // _backward_matrix_product accumulates one rank-one/rank-two product's
 // gradients into contiguous grad_a and grad_b (nil when not tracked). A vector
 // a is a single row and a vector b a single column, as in the forward kernel.
+// With a as [m,k], b as [k,n] and upstream as [m,n], grad_a += upstream @ bᵀ
+// and grad_b += aᵀ @ upstream, each run through the blocked forward kernel on
+// transposed views. Each gradient element adds its terms in the same order as
+// an element-by-element loop, so the result matches one exactly.
 _backward_matrix_product :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T)) -> Tensor_Error {
 	a_rank, b_rank := len(a.shape), len(b.shape)
-	inner_count := a.shape[a_rank-1]
+	k := a.shape[a_rank-1]
 	m := a.shape[0] if a_rank == 2 else 1
 	n := b.shape[1] if b_rank == 2 else 1
-	a_row_stride := a.strides[0] if a_rank == 2 else 0
-	b_column_stride := b.strides[1] if b_rank == 2 else 0
-	for i in 0..<m {
-		for j in 0..<n {
-			upstream_index := i*n + j
-			if upstream_index >= len(upstream) {
-				return .Invalid_Shape
-			}
-			gradient := upstream[upstream_index]
-			for inner in 0..<inner_count {
-				a_offset := a.offset + i*a_row_stride + inner*a.strides[a_rank-1]
-				b_offset := b.offset + inner*b.strides[0] + j*b_column_stride
-				if a_offset < 0 || a_offset >= len(a.data) || b_offset < 0 || b_offset >= len(b.data) {
-					return .Out_Of_Bounds
-				}
-				if grad_a != nil {
-					a_grad_index := i*inner_count + inner
-					if a_grad_index >= len(grad_a) {
-						return .Invalid_Shape
-					}
-					grad_a[a_grad_index] += gradient*b.data[b_offset]
-				}
-				if grad_b != nil {
-					b_grad_index := inner*n + j
-					if b_grad_index >= len(grad_b) {
-						return .Invalid_Shape
-					}
-					grad_b[b_grad_index] += gradient*a.data[a_offset]
-				}
-			}
-		}
+	a_shape := [2]int{m, k}
+	a_strides := [2]int{a.strides[0] if a_rank == 2 else 0, a.strides[a_rank-1]}
+	b_shape := [2]int{k, n}
+	b_strides := [2]int{b.strides[0], b.strides[1] if b_rank == 2 else 0}
+	a_matrix := Tensor_View(T){data = a.data, shape = a_shape[:], strides = a_strides[:], offset = a.offset}
+	b_matrix := Tensor_View(T){data = b.data, shape = b_shape[:], strides = b_strides[:], offset = b.offset}
+	_validate_autodiff_view(a_matrix) or_return
+	_validate_autodiff_view(b_matrix) or_return
+	if len(upstream) < m*n || (grad_a != nil && len(grad_a) < m*k) || (grad_b != nil && len(grad_b) < k*n) {
+		return .Invalid_Shape
+	}
+	upstream_shape := [2]int{m, n}
+	upstream_strides := [2]int{n, 1}
+	upstream_matrix := Tensor_View(T){data = upstream, shape = upstream_shape[:], strides = upstream_strides[:]}
+	if grad_a != nil {
+		b_transposed_shape := [2]int{n, k}
+		b_transposed_strides := [2]int{b_strides[1], b_strides[0]}
+		b_transposed := Tensor_View(T){data = b.data, shape = b_transposed_shape[:], strides = b_transposed_strides[:], offset = b.offset}
+		_product_kernel(grad_a[:m*k], upstream_matrix, b_transposed, accumulate = true)
+	}
+	if grad_b != nil {
+		a_transposed_shape := [2]int{k, m}
+		a_transposed_strides := [2]int{a_strides[1], a_strides[0]}
+		a_transposed := Tensor_View(T){data = a.data, shape = a_transposed_shape[:], strides = a_transposed_strides[:], offset = a.offset}
+		_product_kernel(grad_b[:k*n], a_transposed, upstream_matrix, accumulate = true)
 	}
 	return .None
 }
