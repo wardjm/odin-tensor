@@ -110,6 +110,8 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Max)
 		case .Min_Axis:
 			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Min)
+		case .Transpose, .Slice, .Reshape:
+			err = _backward_view(&scratch[a], scratch[node_id], node.operation, node.axis, node.start, node.step)
 		case .Leaf:
 		}
 		if err != .None {
@@ -285,6 +287,44 @@ _backward_extreme_axis :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), in
 		outer_index := output_index / inner
 		inner_index := output_index - outer_index*inner
 		gradient.data[(outer_index*reduced_count + best)*inner + inner_index] += output_grad.data[output_index]
+	}
+	return .None
+}
+
+// _backward_view applies the forward view to the input's contiguous gradient
+// and adds the upstream gradient through it, so each upstream value lands on
+// the input element it was read from.
+_backward_view :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), operation: Tape_Operation, axis, start, step: int) -> Tensor_Error where intrinsics.type_is_float(T) {
+	if len(output_grad.data) == 0 {
+		return .None
+	}
+	shape_buffer, strides_buffer: [MAX_RANK]int
+	target := as_view(gradient^)
+	#partial switch operation {
+	case .Transpose:
+		target = transpose_view(target, shape_buffer[:], strides_buffer[:]) or_return
+	case .Slice:
+		if axis < 0 || axis >= len(output_grad.shape) {
+			return .Out_Of_Bounds
+		}
+		target = slice_view(target, axis, start, output_grad.shape[axis], step, shape_buffer[:], strides_buffer[:]) or_return
+	case .Reshape:
+		target.shape, target.strides = output_grad.shape, output_grad.strides
+	case:
+		return .Unsupported_Operation
+	}
+	if !_shapes_match(target.shape, output_grad.shape) {
+		return .Shape_Mismatch
+	}
+	_validate_view(target) or_return
+	row := _row_length(target.shape)
+	inner_step := _inner_step(target, target.shape)
+	for row_start := 0; row_start < len(output_grad.data); row_start += row {
+		offset := _broadcast_offset(target, target.shape, row_start)
+		for i in row_start..<row_start+row {
+			target.data[offset] += output_grad.data[i]
+			offset += inner_step
+		}
 	}
 	return .None
 }

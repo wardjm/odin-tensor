@@ -111,6 +111,28 @@ tape_min_axis :: proc(tape: ^Tape($T), x: Tape_Value(T), axis: int, keep_dims :=
 	return _tape_reduce(tape, x, .Min_Axis, axis, keep_dims)
 }
 
+// tape_transpose, tape_slice, and tape_reshape record views of x. Their
+// values borrow x's storage instead of copying it, except that tape_reshape
+// copies an x that is not contiguous. The gradient of each is the upstream
+// gradient placed back through the same view of x's gradient.
+
+// tape_transpose reverses the axis order, like transpose_view.
+tape_transpose :: proc(tape: ^Tape($T), x: Tape_Value(T)) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_view(tape, x, .Transpose, 0, 0, 0, 0, nil)
+}
+
+// tape_slice selects count elements along axis from start by step, with
+// slice_view's rules: a negative axis, start, or step counts from the end.
+tape_slice :: proc(tape: ^Tape($T), x: Tape_Value(T), axis, start, count: int, step := 1) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_view(tape, x, .Slice, axis, start, count, step, nil)
+}
+
+// tape_reshape gives x a new shape with the same row-major elements, inferring
+// one -1 dimension, like reshape.
+tape_reshape :: proc(tape: ^Tape($T), x: Tape_Value(T), shape: []int) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
+	return _tape_view(tape, x, .Reshape, 0, 0, 0, 0, shape)
+}
+
 _tape_binary :: proc(tape: ^Tape($T), a, b: Tape_Value(T), operation: Tape_Operation) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
 	a_view := tape_value(tape, a) or_return
 	b_view := tape_value(tape, b) or_return
@@ -186,4 +208,70 @@ _tape_reduce :: proc(tape: ^Tape($T), x: Tape_Value(T), operation: Tape_Operatio
 	result, err = _tape_record_reduction(tape, &output, operation, x, axis, keep_dims)
 	release(&output)
 	return
+}
+
+// _tape_view records a view of x. storage owns the view's metadata, plus its
+// data when a reshape has to copy.
+_tape_view :: proc(tape: ^Tape($T), x: Tape_Value(T), operation: Tape_Operation, axis, start, count, step: int, shape: []int) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+	parent_node := _tape_node(tape, x)
+	if parent_node == nil {
+		return result, .Invalid_Tape
+	}
+	parent := parent_node.value
+	template := _Tape_Node(T){
+		requires_grad = parent_node.requires_grad,
+		operation     = operation,
+		parent_a      = x.id,
+		parent_b      = -1,
+		parent_count  = 1,
+	}
+	value: Tensor_View(T)
+	storage: Tensor(T)
+	defer release(&storage)
+	#partial switch operation {
+	case .Transpose:
+		storage = _new_view_storage(T, len(parent.shape), tape.allocator) or_return
+		value = transpose_view(parent, storage.shape, storage.strides) or_return
+	case .Slice:
+		template.axis = _normalize_axis(axis, len(parent.shape)) or_return
+		template.start = start
+		if start < 0 {
+			template.start += parent.shape[template.axis]
+		}
+		template.step = step
+		storage = _new_view_storage(T, len(parent.shape), tape.allocator) or_return
+		value = slice_view(parent, template.axis, template.start, count, step, storage.shape, storage.strides) or_return
+	case .Reshape:
+		parent_count, _ := _element_count(parent.shape)
+		shape_buffer: [MAX_RANK]int
+		new_shape := _reshape_target(shape, parent_count, shape_buffer[:]) or_return
+		if _is_contiguous_view(parent) {
+			storage = _new_view_storage(T, len(new_shape), tape.allocator) or_return
+			copy(storage.shape, new_shape)
+			_fill_row_major_strides(storage.shape, storage.strides)
+			value = Tensor_View(T){data = parent.data, shape = storage.shape, strides = storage.strides, offset = parent.offset}
+		} else {
+			storage = new_tensor(T, new_shape, tape.allocator) or_return
+			_copy_into(storage.data, parent)
+			value = as_view(storage)
+		}
+	case:
+		return result, .Unsupported_Operation
+	}
+	return _tape_take_storage(tape, &storage, value, template)
+}
+
+// _new_view_storage allocates shape and strides of the given rank and no data.
+_new_view_storage :: proc($T: typeid, rank: int, allocator := context.allocator) -> (storage: Tensor(T), err: Tensor_Error) {
+	shape, alloc_err := make([]int, rank, allocator)
+	if alloc_err != nil {
+		return storage, .Allocation_Failed
+	}
+	strides: []int
+	strides, alloc_err = make([]int, rank, allocator)
+	if alloc_err != nil {
+		delete(shape, allocator)
+		return storage, .Allocation_Failed
+	}
+	return Tensor(T){shape = shape, strides = strides, allocator = allocator}, .None
 }

@@ -1455,7 +1455,11 @@ tape_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	exponential_value := tape_exp(&tape, activated_value) or_return
 	root_value := tape_sqrt(&tape, exponential_value) or_return
 	logged_value := tape_log(&tape, root_value) or_return
-	peaks_value := tape_max_axis(&tape, logged_value, 0, true) or_return
+	transposed_value := tape_transpose(&tape, logged_value) or_return
+	// A transposed value is not contiguous, so this reshape copies.
+	reshaped_value := tape_reshape(&tape, transposed_value, []int{1, 4}) or_return
+	sliced_value := tape_slice(&tape, reshaped_value, 1, 0, 2, 2) or_return
+	peaks_value := tape_max_axis(&tape, sliced_value, 0, true) or_return
 	peaks_view := tape_value(&tape, peaks_value) or_return
 	means := mean_axis_views(peaks_view, 1, false, allocator) or_return
 	defer release(&means)
@@ -1520,17 +1524,25 @@ apply_tape_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Ta
 		return tape_max_axis(tape, a, -1)
 	case .Min_Axis:
 		return tape_min_axis(tape, a, 0, true)
+	case .Transpose:
+		return tape_transpose(tape, a)
+	case .Slice:
+		return tape_slice(tape, a, -1, -1, 2, -2)
+	case .Reshape:
+		return tape_reshape(tape, a, []int{-1, 2})
 	}
 	return {}, .Unsupported_Operation
 }
 
+Tape_Helper :: #type proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error)
+
 // helper_objective resets the tape, applies operation, and records
 // sum_all(sin-weighted output) so every output element has a distinct weight.
-helper_objective :: proc(tape: ^Tape(f64), a, b: ^Tensor(f64), operation: Tape_Operation) -> (loss: Tape_Value(f64), a_value, b_value: Tape_Value(f64), err: Tensor_Error) {
+helper_objective :: proc(tape: ^Tape(f64), a, b: ^Tensor(f64), operation: Tape_Operation, apply: Tape_Helper) -> (loss: Tape_Value(f64), a_value, b_value: Tape_Value(f64), err: Tensor_Error) {
 	tape_reset(tape)
 	a_value = tape_add_leaf_borrow(tape, a) or_return
 	b_value = tape_add_leaf_borrow(tape, b) or_return
-	output := apply_tape_helper(tape, a_value, b_value, operation) or_return
+	output := apply(tape, a_value, b_value, operation) or_return
 	output_view := tape_value(tape, output) or_return
 	weights := new_tensor(f64, output_view.shape) or_return
 	defer release(&weights)
@@ -1543,7 +1555,9 @@ helper_objective :: proc(tape: ^Tape(f64), a, b: ^Tensor(f64), operation: Tape_O
 	return loss, a_value, b_value, .None
 }
 
-check_tape_helper :: proc(t: ^testing.T, operation: Tape_Operation, a_values: []f64, a_shape: []int, b_values: []f64, b_shape: []int) {
+// check_tape_helper compares the gradients of helper_objective with central
+// finite differences. apply builds the graph; operation names it in failures.
+check_tape_helper :: proc(t: ^testing.T, operation: Tape_Operation, a_values: []f64, a_shape: []int, b_values: []f64, b_shape: []int, apply: Tape_Helper = apply_tape_helper) {
 	a, err := from_slice(f64, a_values, a_shape)
 	testing.expect(t, err == .None)
 	defer release(&a)
@@ -1556,7 +1570,7 @@ check_tape_helper :: proc(t: ^testing.T, operation: Tape_Operation, a_values: []
 	testing.expect(t, err == .None)
 	defer tape_release(&tape)
 
-	loss, a_value, b_value, objective_err := helper_objective(&tape, &a, &b, operation)
+	loss, a_value, b_value, objective_err := helper_objective(&tape, &a, &b, operation, apply)
 	testing.expectf(t, objective_err == .None, "%v: %v", operation, objective_err)
 	if objective_err != .None {
 		return
@@ -1578,11 +1592,11 @@ check_tape_helper :: proc(t: ^testing.T, operation: Tape_Operation, a_values: []
 		for i in 0..<len(input.data) {
 			original := input.data[i]
 			input.data[i] = original + epsilon
-			plus_loss, _, _, plus_err := helper_objective(&tape, &a, &b, operation)
+			plus_loss, _, _, plus_err := helper_objective(&tape, &a, &b, operation, apply)
 			plus_view, _ := tape_value(&tape, plus_loss)
 			plus := plus_view.data[0]
 			input.data[i] = original - epsilon
-			minus_loss, _, _, minus_err := helper_objective(&tape, &a, &b, operation)
+			minus_loss, _, _, minus_err := helper_objective(&tape, &a, &b, operation, apply)
 			minus_view, _ := tape_value(&tape, minus_loss)
 			minus := minus_view.data[0]
 			input.data[i] = original
@@ -1612,6 +1626,98 @@ test_every_tape_helper_matches_finite_differences :: proc(t: ^testing.T) {
 	for operation in ([]Tape_Operation{.Exp, .Log, .Sqrt}) {
 		check_tape_helper(t, operation, positive_values, []int{2, 3}, row_values, []int{3})
 	}
+	for operation in ([]Tape_Operation{.Transpose, .Slice, .Reshape}) {
+		check_tape_helper(t, operation, matrix_values, []int{2, 3}, row_values, []int{3})
+	}
+}
+
+@(test)
+test_tape_views_chain_into_other_operations :: proc(t: ^testing.T) {
+	// a is [3,2], so transpose(a) @ b is [2,3] @ [3,2].
+	transpose_then_matmul :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), _: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
+		transposed := tape_transpose(tape, a) or_return
+		return tape_matmul(tape, transposed, b)
+	}
+	check_tape_helper(t, .Transpose, []f64{0.3, -1.2, 0.8, 1.5, -0.4, 0.9}, []int{3, 2}, []f64{0.7, -0.5, 1.3, 0.2, -0.9, 1.1}, []int{3, 2}, transpose_then_matmul)
+
+	// Rows 2 and 0 of a [3,4] matrix, then a column sum: row 1 gets no gradient.
+	slice_then_sum :: proc(tape: ^Tape(f64), a, _: Tape_Value(f64), _: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
+		rows := tape_slice(tape, a, 0, 2, 2, -2) or_return
+		return tape_sum_axis(tape, rows, 0)
+	}
+	check_tape_helper(t, .Slice, []f64{0.3, -1.2, 0.8, 1.5, -0.4, 0.9, 0.7, -0.5, 1.3, -0.2, 1.1, 0.6}, []int{3, 4}, []f64{0}, []int{1}, slice_then_sum)
+
+	// A transposed value is not contiguous, so tape_reshape copies it.
+	transpose_then_reshape :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), _: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
+		transposed := tape_transpose(tape, a) or_return
+		flat := tape_reshape(tape, transposed, []int{6}) or_return
+		return tape_mul(tape, flat, b)
+	}
+	check_tape_helper(t, .Reshape, []f64{0.3, -1.2, 0.8, 1.5, -0.4, 0.9}, []int{2, 3}, []f64{0.7, -0.5, 1.3, 0.2, -0.9, 1.1}, []int{6}, transpose_then_reshape)
+}
+
+@(test)
+test_tape_views_borrow_and_validate :: proc(t: ^testing.T) {
+	x, err := from_slice(f64, []f64{1, 2, 3, 4, 5, 6}, []int{2, 3})
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer release(&x)
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	testing.expect_value(t, err, Tensor_Error.None)
+	defer tape_release(&tape)
+	x_value, x_err := tape_add_leaf_borrow(&tape, &x)
+	testing.expect_value(t, x_err, Tensor_Error.None)
+
+	transposed, transposed_err := tape_transpose(&tape, x_value)
+	testing.expect_value(t, transposed_err, Tensor_Error.None)
+	transposed_view, _ := tape_value(&tape, transposed)
+	testing.expect(t, raw_data(transposed_view.data) == raw_data(x.data), "tape_transpose should borrow x's storage")
+	contiguous, copy_err := copy_view(transposed_view)
+	testing.expect_value(t, copy_err, Tensor_Error.None)
+	defer release(&contiguous)
+	expect_f64_data(t, contiguous.data, []f64{1, 4, 2, 5, 3, 6})
+
+	// Negative start and step count from the end: columns 2 and 0.
+	sliced, sliced_err := tape_slice(&tape, x_value, 1, -1, 2, -2)
+	testing.expect_value(t, sliced_err, Tensor_Error.None)
+	sliced_view, _ := tape_value(&tape, sliced)
+	testing.expect(t, raw_data(sliced_view.data) == raw_data(x.data), "tape_slice should borrow x's storage")
+	sliced_copy, sliced_copy_err := copy_view(sliced_view)
+	testing.expect_value(t, sliced_copy_err, Tensor_Error.None)
+	defer release(&sliced_copy)
+	expect_f64_data(t, sliced_copy.data, []f64{3, 1, 6, 4})
+
+	reshaped, reshaped_err := tape_reshape(&tape, x_value, []int{3, -1})
+	testing.expect_value(t, reshaped_err, Tensor_Error.None)
+	reshaped_view, _ := tape_value(&tape, reshaped)
+	testing.expect(t, raw_data(reshaped_view.data) == raw_data(x.data), "tape_reshape of a contiguous value should borrow its storage")
+	testing.expect(t, _shapes_match(reshaped_view.shape, []int{3, 2}), "tape_reshape should infer -1 as 2")
+
+	// The gradient of every view lands on the element it read.
+	seed, seed_err := from_slice(f64, []f64{10, 20, 30, 40}, []int{2, 2})
+	testing.expect_value(t, seed_err, Tensor_Error.None)
+	defer release(&seed)
+	testing.expect_value(t, tape_backward_with_seed(&tape, sliced, seed), Tensor_Error.None)
+	x_grad, _ := tape_gradient(&tape, x_value)
+	expect_f64_data(t, x_grad.data, []f64{20, 0, 10, 40, 0, 30})
+
+	_, bad_slice := tape_slice(&tape, x_value, 1, 2, 2)
+	testing.expect_value(t, bad_slice, Tensor_Error.Out_Of_Bounds)
+	_, bad_axis := tape_slice(&tape, x_value, 2, 0, 1)
+	testing.expect_value(t, bad_axis, Tensor_Error.Out_Of_Bounds)
+	_, bad_reshape := tape_reshape(&tape, x_value, []int{4, -1})
+	testing.expect_value(t, bad_reshape, Tensor_Error.Shape_Mismatch)
+	_, stale := tape_transpose(&tape, Tape_Value(f64){})
+	testing.expect_value(t, stale, Tensor_Error.Invalid_Tape)
+
+	// An empty slice records an empty value and passes back no gradient.
+	empty, empty_err := tape_slice(&tape, x_value, 0, 2, 0)
+	testing.expect_value(t, empty_err, Tensor_Error.None)
+	empty_seed, empty_seed_err := new_tensor(f64, []int{0, 3})
+	testing.expect_value(t, empty_seed_err, Tensor_Error.None)
+	defer release(&empty_seed)
+	testing.expect_value(t, tape_backward_with_seed(&tape, empty, empty_seed), Tensor_Error.None)
+	expect_f64_data(t, x_grad.data, []f64{20, 0, 10, 40, 0, 30})
 }
 
 @(test)

@@ -28,6 +28,9 @@ Tape_Operation :: enum {
 	Min_All,
 	Max_Axis,
 	Min_Axis,
+	Transpose,
+	Slice,
+	Reshape,
 }
 
 _Tape_Node :: struct($T: typeid) {
@@ -42,6 +45,8 @@ _Tape_Node :: struct($T: typeid) {
 	parent_count:  int,
 	axis:          int,
 	keep_dims:     bool,
+	start:         int,
+	step:          int,
 }
 
 // Tape owns all recorded operation outputs and gradient buffers. Leaf values
@@ -344,19 +349,26 @@ _tape_record_node :: proc(tape: ^Tape($T), output: ^Tensor(T), operation: Tape_O
 // _tape_take_output allocates the node's gradient, appends it, and only then
 // takes ownership of output. On failure output remains owned by the caller.
 _tape_take_output :: proc(tape: ^Tape($T), output: ^Tensor(T), template: _Tape_Node(T)) -> (result: Tape_Value(T), err: Tensor_Error) {
+	return _tape_take_storage(tape, output, as_view(output^), template)
+}
+
+// _tape_take_storage records value and takes ownership of storage, which holds
+// value's metadata and, unless value borrows a parent's data, its elements.
+// On failure storage remains owned by the caller.
+_tape_take_storage :: proc(tape: ^Tape($T), storage: ^Tensor(T), value: Tensor_View(T), template: _Tape_Node(T)) -> (result: Tape_Value(T), err: Tensor_Error) {
 	node := template
 	if node.requires_grad {
-		node.grad = new_tensor(T, output.shape, tape.allocator) or_return
+		node.grad = new_tensor(T, value.shape, tape.allocator) or_return
 	}
-	node.value = as_view(output^)
-	node.owned_value = output^
+	node.value = value
+	node.owned_value = storage^
 	node.owns_value = true
 	result, err = _tape_append(tape, node)
 	if err != .None {
 		release(&node.grad)
 		return result, err
 	}
-	output^ = {}
+	storage^ = {}
 	return result, .None
 }
 

@@ -188,36 +188,7 @@ release :: proc(t: ^Tensor($T)) {
 // earlier with as_view (including borrowed autodiff leaves) become invalid.
 reshape :: proc(t: ^Tensor($T), shape: []int) -> Tensor_Error {
 	inferred_buffer: [MAX_RANK]int
-	new_shape := shape
-	inferred_axis := -1
-	known := 1
-	for dim, axis in shape {
-		if dim == -1 && inferred_axis < 0 {
-			inferred_axis = axis
-		} else if dim < 0 {
-			return .Invalid_Shape
-		} else {
-			known *= dim
-		}
-	}
-	if inferred_axis >= 0 {
-		if len(shape) > len(inferred_buffer) {
-			return .Invalid_Shape
-		}
-		if known == 0 || len(t.data) % known != 0 {
-			return .Shape_Mismatch
-		}
-		copy(inferred_buffer[:], shape)
-		inferred_buffer[inferred_axis] = len(t.data) / known
-		new_shape = inferred_buffer[:len(shape)]
-	}
-	count, valid := _element_count(new_shape)
-	if !valid || !_strides_are_valid(new_shape) {
-		return .Invalid_Shape
-	}
-	if count != len(t.data) {
-		return .Shape_Mismatch
-	}
+	new_shape := _reshape_target(shape, len(t.data), inferred_buffer[:]) or_return
 
 	if len(new_shape) == len(t.shape) {
 		_fill_row_major_strides(new_shape, t.strides)
@@ -246,6 +217,42 @@ reshape :: proc(t: ^Tensor($T), shape: []int) -> Tensor_Error {
 	t.shape = owned_shape
 	t.strides = owned_strides
 	return .None
+}
+
+// _reshape_target resolves a reshape request for count elements, inferring
+// one -1 dimension into buffer when present.
+_reshape_target :: proc(shape: []int, count: int, buffer: []int) -> (new_shape: []int, err: Tensor_Error) {
+	new_shape = shape
+	inferred_axis := -1
+	known := 1
+	for dim, axis in shape {
+		if dim == -1 && inferred_axis < 0 {
+			inferred_axis = axis
+		} else if dim < 0 {
+			return new_shape, .Invalid_Shape
+		} else {
+			known *= dim
+		}
+	}
+	if inferred_axis >= 0 {
+		if len(shape) > len(buffer) {
+			return new_shape, .Invalid_Shape
+		}
+		if known == 0 || count % known != 0 {
+			return new_shape, .Shape_Mismatch
+		}
+		copy(buffer, shape)
+		buffer[inferred_axis] = count / known
+		new_shape = buffer[:len(shape)]
+	}
+	new_count, valid := _element_count(new_shape)
+	if !valid || !_strides_are_valid(new_shape) {
+		return new_shape, .Invalid_Shape
+	}
+	if new_count != count {
+		return new_shape, .Shape_Mismatch
+	}
+	return new_shape, .None
 }
 
 // as_view creates a non-owning view over a tensor. It allocates no memory;

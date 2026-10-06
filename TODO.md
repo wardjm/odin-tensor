@@ -55,7 +55,7 @@ Every new public procedure also needs a failing-allocator case (see `expect_clea
   - Done when: `check_tape_helper` passes finite differences for each with positive inputs, and `log` of 0 gives an Inf gradient, not an error.
 - [x] **`tape_max_axis` / `tape_max_all` (and min).** The gradient goes to the arg-max element, with ties going to the first index (matches `argmax`; PyTorch splits ties evenly, so record the choice in the README).
   - Done when tests cover: finite differences pass on inputs without ties, and the gradient of `[3,3]` is `[1,0]`.
-- [ ] **Differentiable views: `tape_transpose`, `tape_slice`, `tape_reshape`.**
+- [x] **Differentiable views: `tape_transpose`, `tape_slice`, `tape_reshape`.**
   - Done when: finite differences pass through a transpose → matmul chain and a slice → sum chain.
 - [ ] **Per-row offsets in the backward kernels.** `_backward_activation` and `_backward_binary_elementwise` still compute a full index per element.
   - Done when: all autodiff tests pass unchanged, and `odin run bench -o:speed` reports PASS for `tape_mul + backward 1000x1000` (5× faster than its 130 ms baseline).
