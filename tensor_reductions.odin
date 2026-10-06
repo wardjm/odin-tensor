@@ -729,13 +729,15 @@ _reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operat
 // type. Integer sums and products wrap on overflow. sum_all and sum_all_views
 // also accept an integer accumulator type, as in sum_all(source, i64): each
 // element converts to Acc before it is added, and the result is a Tensor(Acc).
+// Acc must hold every value of T, so it is at least as wide with the same
+// signedness, or strictly wider and signed when T is unsigned.
 sum_all :: proc{sum_all_same_type, sum_all_as}
 sum_all_views :: proc{sum_all_views_same_type, sum_all_views_as}
 
 sum_all_same_type :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(as_view(source), .Sum, allocator)
 }
-sum_all_as :: proc(source: Tensor($T), $Acc: typeid, allocator := context.allocator) -> (Tensor(Acc), Tensor_Error) where intrinsics.type_is_integer(T) && intrinsics.type_is_integer(Acc) {
+sum_all_as :: proc(source: Tensor($T), $Acc: typeid, allocator := context.allocator) -> (Tensor(Acc), Tensor_Error) where intrinsics.type_is_integer(T) && intrinsics.type_is_integer(Acc) && size_of(Acc) >= size_of(T) && (intrinsics.type_is_unsigned(T) == intrinsics.type_is_unsigned(Acc) || (intrinsics.type_is_unsigned(T) && size_of(Acc) > size_of(T))) {
 	return _sum_all_as_views(as_view(source), Acc, allocator)
 }
 mean_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
@@ -754,7 +756,7 @@ min_all :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T
 sum_all_views_same_type :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return _reduce_all_views(source, .Sum, allocator)
 }
-sum_all_views_as :: proc(source: Tensor_View($T), $Acc: typeid, allocator := context.allocator) -> (Tensor(Acc), Tensor_Error) where intrinsics.type_is_integer(T) && intrinsics.type_is_integer(Acc) {
+sum_all_views_as :: proc(source: Tensor_View($T), $Acc: typeid, allocator := context.allocator) -> (Tensor(Acc), Tensor_Error) where intrinsics.type_is_integer(T) && intrinsics.type_is_integer(Acc) && size_of(Acc) >= size_of(T) && (intrinsics.type_is_unsigned(T) == intrinsics.type_is_unsigned(Acc) || (intrinsics.type_is_unsigned(T) && size_of(Acc) > size_of(T))) {
 	return _sum_all_as_views(source, Acc, allocator)
 }
 mean_all_views :: proc(source: Tensor_View($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_float(T) {
