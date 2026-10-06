@@ -2,10 +2,10 @@ package tensor
 
 // Borrowed view construction and owned copies of tensor views.
 
-// transpose_view reverses the axis order (for a matrix, this is the usual
-// transpose). Caller-provided buffers hold the view metadata; each must have at
-// least rank elements and must remain alive and unmodified while the view lives.
-// The buffers must not alias source.shape or source.strides.
+// transpose_view reverses the axis order, the usual transpose for a matrix.
+// The caller's buffers hold the view metadata. Each needs at least rank
+// elements, must not alias source.shape or source.strides, and must stay alive
+// and unchanged while the view is used.
 transpose_view :: proc(source: Tensor_View($T), shape_buffer, strides_buffer: []int) -> (view: Tensor_View(T), err: Tensor_Error) {
 	rank := len(source.shape)
 	if len(source.strides) != rank {
@@ -85,11 +85,10 @@ transpose_copy_tensor :: proc(source: Tensor($T), allocator := context.allocator
 }
 
 // slice_view selects count elements along one axis, starting at start and
-// advancing by step. NumPy's a[start:stop:step] has a stop instead; count is
-// used here so reverse and empty slices have unambiguous bounds. Negative axis,
-// start, and step count from the end as in NumPy.
-// Caller-provided metadata buffers must be distinct, non-overlapping, and live
-// and unchanged for the lifetime of the returned borrowed view.
+// advancing by step. NumPy's a[start:stop:step] takes a stop; a count gives
+// reverse and empty slices unambiguous bounds. Negative axis, start, and step
+// count from the end. The metadata buffers must not overlap and must stay alive
+// and unchanged while the view is used.
 slice_view :: proc(source: Tensor_View($T), axis, start, count, step: int, shape_buffer, strides_buffer: []int) -> (view: Tensor_View(T), err: Tensor_Error) {
 	rank := len(source.shape)
 	if len(source.strides) != rank {
@@ -149,12 +148,11 @@ slice_view :: proc(source: Tensor_View($T), axis, start, count, step: int, shape
 	return view, .None
 }
 
-// broadcast_view expands source to target_shape without copying data. Dimensions are
-// aligned from the right; a source dimension of one is expanded with a zero
-// stride. shape_buffer and strides_buffer hold the returned metadata and need
-// at least len(target_shape) elements each. They must be distinct and
-// non-overlapping, must not alias source metadata, and must stay alive and
-// unchanged for the view's lifetime.
+// broadcast_view expands source to target_shape without copying. Dimensions
+// align from the right, and a source dimension of one gets a zero stride.
+// shape_buffer and strides_buffer each need len(target_shape) elements, must
+// not overlap each other or source's metadata, and must stay alive and
+// unchanged while the view is used.
 broadcast_view :: proc(source: Tensor_View($T), target_shape, shape_buffer, strides_buffer: []int) -> (view: Tensor_View(T), err: Tensor_Error) {
 	source_rank := len(source.shape)
 	target_rank := len(target_shape)

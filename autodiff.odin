@@ -82,7 +82,7 @@ tape_mean_all :: proc(tape: ^Tape($T), x: Tape_Value(T)) -> (Tape_Value(T), Tens
 	return _tape_reduce(tape, x, .Mean_All, -1, false)
 }
 
-// tape_sum_axis and tape_mean_axis accept a negative axis, counted from the end.
+// tape_sum_axis and tape_mean_axis accept a negative axis.
 tape_sum_axis :: proc(tape: ^Tape($T), x: Tape_Value(T), axis: int, keep_dims := false) -> (Tape_Value(T), Tensor_Error) where intrinsics.type_is_float(T) {
 	return _tape_reduce(tape, x, .Sum_Axis, axis, keep_dims)
 }

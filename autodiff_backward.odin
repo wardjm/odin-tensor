@@ -39,10 +39,10 @@ tape_backward :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> Tensor_Error whe
 	return _tape_backward_seeded(tape, value.id, seed[:])
 }
 
-// _tape_backward_seeded performs a transactional reverse pass in temporary
-// gradient buffers, committing only after every active node is supported.
-// Only nodes reachable from root are visited, so unrelated branches cannot
-// contribute (even NaN from 0*inf), and nodes recorded after root are ignored.
+// _tape_backward_seeded runs the reverse pass in temporary gradient buffers and
+// commits only if every active node is supported. It visits only nodes
+// reachable from root, so unrelated branches contribute nothing, not even NaN
+// from 0*inf, and nodes recorded after root are ignored.
 _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_Error where intrinsics.type_is_float(T) {
 	node_count := root+1
 	scratch, scratch_alloc_err := make([]Tensor(T), node_count, tape.allocator)
@@ -557,14 +557,12 @@ _backward_matmul :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a,
 }
 
 // _backward_matrix_product accumulates one rank-one/rank-two product's
-// gradients into contiguous grad_a and grad_b (nil when not tracked). A vector
-// a is a single row and a vector b a single column, as in the forward kernel.
-// With a as [m,k], b as [k,n] and upstream as [m,n], grad_a += upstream @ bᵀ
-// and grad_b += aᵀ @ upstream, each run through the blocked forward kernel on
-// transposed views. Each gradient element adds its terms in the same order as
-// an element-by-element loop, so the result matches one exactly, except when
-// grad_a and grad_b are the same buffer (a @ a): all of grad_a's terms then
-// land before grad_b's, which can change the last bits.
+// gradients into contiguous grad_a and grad_b (nil when not tracked), treating
+// a vector a as a row and a vector b as a column. With a as [m,k] and b as
+// [k,n], grad_a += upstream @ bᵀ and grad_b += aᵀ @ upstream, both through the
+// forward kernel on transposed views. Each element adds its terms in naive-loop
+// order and matches that loop exactly, except for a @ a: grad_a and grad_b then
+// share a buffer and grad_a's terms land first, so the last bits can differ.
 _backward_matrix_product :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T)) -> Tensor_Error {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	k := a.shape[a_rank-1]

@@ -2,13 +2,12 @@
 //
 //     odin run bench -o:speed
 //
-// Each case reports the median of several timed runs. Cases with a target
-// compare against a baseline measured on the reference machine and fail the
-// run (exit code 1) when the speedup falls short, so TODO speed items have a
-// pass/fail check. Baselines are machine-specific: re-measure them with
-// `odin run bench -o:speed -define:BENCH_BASELINE=true` (which prints medians
-// without verdicts) before relying on the verdicts on different hardware.
-// Reference machine baselines were measured on 2026-10-05.
+// Each case reports the median of several timed runs. A case with a target
+// compares against a baseline from the reference machine (measured 2026-10-05)
+// and fails the run with exit code 1 when the speedup falls short. On other
+// hardware, re-measure the baselines first with
+// `odin run bench -o:speed -define:BENCH_BASELINE=true`, which prints medians
+// without verdicts.
 package bench
 
 import "core:fmt"
@@ -52,15 +51,14 @@ CASES := []Case{
 	{name = "sum_axis 0", run = bench_sum_axis, repetitions = 20},
 	{name = "sum_all", run = bench_sum_all, repetitions = 20},
 	{name = "matmul_into 256", run = bench_matmul_256, repetitions = 10},
-	// TODO.md: cache-block large matmul, at least 2x faster.
+	// Cache-blocked matmul: at least 2x faster.
 	{name = "matmul_into 512", run = bench_matmul_512, repetitions = 5, baseline_ms = 17.6, target_speedup = 2},
-	// Shapes the matmul blocking skips or leaves a column tail on, to catch
-	// regressions on them.
+	// Shapes the matmul blocking skips or leaves a column tail on.
 	{name = "matmul_into vector @ 1000x1000", run = bench_matmul_vector, repetitions = 20},
 	{name = "matmul_into 1000x1000 @ 1000x15", run = bench_matmul_narrow, repetitions = 20},
-	// TODO.md: per-row offsets in backward kernels, at least 5x faster.
+	// Per-row offsets in backward kernels: at least 5x faster.
 	{name = "tape_mul + backward 1000x1000", run = bench_tape_mul_backward, repetitions = 5, baseline_ms = 130, target_speedup = 5},
-	// TODO.md: blocked matmul backward, at least 10x faster.
+	// Blocked matmul backward: at least 10x faster.
 	{name = "tape_matmul + backward 512", run = bench_tape_matmul_backward, repetitions = 5, baseline_ms = 547, target_speedup = 10},
 }
 

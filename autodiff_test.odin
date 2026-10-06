@@ -1026,7 +1026,7 @@ test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) 
 	require_ok(t, err)
 	defer release(&storage)
 	shape_buffer, strides_buffer := [3]int{}, [3]int{}
-	// permuted is storage with each batch's matrix transposed: shape {2, 3, 2}, strides {6, 1, 3}.
+	// permuted transposes each batch's matrix: shape {2, 3, 2}, strides {6, 1, 3}.
 	permuted, view_err := permute_view(as_view(storage), []int{0, 2, 1}, shape_buffer[:], strides_buffer[:])
 	require_ok(t, view_err)
 	contiguous: Tensor(f64)
@@ -1079,11 +1079,10 @@ test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) 
 	expect_f64_data(t, view_b_grad.data, copy_b_grad.data)
 }
 
-// The other matmul backward tests use matrices small enough that the product
-// kernel never blocks. Here a transposed [9,70] a, whose inner axis is strided,
-// broadcasts against a [2,70,10] b: both gradient products take the register
-// tiles plus the row and column tails, k spans two strided blocks, and the
-// second batch accumulates onto a gradient the first already filled.
+// The other matmul backward tests are too small for the product kernel to
+// block. Here a transposed [9,70] a broadcasts against a [2,70,10] b, so both
+// gradient products hit the register tiles and both tails, k spans two strided
+// blocks, and the second batch accumulates onto the first's gradient.
 @(test)
 test_tape_blocked_matmul_backward_matches_naive :: proc(t: ^testing.T) {
 	M, K, N, BATCHES :: 9, 70, 10, 2

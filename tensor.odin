@@ -31,9 +31,8 @@ Tensor :: struct($T: typeid) {
 	allocator: mem.Allocator,
 }
 
-// Tensor_View borrows its data and metadata. It never owns or frees any of
-// these slices. The caller must keep both the source tensor and metadata buffers
-// alive for as long as the view is used.
+// Tensor_View borrows its data and metadata and never frees them. The caller
+// keeps the source tensor and metadata buffers alive while the view is used.
 Tensor_View :: struct($T: typeid) {
 	data:    []T,
 	shape:   []int,
@@ -41,9 +40,9 @@ Tensor_View :: struct($T: typeid) {
 	offset:  int,
 }
 
-// _element_count validates a shape and calculates the product of its dimensions.
-// A rank-zero shape represents a scalar and therefore contains one element.
-// Shapes with more than MAX_RANK dimensions are invalid.
+// _element_count validates a shape and returns the product of its dimensions.
+// A rank-zero shape is a scalar with one element. Shapes with more than
+// MAX_RANK dimensions are invalid.
 _element_count :: proc(shape: []int) -> (count: int, ok: bool) {
 	if len(shape) > MAX_RANK {
 		return 0, false
@@ -172,9 +171,9 @@ from_slice :: proc($T: typeid, values: []T, shape: []int, allocator := context.a
 	return result, .None
 }
 
-// release frees owned storage and resets the tensor. Release each tensor exactly
-// once: a shallow copy shares the same allocations, so it must never be used or
-// released after the original is released.
+// release frees owned storage and resets the tensor. Release each tensor
+// exactly once; a shallow copy shares its allocations, so never use or release
+// one after the original is released.
 release :: proc(t: ^Tensor($T)) {
 	delete(t.data, t.allocator)
 	delete(t.shape, t.allocator)

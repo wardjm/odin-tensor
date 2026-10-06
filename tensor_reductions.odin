@@ -145,9 +145,9 @@ _reduction_shape_matches :: proc(output: Tensor($T), source_shape: []int, axis: 
 }
 
 // _reduce_axis_views_into reduces source along axis into an exactly shaped,
-// contiguous output. A negative axis counts from the end. keep_dims retains the
-// reduced dimension as a singleton. Output must not overlap source; an overlap
-// returns Aliased_Output.
+// contiguous output. A negative axis counts from the end, and keep_dims keeps
+// the reduced axis with size 1. An output that overlaps source returns
+// Aliased_Output.
 _reduce_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: int, $operation: _Reduction_Operation, keep_dims := false) -> Tensor_Error {
 	_validate_view(source) or_return
 	reduced_axis := _normalize_axis(axis, len(source.shape)) or_return
@@ -350,9 +350,8 @@ _reduced_axes_count :: proc(shape: []int, mask: ^[MAX_RANK]bool) -> int {
 // _reduce_axes_views_into reduces source over every axis in axes into an
 // exactly shaped, contiguous output. Negative axes count from the end; a
 // repeated axis returns Invalid_Shape and an out-of-range one Out_Of_Bounds.
-// keep_dims retains each reduced
-// dimension as a singleton. Output must not overlap source; an overlap returns
-// Aliased_Output.
+// keep_dims keeps each reduced axis with size 1. An output that overlaps source
+// returns Aliased_Output.
 _reduce_axes_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axes: []int, $operation: _Reduction_Operation, keep_dims := false) -> Tensor_Error {
 	_validate_view(source) or_return
 	mask := _reduced_axes_mask(axes, len(source.shape)) or_return
@@ -559,8 +558,8 @@ _arg_reduce_axis_views :: proc(source: Tensor_View($T), axis: int, $operation: _
 
 // argmax_axis and argmin_axis return the index of the largest or smallest
 // element along one axis as a Tensor(int). A negative axis counts from the end,
-// and keep_dims keeps the reduced axis with size 1. Ties pick the first index, a NaN wins, and
-// an empty axis returns Empty_Reduction.
+// and keep_dims keeps the reduced axis with size 1. Ties pick the first index,
+// a NaN wins, and an empty axis returns Empty_Reduction.
 argmax_axis :: proc(source: Tensor($T), axis: int, keep_dims := false, allocator := context.allocator) -> (Tensor(int), Tensor_Error) where intrinsics.type_is_ordered_numeric(T) {
 	return _arg_reduce_axis_views(as_view(source), axis, .Max, keep_dims, allocator)
 }
@@ -725,12 +724,11 @@ _reduce_all_views :: proc(source: Tensor_View($T), $operation: _Reduction_Operat
 }
 
 // sum_all, mean_all, prod_all, max_all, and min_all reduce every element to a
-// rank-zero tensor. Max and min propagate NaN. mean requires a floating-point
-// type. Integer sums and products wrap on overflow. sum_all and sum_all_views
-// also accept an integer accumulator type, as in sum_all(source, i64): each
-// element converts to Acc before it is added, and the result is a Tensor(Acc).
-// Acc must hold every value of T, so it is at least as wide with the same
-// signedness, or strictly wider and signed when T is unsigned.
+// rank-zero tensor. Max and min propagate NaN, mean requires a float type, and
+// integer sums and products wrap. sum_all(source, i64) and sum_all_views take
+// an accumulator type Acc, convert each element to it, and return a
+// Tensor(Acc). Acc must hold every value of T: as wide with the same
+// signedness, or wider and signed when T is unsigned.
 sum_all :: proc{sum_all_same_type, sum_all_as}
 sum_all_views :: proc{sum_all_views_same_type, sum_all_views_as}
 
@@ -880,9 +878,9 @@ std_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axis: i
 }
 
 // _variance_all_views returns the variance (or, with take_sqrt, the standard
-// deviation) of every element as a rank-zero tensor. An empty source, or ddof
-// >= the element count, returns Empty_Reduction. It makes two passes: a
-// pairwise mean, then a pairwise sum of squared deviations.
+// deviation) of every element as a rank-zero tensor, using a pairwise mean and
+// then a pairwise sum of squared deviations. An empty source, or ddof >= the
+// element count, returns Empty_Reduction.
 _variance_all_views :: proc(source: Tensor_View($T), ddof: int, $take_sqrt: bool, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
 	count, _ := _element_count(source.shape)

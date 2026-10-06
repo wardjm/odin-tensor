@@ -498,7 +498,7 @@ test_reductions_over_several_axes :: proc(t: ^testing.T) {
 	testing.expect_value(t, mean_axes_into(&copied, values, []int{}), Tensor_Error.None)
 	expect_f64_data(t, copied.data, counting[:])
 
-	// Wrong output shapes, bad axes, and overlapping outputs are rejected without writing.
+	// Bad output shapes, axes, and overlaps are rejected without writing.
 	testing.expect_value(t, sum_axes_into(&kept, values, []int{0, 2}), Tensor_Error.Shape_Mismatch)
 	testing.expect_value(t, sum_axes_into(&output, values, []int{0, 2}, true), Tensor_Error.Shape_Mismatch)
 	testing.expect_value(t, sum_axes_into(&output, values, []int{1}), Tensor_Error.Shape_Mismatch)
@@ -2007,7 +2007,7 @@ test_into_outputs_reject_overlapping_inputs :: proc(t: ^testing.T) {
 	testing.expect_value(t, dot_views_into(&row_sums, as_view(a), as_view(ones)), Tensor_Error.None)
 	expect_f64_data(t, row_sums.data, []f64{3, 7})
 
-	// A unary op may run over the output's own storage, but not a permutation of it.
+	// A unary op may read the output's own storage, but not a permutation of it.
 	squares: Tensor(f64)
 	squares, err = from_slice(f64, []f64{1, 4, 9, 16}, []int{2, 2})
 	require_ok(t, err)
@@ -2030,7 +2030,7 @@ test_into_outputs_reject_overlapping_inputs :: proc(t: ^testing.T) {
 	testing.expect_value(t, sum_axis_views_into(&row_sums, folded, 1), Tensor_Error.Aliased_Output)
 	expect_f64_data(t, row_sums.data, []f64{3, 7})
 
-	// Element-wise ops read each element before writing it, so self-aliasing is fine.
+	// Element-wise ops read each element before writing it, so self-aliasing works.
 	testing.expect_value(t, add_into(&a, a, a), Tensor_Error.None)
 	expect_f64_data(t, a.data, []f64{2, 4, 6, 8})
 	testing.expect_value(t, mul_in_place(&a, a), Tensor_Error.None)

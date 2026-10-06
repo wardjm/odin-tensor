@@ -40,33 +40,29 @@ _dot_result_shape :: proc(a_shape, b_shape, shape_buffer: []int) -> (rank: int, 
 	return rank, .None
 }
 
-// Blocking for _product_kernel. Output is computed in register tiles of
-// _PRODUCT_TILE_ROWS rows by _PRODUCT_TILE_BYTES of columns, and k is split
-// into blocks of _PRODUCT_BLOCK_DEPTH so each tile's slice of b can be packed
-// into a contiguous panel that stays in L1 while every row tile reuses it.
-// Sizes were tuned on matmul_into 512 in bench. Products with fewer than
-// _PRODUCT_TILE_ROWS rows, fewer than _PRODUCT_MIN_BLOCKED_DEPTH inner
-// elements, or less than one column tile reuse b too little to pay for packing
-// and skip blocking.
+// Blocking for _product_kernel, tuned on the matmul_into 512 bench. Output is
+// computed in register tiles of _PRODUCT_TILE_ROWS rows by _PRODUCT_TILE_BYTES
+// of columns. k is split into blocks of _PRODUCT_BLOCK_DEPTH so each tile's
+// slice of b packs into a panel that stays in L1 while every row tile reuses
+// it. Products too small to repay packing (under _PRODUCT_TILE_ROWS rows,
+// _PRODUCT_MIN_BLOCKED_DEPTH inner elements, or one column tile) skip it.
 _PRODUCT_TILE_ROWS :: 2
 _PRODUCT_TILE_BYTES :: 64
 _PRODUCT_BLOCK_DEPTH :: 256
-// When a's inner elements are not adjacent, as for a transposed view in the
-// matmul backward or a forward transpose(x) @ y, each step along k reads a
-// fresh cache line of a. With power-of-two row lengths those lines alias in L1,
-// so a shallower block keeps them resident; on the backward bench this cut the
-// aᵀ @ b product by a quarter.
+// When a's inner elements are not adjacent, as for a transposed a, each step
+// along k reads a new cache line of a, and with power-of-two row lengths those
+// lines alias in L1. A shallower block keeps them resident; it cut the aᵀ @ b
+// product in the backward bench by a quarter.
 _PRODUCT_STRIDED_BLOCK_DEPTH :: 64
 _PRODUCT_MIN_BLOCKED_DEPTH :: 8
 
-// _product_kernel computes output = a @ b with vectors treated as a single row
-// (a) or column (b), or output += a @ b when accumulate is set. The outer loop
-// walks k blocks; within each, column tiles pack their panel of b and then
-// sweep the row tiles, and columns past the last full tile take the unpacked
-// i-k-j loop. Each output element still adds its k products in order onto its
-// starting value (zero unless accumulating), so blocking does not change the
-// result. The inlining directives on the _product_strip calls are measured
-// choices: either way round, narrow or tail-heavy products lose 10-15%.
+// _product_kernel computes output = a @ b, or output += a @ b when accumulate
+// is set, treating a vector a as a row and a vector b as a column. For each k
+// block, every column tile packs its panel of b and sweeps the row tiles;
+// columns past the last full tile take the unpacked i-k-j loop. Each output
+// element still adds its k products in order, so blocking doesn't change the
+// result. The inlining directives on the _product_strip calls were measured:
+// flipping either costs narrow or tail-heavy products 10-15%.
 _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) #no_bounds_check {
 	TILE_COLUMNS :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
 	a_rank, b_rank := len(a.shape), len(b.shape)
@@ -144,9 +140,9 @@ _product_tile :: #force_inline proc($ROWS, $TILE_COLUMNS: int, output: []$T, row
 }
 
 // _product_strip adds a[:, k0..<k1] @ b[k0..<k1, j0..<j1] into the matching
-// columns of output for every row. It loops i-k-j so the innermost loop walks
-// one output row and one row of b with fixed steps. It keeps bounds checks
-// because narrow products measured about 10% slower without them.
+// columns of output. The i-k-j order makes the inner loop walk one row of
+// output and one row of b with fixed steps. Bounds checks stay on: narrow
+// products measured about 10% slower without them.
 _product_strip :: proc(output: []$T, a, b: Tensor_View(T), k0, k1, j0, j1: int) {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1

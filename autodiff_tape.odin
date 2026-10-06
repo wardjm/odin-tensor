@@ -168,9 +168,8 @@ tape_add_leaf_view :: proc(tape: ^Tape($T), value: Tensor_View(T), requires_grad
 	return
 }
 
-// tape_add_leaf_copy snapshots a tensor view into tape-owned contiguous storage.
-// The source may be changed or released after this succeeds. Strides and offsets
-// are honored, so transposed and reversed views are copied in logical order.
+// tape_add_leaf_copy copies a view, in logical order, into tape-owned
+// contiguous storage. The source may change or be released afterwards.
 tape_add_leaf_copy :: proc(tape: ^Tape($T), value: Tensor_View(T), requires_grad := true) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
 	if tape == nil || tape.identity == 0 {
 		return result, .Invalid_Tape
