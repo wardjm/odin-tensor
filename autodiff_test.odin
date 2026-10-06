@@ -1067,11 +1067,15 @@ test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) 
 	require_ok(t, copy_product_err)
 	testing.expect_value(t, tape_backward_with_seed(&copy_tape, copy_product, seed), Tensor_Error.None)
 
-	view_a_grad, _ := tape_gradient(&view_tape, view_a)
-	copy_a_grad, _ := tape_gradient(&copy_tape, copy_a)
+	view_a_grad, view_a_grad_err := tape_gradient(&view_tape, view_a)
+	require_ok(t, view_a_grad_err)
+	copy_a_grad, copy_a_grad_err := tape_gradient(&copy_tape, copy_a)
+	require_ok(t, copy_a_grad_err)
 	expect_f64_data(t, view_a_grad.data, copy_a_grad.data)
-	view_b_grad, _ := tape_gradient(&view_tape, view_b)
-	copy_b_grad, _ := tape_gradient(&copy_tape, copy_b)
+	view_b_grad, view_b_grad_err := tape_gradient(&view_tape, view_b)
+	require_ok(t, view_b_grad_err)
+	copy_b_grad, copy_b_grad_err := tape_gradient(&copy_tape, copy_b)
+	require_ok(t, copy_b_grad_err)
 	expect_f64_data(t, view_b_grad.data, copy_b_grad.data)
 }
 
@@ -1796,8 +1800,10 @@ check_tape_helper :: proc(t: ^testing.T, operation: Tape_Operation, a_values: []
 		return
 	}
 	testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
-	a_grad, _ := tape_gradient(&tape, a_value)
-	b_grad, _ := tape_gradient(&tape, b_value)
+	a_grad, a_grad_err := tape_gradient(&tape, a_value)
+	require_ok(t, a_grad_err)
+	b_grad, b_grad_err := tape_gradient(&tape, b_value)
+	require_ok(t, b_grad_err)
 	analytic_a := make([]f64, len(a.data))
 	defer delete(analytic_a)
 	analytic_b := make([]f64, len(b.data))
@@ -1813,15 +1819,18 @@ check_tape_helper :: proc(t: ^testing.T, operation: Tape_Operation, a_values: []
 			original := input.data[i]
 			input.data[i] = original + epsilon
 			plus_loss, _, _, plus_err := helper_objective(&tape, &a, &b, operation, apply)
-			plus_view, _ := tape_value(&tape, plus_loss)
+			input.data[i] = original
+			require_ok(t, plus_err)
+			plus_view, plus_view_err := tape_value(&tape, plus_loss)
+			require_ok(t, plus_view_err)
 			plus := plus_view.data[0]
 			input.data[i] = original - epsilon
 			minus_loss, _, _, minus_err := helper_objective(&tape, &a, &b, operation, apply)
-			minus_view, _ := tape_value(&tape, minus_loss)
-			minus := minus_view.data[0]
 			input.data[i] = original
-			require_ok(t, plus_err)
 			require_ok(t, minus_err)
+			minus_view, minus_view_err := tape_value(&tape, minus_loss)
+			require_ok(t, minus_view_err)
+			minus := minus_view.data[0]
 			numeric := (plus - minus) / (2*epsilon)
 			testing.expectf(t, abs(numeric - analytic[which][i]) < 1e-6, "%v input %d[%d]: analytic %v, numeric %v", operation, which, i, analytic[which][i], numeric)
 		}
@@ -1891,7 +1900,8 @@ test_tape_views_borrow_and_validate :: proc(t: ^testing.T) {
 
 	transposed, transposed_err := tape_transpose(&tape, x_value)
 	require_ok(t, transposed_err)
-	transposed_view, _ := tape_value(&tape, transposed)
+	transposed_view, transposed_view_err := tape_value(&tape, transposed)
+	require_ok(t, transposed_view_err)
 	testing.expectf(t, raw_data(transposed_view.data) == raw_data(x.data), "tape_transpose should borrow x's storage")
 	contiguous, copy_err := copy_view(transposed_view)
 	require_ok(t, copy_err)
@@ -1901,7 +1911,8 @@ test_tape_views_borrow_and_validate :: proc(t: ^testing.T) {
 	// Negative start and step count from the end: columns 2 and 0.
 	sliced, sliced_err := tape_slice(&tape, x_value, 1, -1, 2, -2)
 	require_ok(t, sliced_err)
-	sliced_view, _ := tape_value(&tape, sliced)
+	sliced_view, sliced_view_err := tape_value(&tape, sliced)
+	require_ok(t, sliced_view_err)
 	testing.expectf(t, raw_data(sliced_view.data) == raw_data(x.data), "tape_slice should borrow x's storage")
 	sliced_copy, sliced_copy_err := copy_view(sliced_view)
 	require_ok(t, sliced_copy_err)
@@ -1910,7 +1921,8 @@ test_tape_views_borrow_and_validate :: proc(t: ^testing.T) {
 
 	reshaped, reshaped_err := tape_reshape(&tape, x_value, []int{3, -1})
 	require_ok(t, reshaped_err)
-	reshaped_view, _ := tape_value(&tape, reshaped)
+	reshaped_view, reshaped_view_err := tape_value(&tape, reshaped)
+	require_ok(t, reshaped_view_err)
 	testing.expectf(t, raw_data(reshaped_view.data) == raw_data(x.data), "tape_reshape of a contiguous value should borrow its storage")
 	testing.expectf(t, _shapes_match(reshaped_view.shape, []int{3, 2}), "tape_reshape should infer -1 as 2, got shape %v", reshaped_view.shape)
 
@@ -1919,7 +1931,8 @@ test_tape_views_borrow_and_validate :: proc(t: ^testing.T) {
 	require_ok(t, seed_err)
 	defer release(&seed)
 	testing.expect_value(t, tape_backward_with_seed(&tape, sliced, seed), Tensor_Error.None)
-	x_grad, _ := tape_gradient(&tape, x_value)
+	x_grad, x_grad_err := tape_gradient(&tape, x_value)
+	require_ok(t, x_grad_err)
 	expect_f64_data(t, x_grad.data, []f64{20, 0, 10, 40, 0, 30})
 
 	_, bad_slice := tape_slice(&tape, x_value, 1, 2, 2)
@@ -1966,7 +1979,8 @@ test_tape_max_and_min_route_gradient_like_argmax :: proc(t: ^testing.T) {
 		loss, loss_err := tape_sum_all(&tape, y)
 		require_ok(t, loss_err)
 		testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
-		x_grad, _ := tape_gradient(&tape, x_value)
+		x_grad, x_grad_err := tape_gradient(&tape, x_value)
+		require_ok(t, x_grad_err)
 		testing.expectf(t, x_grad.data[0] == 1 && x_grad.data[1] == 0, "%v: gradient of [3,3] is %v, want [1,0]", operation, x_grad.data)
 
 		tape_reset(&tape)
@@ -1977,7 +1991,8 @@ test_tape_max_and_min_route_gradient_like_argmax :: proc(t: ^testing.T) {
 		loss, loss_err = tape_sum_all(&tape, y)
 		require_ok(t, loss_err)
 		testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
-		nan_grad, _ := tape_gradient(&tape, nan_value)
+		nan_grad, nan_grad_err := tape_gradient(&tape, nan_value)
+		require_ok(t, nan_grad_err)
 		// Global reductions pick the first NaN; axis -1 picks it in each row,
 		// and axis 0 picks it in the second column only.
 		want := []f64{0, 1, 0, 0}
@@ -2078,8 +2093,10 @@ test_tape_max_and_min_axis_gradients_through_permuted_view :: proc(t: ^testing.T
 		testing.expectf(t, copy_y_err == .None, "%v: %v", operation, copy_y_err)
 		testing.expect_value(t, tape_backward_with_seed(&copy_tape, copy_y, seed), Tensor_Error.None)
 
-		view_grad, _ := tape_gradient(&view_tape, view_x)
-		copy_grad, _ := tape_gradient(&copy_tape, copy_x)
+		view_grad, view_grad_err := tape_gradient(&view_tape, view_x)
+		require_ok(t, view_grad_err)
+		copy_grad, copy_grad_err := tape_gradient(&copy_tape, copy_x)
+		require_ok(t, copy_grad_err)
 		expect_f64_data(t, view_grad.data, copy_grad.data)
 	}
 }
@@ -2104,16 +2121,19 @@ test_tape_log_and_sqrt_of_zero_give_infinite_gradients :: proc(t: ^testing.T) {
 		loss, loss_err := tape_sum_all(&tape, y)
 		require_ok(t, loss_err)
 		testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
-		x_grad, _ := tape_gradient(&tape, x_value)
+		x_grad, x_grad_err := tape_gradient(&tape, x_value)
+		require_ok(t, x_grad_err)
 		testing.expectf(t, math.is_inf(x_grad.data[0], 1), "%v: gradient at 0 is %v, want +Inf", operation, x_grad.data[0])
 		testing.expectf(t, x_grad.data[1] == 0.25, "%v: gradient at 4 is %v, want 0.25", operation, x_grad.data[1])
 	}
 	// log(0) = -Inf is recorded as the forward value, not rejected.
 	tape_reset(&tape)
-	x_value, _ := tape_add_leaf_borrow(&tape, &x)
+	x_value, x_value_err := tape_add_leaf_borrow(&tape, &x)
+	require_ok(t, x_value_err)
 	logged, logged_err := tape_log(&tape, x_value)
 	require_ok(t, logged_err)
-	logged_view, _ := tape_value(&tape, logged)
+	logged_view, logged_view_err := tape_value(&tape, logged)
+	require_ok(t, logged_view_err)
 	testing.expect_value(t, logged_view.data[0], math.inf_f64(-1))
 }
 
@@ -2135,9 +2155,12 @@ test_tape_backward_visits_only_reachable_nodes :: proc(t: ^testing.T) {
 	tape, err = tape_init(f64)
 	require_ok(t, err)
 	defer tape_release(&tape)
-	x_value, _ := tape_add_leaf_borrow(&tape, &x)
-	infinity_value, _ := tape_add_leaf_borrow(&tape, &infinity, false)
-	zero_value, _ := tape_add_leaf_borrow(&tape, &zero, false)
+	x_value, x_value_err := tape_add_leaf_borrow(&tape, &x)
+	require_ok(t, x_value_err)
+	infinity_value, infinity_value_err := tape_add_leaf_borrow(&tape, &infinity, false)
+	require_ok(t, infinity_value_err)
+	zero_value, zero_value_err := tape_add_leaf_borrow(&tape, &zero, false)
+	require_ok(t, zero_value_err)
 
 	// An unrelated branch whose local derivative is infinite does not touch x.
 	scaled, scaled_err := tape_mul(&tape, x_value, infinity_value)
@@ -2145,7 +2168,8 @@ test_tape_backward_visits_only_reachable_nodes :: proc(t: ^testing.T) {
 	direct, direct_err := tape_sum_all(&tape, x_value)
 	require_ok(t, direct_err)
 	testing.expect_value(t, tape_backward(&tape, direct), Tensor_Error.None)
-	x_grad, _ := tape_gradient(&tape, x_value)
+	x_grad, x_grad_err := tape_gradient(&tape, x_value)
+	require_ok(t, x_grad_err)
 	expect_f64_data(t, x_grad.data, []f64{1})
 
 	// On a reachable path, 0 * inf gives NaN, as in other autodiff libraries.
