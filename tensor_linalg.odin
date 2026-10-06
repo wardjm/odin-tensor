@@ -323,15 +323,15 @@ matmul_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_E
 
 // scale_in_place multiplies every element by a scalar without allocating.
 // Do not use it on storage borrowed by an active autodiff tape.
-scale_in_place :: proc(t: ^Tensor($T), factor: T) -> Tensor_Error where intrinsics.type_is_float(T) {
+scale_in_place :: proc(t: ^Tensor($T), factor: T) where intrinsics.type_is_float(T) {
 	for i in 0..<len(t.data) {
 		t.data[i] *= factor
 	}
-	return .None
 }
 
 // add_scaled_in_place performs t += factor*source without allocating. Shapes
-// must match exactly; do not mutate storage borrowed by an active autodiff tape.
+// must match exactly (source does not broadcast); a mismatch returns
+// Shape_Mismatch. Do not mutate storage borrowed by an active autodiff tape.
 add_scaled_in_place :: proc(t: ^Tensor($T), source: Tensor(T), factor: T) -> Tensor_Error where intrinsics.type_is_float(T) {
 	if !_shapes_match(t.shape, source.shape) {
 		return .Shape_Mismatch

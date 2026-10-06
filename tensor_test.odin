@@ -1267,7 +1267,7 @@ test_optimizer_in_place_scaling_helpers :: proc(t: ^testing.T) {
 	testing.expect(t, abs(parameters.data[0]-0.975) < 1e-12)
 	testing.expect(t, abs(parameters.data[1]+2.2) < 1e-12)
 	testing.expect(t, abs(parameters.data[2]-0.6) < 1e-12)
-	testing.expect(t, scale_in_place(&parameters, 2) == .None)
+	scale_in_place(&parameters, 2)
 	testing.expect(t, abs(parameters.data[0]-1.95) < 1e-12)
 	testing.expect(t, abs(parameters.data[1]+4.4) < 1e-12)
 	testing.expect(t, abs(parameters.data[2]-1.2) < 1e-12)

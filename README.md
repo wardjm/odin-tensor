@@ -117,7 +117,7 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 `exp`, `log`, `sqrt`, `relu`, `sigmoid`, and `tanh` have the same allocating, `_views`, `_into`, `_views_into`, and `_in_place` forms (`_in_place` takes only the tensor).
 
-`broadcast_shape(a_shape, b_shape, buffer)` computes a broadcast shape without allocating. `scale_in_place(&t, factor)` and `add_scaled_in_place(&t, source, factor)` are simple optimizer updates.
+`broadcast_shape(a_shape, b_shape, buffer)` computes a broadcast shape without allocating. `scale_in_place(&t, factor)` and `add_scaled_in_place(&t, source, factor)` are simple optimizer updates. `scale_in_place` cannot fail and returns nothing. `add_scaled_in_place` requires `source` to have exactly the shape of `t` and returns `.Shape_Mismatch` otherwise; it does not broadcast, because an optimizer step always pairs a parameter with a gradient of the same shape.
 
 ### Reductions
 
