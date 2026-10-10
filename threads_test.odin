@@ -93,6 +93,103 @@ all_products :: proc() -> (results: [dynamic][]f64, integer_results: [dynamic][]
 	return
 }
 
+// filled is a tensor of shape with deterministic values in about [-2, 2].
+filled :: proc(shape: []int, salt: int) -> Tensor(f64) {
+	t := new_tensor(f64, shape) or_else panic("new")
+	for &value, i in t.data do value = f64((i*7 + salt) % 29) * 0.14 - 2
+	return t
+}
+
+// all_elementwise computes element-wise, im2col and pooling results, forward
+// and backward, each large enough to split between threads.
+all_elementwise :: proc() -> (results: [dynamic][]f64) {
+	big := filled([]int{300, 400}, 1)
+	defer release(&big)
+	other := filled([]int{300, 400}, 2)
+	defer release(&other)
+	row := filled([]int{400}, 3)
+	defer release(&row)
+	for &value in other.data do value = value + 3 // keep divisors away from zero
+	shape_buffer, strides_buffer: [2]int
+	transposed := transpose_view(as_view(big), shape_buffer[:], strides_buffer[:]) or_else panic("transpose")
+
+	keep :: proc(results: ^[dynamic][]f64, t: Tensor(f64)) {
+		t := t
+		append(results, slice.clone(t.data))
+		release(&t)
+	}
+	keep(&results, add(big, other) or_else panic("add"))
+	keep(&results, div(big, other) or_else panic("div"))
+	keep(&results, mul(big, row) or_else panic("mul")) // broadcast rows
+	keep(&results, tanh_views(transposed) or_else panic("tanh")) // strided source
+	keep(&results, exp(big) or_else panic("exp"))
+	in_place := copy_view(as_view(big)) or_else panic("copy")
+	relu_in_place(&in_place)
+	add_in_place(&in_place, row)
+	keep(&results, in_place)
+
+	image := filled([]int{16, 30, 30, 3}, 4)
+	defer release(&image)
+	axes_shape, axes_strides: [4]int
+	// The same values read channels-first, so pixels and channels are strided.
+	channels_first := filled([]int{16, 3, 30, 30}, 4)
+	defer release(&channels_first)
+	permuted := permute_view(as_view(channels_first), []int{0, 2, 3, 1}, axes_shape[:], axes_strides[:]) or_else panic("permute")
+	keep(&results, im2col(image, 5, 5) or_else panic("im2col"))
+	keep(&results, im2col_views(permuted, 3, 4, 2) or_else panic("im2col"))
+	keep(&results, max_pool2d(image, 2, 2) or_else panic("pool"))
+	keep(&results, max_pool2d_views(permuted, 3, 2) or_else panic("pool"))
+
+	// A convolution layer's graph and a same-shape and a broadcast product.
+	tape := tape_init(f64) or_else panic("tape")
+	defer tape_release(&tape)
+	weights := filled([]int{5, 5, 3, 8}, 5)
+	defer release(&weights)
+	for &value in weights.data do value *= 0.05
+	bias := filled([]int{8}, 6)
+	defer release(&bias)
+	x := tape_add_leaf_borrow(&tape, &image) or_else panic("leaf")
+	w := tape_add_leaf_borrow(&tape, &weights) or_else panic("leaf")
+	b := tape_add_leaf_borrow(&tape, &bias) or_else panic("leaf")
+	windows := tape_im2col(&tape, x, 5, 5) or_else panic("im2col")
+	rows := tape_reshape(&tape, windows, []int{-1, 75}) or_else panic("reshape")
+	kernels := tape_reshape(&tape, w, []int{75, 8}) or_else panic("reshape")
+	product := tape_matmul(&tape, rows, kernels) or_else panic("matmul")
+	biased := tape_add(&tape, product, b) or_else panic("add")
+	images := tape_reshape(&tape, biased, []int{16, 26, 26, 8}) or_else panic("reshape")
+	activated := tape_relu(&tape, images) or_else panic("relu")
+	squared := tape_mul(&tape, activated, activated) or_else panic("mul")
+	summed := tape_add(&tape, squared, activated) or_else panic("add")
+	pooled := tape_max_pool2d(&tape, summed, 2, 2) or_else panic("pool")
+	sigmoid := tape_sigmoid(&tape, pooled) or_else panic("sigmoid")
+	total := tape_sum_all(&tape, sigmoid) or_else panic("sum")
+	if tape_backward(&tape, total) != .None do panic("backward")
+	// A second pass adds into the existing gradients.
+	if tape_backward(&tape, total) != .None do panic("backward")
+	for value in ([]Tape_Value(f64){x, w, b, activated}) {
+		gradient := tape_gradient(&tape, value) or_else panic("gradient")
+		append(&results, slice.clone(gradient.data))
+	}
+
+	// A repeating operand long enough that its gradient's sums are split.
+	wide := filled([]int{600, 256}, 7)
+	defer release(&wide)
+	scale := filled([]int{256}, 8)
+	defer release(&scale)
+	tape_reset(&tape)
+	wide_value := tape_add_leaf_borrow(&tape, &wide) or_else panic("leaf")
+	scale_value := tape_add_leaf_borrow(&tape, &scale) or_else panic("leaf")
+	scaled := tape_mul(&tape, wide_value, scale_value) or_else panic("mul")
+	divided := tape_div(&tape, scaled, scale_value) or_else panic("div")
+	wide_total := tape_sum_all(&tape, tape_tanh(&tape, divided) or_else panic("tanh")) or_else panic("sum")
+	if tape_backward(&tape, wide_total) != .None do panic("backward")
+	for value in ([]Tape_Value(f64){wide_value, scale_value}) {
+		gradient := tape_gradient(&tape, value) or_else panic("gradient")
+		append(&results, slice.clone(gradient.data))
+	}
+	return
+}
+
 delete_results :: proc(results: [dynamic][]f64, integer_results: [dynamic][]i32) {
 	for r in results do delete(r)
 	for r in integer_results do delete(r)
@@ -125,6 +222,8 @@ test_threaded_products_match_one_thread :: proc(t: ^testing.T) {
 
 	reference, integer_reference := all_products()
 	defer delete_results(reference, integer_reference)
+	elementwise_reference := all_elementwise()
+	defer delete_results(elementwise_reference, nil)
 	// Odd counts leave uneven row ranges.
 	for threads in ([]int{2, 3, 4, 8}) {
 		require_ok(t, set_thread_count(threads))
@@ -132,6 +231,11 @@ test_threaded_products_match_one_thread :: proc(t: ^testing.T) {
 		actual, integer_actual := all_products()
 		defer delete_results(actual, integer_actual)
 		expect_same_results(t, threads, reference, actual, integer_reference, integer_actual)
+		elementwise_actual := all_elementwise()
+		defer delete_results(elementwise_actual, nil)
+		for r, i in elementwise_reference {
+			testing.expectf(t, slice.equal(r, elementwise_actual[i]), "%d threads: element-wise result %d differs from one thread", threads, i)
+		}
 	}
 
 	// Several threads multiplying at once: one gets the workers, the rest run

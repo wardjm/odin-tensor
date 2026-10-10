@@ -38,20 +38,36 @@ _apply_unary_operation :: #force_inline proc(value: $T, $operation: _Unary_Opera
 // _unary_kernel applies operation to every element of a validated source,
 // writing output in row-major order.
 _unary_kernel :: proc(output: []$T, source: Tensor_View(T), $operation: _Unary_Operation) {
-	count := len(output)
-	if count == 0 {
+	if len(output) == 0 {
 		return
 	}
-	if _is_contiguous_view(source) {
-		source_data := source.data[source.offset:][:count]
-		for i in 0..<count {
+	job := _Unary_Job(T){output = output, source = source, contiguous = _is_contiguous_view(source)}
+	_parallel_ranges(len(output), 1 if job.contiguous else _row_length(source.shape), proc(data: rawptr, first, last: int) {
+		job := (^_Unary_Job(T))(data)
+		_unary_range(job, first, last, operation)
+	}, &job)
+}
+
+_Unary_Job :: struct($T: typeid) {
+	output:     []T,
+	source:     Tensor_View(T),
+	contiguous: bool,
+}
+
+// _unary_range fills output[first:last]; for strided views first is a
+// multiple of the row length.
+_unary_range :: proc(job: ^_Unary_Job($T), first, last: int, $operation: _Unary_Operation) {
+	output, source := job.output, job.source
+	if job.contiguous {
+		source_data := source.data[source.offset:]
+		for i in first..<last {
 			output[i] = _apply_unary_operation(source_data[i], operation)
 		}
 		return
 	}
 	row := _row_length(source.shape)
 	step := _inner_step(source, source.shape)
-	for start := 0; start < count; start += row {
+	for start := first; start < last; start += row {
 		offset := _broadcast_offset(source, source.shape, start)
 		for i in start..<start+row {
 			output[i] = _apply_unary_operation(source.data[offset], operation)

@@ -1,12 +1,13 @@
 package tensor
 
-// Worker threads for matrix products.
+// Worker threads.
 //
 // The library is single-threaded until set_thread_count asks for more. Large
-// products are then split into row ranges, one per thread, with the calling
+// matrix products, element-wise operations, im2col and pooling, forward and
+// backward, are then split into ranges, one per thread, with the calling
 // thread taking one range and waiting for the rest. Each output element is
-// still computed by one thread, adding its products in the same order, so the
-// thread count never changes a result.
+// still computed by one thread, combining its inputs in the same order, so
+// the thread count never changes a result.
 
 import "base:intrinsics"
 import "core:sync"
@@ -15,6 +16,10 @@ import "core:thread"
 // _PARALLEL_MIN_WORK is the multiply-add count below which a product stays on
 // the calling thread: splitting smaller ones costs more than it saves.
 _PARALLEL_MIN_WORK :: 1 << 18
+
+// _PARALLEL_MIN_ELEMENTS is the element count below which an element-wise
+// pass stays on the calling thread.
+_PARALLEL_MIN_ELEMENTS :: 1 << 16
 
 _Parallel_Body :: #type proc(data: rawptr, chunk: int)
 
@@ -163,6 +168,33 @@ _parallel_for :: proc(chunks: int, body: _Parallel_Body, data: rawptr) {
 	for chunk in 0..<chunks {
 		body(data, chunk)
 	}
+}
+
+_Range_Body :: #type proc(data: rawptr, first, last: int)
+
+_Parallel_Ranges :: struct {
+	body:   _Range_Body,
+	data:   rawptr,
+	length: int,
+	count:  int,
+}
+
+// _parallel_ranges calls body(data, first, last) on ranges that together
+// cover 0..<count, each starting at a multiple of granule. With one thread, or
+// under _PARALLEL_MIN_ELEMENTS units of work (cost per item times count), it
+// is a single call for the whole range.
+_parallel_ranges :: proc(count, granule: int, body: _Range_Body, data: rawptr, cost := 1) {
+	if count*cost < _PARALLEL_MIN_ELEMENTS || thread_count() == 1 {
+		body(data, 0, count)
+		return
+	}
+	length, chunks := _parallel_chunks(count, granule)
+	ranges := _Parallel_Ranges{body = body, data = data, length = length, count = count}
+	_parallel_for(chunks, proc(data: rawptr, chunk: int) {
+		ranges := (^_Parallel_Ranges)(data)
+		first := chunk * ranges.length
+		ranges.body(ranges.data, first, min(first+ranges.length, ranges.count))
+	}, &ranges)
 }
 
 // _parallel_chunks splits count items into one range per thread, each a

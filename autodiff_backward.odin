@@ -139,9 +139,7 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			node.has_grad = true
 			continue
 		}
-		for &value, j in node.grad.data {
-			value += scratch[i].data[j]
-		}
+		_add_into(node.grad.data, scratch[i].data)
 	}
 	return .None
 }
@@ -430,9 +428,7 @@ _backward_view :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), operation:
 		if len(gradient.data) != len(output_grad.data) {
 			return .Shape_Mismatch
 		}
-		for &value, i in gradient.data {
-			value += output_grad.data[i]
-		}
+		_add_into(gradient.data, output_grad.data)
 		return .None
 	case:
 		return .Unsupported_Operation
@@ -492,14 +488,29 @@ _backward_activation :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), inpu
 // Contiguous views take one flat loop; otherwise it finds storage offsets once
 // per row, stepping along it. Both views must be validated and share the shape
 // of the contiguous gradient and upstream.
-_backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Tensor_View(T), $operation: Tape_Operation) #no_bounds_check {
-	if _is_contiguous_view(input) && _is_contiguous_view(output) {
-		// One flat loop with no offset arithmetic, which the compiler can
-		// vectorize.
-		count := len(upstream)
-		inputs := input.data[input.offset:][:count]
-		outputs := output.data[output.offset:][:count]
-		for i in 0..<count {
+_backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Tensor_View(T), $operation: Tape_Operation) {
+	job := _Activation_Job(T){gradient = gradient, upstream = upstream, input = input, output = output}
+	job.contiguous = _is_contiguous_view(input) && _is_contiguous_view(output)
+	_parallel_ranges(len(upstream), 1 if job.contiguous else _row_length(input.shape), proc(data: rawptr, first, last: int) {
+		_backward_activation_range((^_Activation_Job(T))(data), first, last, operation)
+	}, &job)
+}
+
+_Activation_Job :: struct($T: typeid) {
+	gradient, upstream: []T,
+	input, output:      Tensor_View(T),
+	contiguous:         bool,
+}
+
+// _backward_activation_range adds the gradient for elements first..<last;
+// for strided views first is a multiple of the row length. Contiguous views
+// take one flat loop the compiler can vectorize.
+_backward_activation_range :: proc(job: ^_Activation_Job($T), first, last: int, $operation: Tape_Operation) #no_bounds_check {
+	gradient, upstream, input, output := job.gradient, job.upstream, job.input, job.output
+	if job.contiguous {
+		inputs := input.data[input.offset:]
+		outputs := output.data[output.offset:]
+		for i in first..<last {
 			gradient[i] += upstream[i] * _activation_derivative(inputs[i], outputs[i], operation)
 		}
 		return
@@ -507,7 +518,7 @@ _backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Ten
 	row := _row_length(input.shape)
 	input_step := _inner_step(input, input.shape)
 	output_step := _inner_step(output, output.shape)
-	for start := 0; start < len(upstream); start += row {
+	for start := first; start < last; start += row {
 		input_offset := _broadcast_offset(input, input.shape, start)
 		output_offset := _broadcast_offset(output, output.shape, start)
 		for i in start..<start+row {
@@ -520,6 +531,22 @@ _backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Ten
 
 // _backward_binary_elementwise applies one binary VJP and reduces broadcasted
 // contributions into each parent's original shape.
+// _add_into adds source into target element by element, split between
+// threads when large.
+_add_into :: proc(target, source: []$T) {
+	Job :: struct {
+		target, source: []T,
+	}
+	job := Job{target, source}
+	_parallel_ranges(len(target), 1, proc(data: rawptr, first, last: int) {
+		job := (^Job)(data)
+		target, source := job.target[first:last], job.source[first:last]
+		for &value, i in target {
+			value += source[i]
+		}
+	}, &job)
+}
+
 // _activation_derivative is d output / d input for one element, from whichever
 // of the forward input and output the rule needs.
 _activation_derivative :: #force_inline proc(input, output: $T, $operation: Tape_Operation) -> T {
@@ -649,28 +676,86 @@ _suffix_period :: proc(shape, result_shape: []int) -> (period: int, ok: bool) {
 }
 
 // _backward_binary_repeating is _backward_binary_kernel for operands found by
-// _repeating_operands: blocks of the shorter period, each a flat loop the
-// compiler can vectorize.
-_backward_binary_repeating :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T), a_period, b_period: int, $operation: Tape_Operation) #no_bounds_check {
-	period := min(a_period, b_period)
-	a_values := a.data[a.offset:][:a_period]
-	b_values := b.data[b.offset:][:b_period]
-	for block := 0; block < len(upstream); block += period {
-		g := upstream[block:][:period]
-		a_block := a_values[block:][:period] if a_period > period else a_values
-		b_block := b_values[block:][:period] if b_period > period else b_values
-		if grad_a != nil {
-			a_grad := grad_a[block:][:period] if a_period > period else grad_a
-			for j in 0..<period {
+// _repeating_operands. Gradients of operands that fill the output are split
+// between threads by blocks of the shorter period; the repeating operand's
+// gradient sums over every block, so threads split its elements instead,
+// each adding its blocks in order. Every loop is flat and can vectorize.
+_backward_binary_repeating :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T), a_period, b_period: int, $operation: Tape_Operation) {
+	total := len(upstream)
+	job := _Repeating_Job(T){grad_a = grad_a, grad_b = grad_b, upstream = upstream, a = a.data[a.offset:][:a_period], b = b.data[b.offset:][:b_period], period = min(a_period, b_period), total = total}
+	job.a_full, job.b_full = a_period == total, b_period == total
+	// Blocks are one period long, or a fixed size when both operands fill the
+	// output and the period is the whole tensor.
+	job.block = job.period
+	if job.a_full && job.b_full {
+		job.block = min(total, 1 << 12)
+	}
+	if (grad_a != nil && job.a_full) || (grad_b != nil && job.b_full) {
+		_parallel_ranges((total + job.block - 1)/job.block, 1, proc(data: rawptr, first, last: int) {
+			_repeating_full_blocks((^_Repeating_Job(T))(data), first, last, operation)
+		}, &job, job.block)
+	}
+	if (grad_a != nil && !job.a_full) || (grad_b != nil && !job.b_full) {
+		// Each thread reads every block, so only a period long enough for
+		// whole cache lines per thread is worth splitting.
+		_parallel_ranges(job.period, 64, proc(data: rawptr, first, last: int) {
+			_repeating_sums((^_Repeating_Job(T))(data), first, last, operation)
+		}, &job, total/job.period)
+	}
+}
+
+_Repeating_Job :: struct($T: typeid) {
+	grad_a, grad_b, upstream: []T,
+	a, b:                     []T,
+	period, total:            int,
+	block:                    int,
+	a_full, b_full:           bool,
+}
+
+// _repeating_full_blocks adds the full operands' gradients for blocks
+// first..<last of job.block elements; the last block may be shorter.
+_repeating_full_blocks :: proc(job: ^_Repeating_Job($T), first, last: int, $operation: Tape_Operation) #no_bounds_check {
+	for start := first*job.block; start < min(last*job.block, job.total); start += job.block {
+		length := min(job.block, job.total-start)
+		g := job.upstream[start:][:length]
+		// A repeating operand's block is its whole period.
+		a_block := job.a[start:][:length] if job.a_full else job.a
+		b_block := job.b[start:][:length] if job.b_full else job.b
+		if job.grad_a != nil && job.a_full {
+			a_grad := job.grad_a[start:][:length]
+			for j in 0..<length {
 				contribution, _ := _binary_vjp(g[j], a_block[j], b_block[j], operation)
 				a_grad[j] += contribution
 			}
 		}
-		if grad_b != nil {
-			b_grad := grad_b[block:][:period] if b_period > period else grad_b
-			for j in 0..<period {
+		if job.grad_b != nil && job.b_full {
+			b_grad := job.grad_b[start:][:length]
+			for j in 0..<length {
 				_, contribution := _binary_vjp(g[j], a_block[j], b_block[j], operation)
 				b_grad[j] += contribution
+			}
+		}
+	}
+}
+
+// _repeating_sums adds the repeating operand's gradient for its elements
+// first..<last, block by block in order.
+_repeating_sums :: proc(job: ^_Repeating_Job($T), first, last: int, $operation: Tape_Operation) #no_bounds_check {
+	period := job.period
+	for block := 0; block < job.total; block += period {
+		g := job.upstream[block:][:period]
+		a_block := job.a[block:][:period] if job.a_full else job.a
+		b_block := job.b[block:][:period] if job.b_full else job.b
+		if job.grad_a != nil && !job.a_full {
+			for j in first..<last {
+				contribution, _ := _binary_vjp(g[j], a_block[j], b_block[j], operation)
+				job.grad_a[j] += contribution
+			}
+		}
+		if job.grad_b != nil && !job.b_full {
+			for j in first..<last {
+				_, contribution := _binary_vjp(g[j], a_block[j], b_block[j], operation)
+				job.grad_b[j] += contribution
 			}
 		}
 	}

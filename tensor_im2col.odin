@@ -83,39 +83,57 @@ _im2col_shape :: proc(source_shape: []int, kernel_height, kernel_width, stride: 
 }
 
 // _im2col_kernel fills the contiguous output, whose shape result_shape comes
-// from _im2col_shape, from a validated source. When pixels and channels are
-// contiguous, each window row (oy, ox, dy) is one copy of
-// kernel_width*channels elements.
-_im2col_kernel :: proc(output: []$T, source: Tensor_View(T), kernel_height, kernel_width, stride: int, result_shape: []int) #no_bounds_check {
+// from _im2col_shape, from a validated source, splitting the (image, output
+// row) pairs between threads. When pixels and channels are contiguous, each
+// window row (oy, ox, dy) is one copy of kernel_width*channels elements.
+_im2col_kernel :: proc(output: []$T, source: Tensor_View(T), kernel_height, kernel_width, stride: int, result_shape: []int) {
 	if len(output) == 0 {
 		return
 	}
 	rank := len(source.shape)
-	batch_view := Tensor_View(T){data = source.data, shape = source.shape[:rank-3], strides = source.strides[:rank-3], offset = source.offset}
-	batch_count, _ := _element_count(batch_view.shape)
-	out_height, out_width := result_shape[rank-3], result_shape[rank-2]
+	job := _Im2col_Job(T){output = output, source = source, kernel_height = kernel_height, kernel_width = kernel_width, stride = stride}
+	job.batch = Tensor_View(T){data = source.data, shape = source.shape[:rank-3], strides = source.strides[:rank-3], offset = source.offset}
+	batch_count, _ := _element_count(job.batch.shape)
+	job.out_height, job.out_width, job.columns = result_shape[rank-3], result_shape[rank-2], result_shape[rank-1]
+	_parallel_ranges(batch_count*job.out_height, 1, proc(data: rawptr, first, last: int) {
+		_im2col_rows((^_Im2col_Job(T))(data), first, last)
+	}, &job, job.out_width*job.columns)
+}
+
+_Im2col_Job :: struct($T: typeid) {
+	output:                            []T,
+	source:                            Tensor_View(T),
+	batch:                             Tensor_View(T),
+	kernel_height, kernel_width:       int,
+	stride:                            int,
+	out_height, out_width, columns:    int,
+}
+
+// _im2col_rows fills the output rows for (image, output row) pairs first..<last.
+_im2col_rows :: proc(job: ^_Im2col_Job($T), first, last: int) #no_bounds_check {
+	source, output := job.source, job.output
+	rank := len(source.shape)
 	channels := source.shape[rank-1]
 	row_stride, pixel_stride, channel_stride := source.strides[rank-3], source.strides[rank-2], source.strides[rank-1]
 	contiguous_rows := channel_stride == 1 && pixel_stride == channels
-	row_length := kernel_width * channels
-	next := 0
-	for batch in 0..<batch_count {
-		base := _broadcast_offset(batch_view, batch_view.shape, batch)
-		for oy in 0..<out_height {
-			for ox in 0..<out_width {
-				for dy in 0..<kernel_height {
-					start := base + (oy*stride+dy)*row_stride + ox*stride*pixel_stride
-					if contiguous_rows {
-						copy(output[next:][:row_length], source.data[start:][:row_length])
-						next += row_length
-						continue
-					}
-					for dx in 0..<kernel_width {
-						pixel := start + dx*pixel_stride
-						for c in 0..<channels {
-							output[next] = source.data[pixel + c*channel_stride]
-							next += 1
-						}
+	row_length := job.kernel_width * channels
+	next := first * job.out_width * job.columns
+	for pair in first..<last {
+		batch, oy := pair / job.out_height, pair % job.out_height
+		base := _broadcast_offset(job.batch, job.batch.shape, batch)
+		for ox in 0..<job.out_width {
+			for dy in 0..<job.kernel_height {
+				start := base + (oy*job.stride+dy)*row_stride + ox*job.stride*pixel_stride
+				if contiguous_rows {
+					copy(output[next:][:row_length], source.data[start:][:row_length])
+					next += row_length
+					continue
+				}
+				for dx in 0..<job.kernel_width {
+					pixel := start + dx*pixel_stride
+					for c in 0..<channels {
+						output[next] = source.data[pixel + c*channel_stride]
+						next += 1
 					}
 				}
 			}
@@ -126,7 +144,7 @@ _im2col_kernel :: proc(output: []$T, source: Tensor_View(T), kernel_height, kern
 // _backward_im2col adds each upstream value back to the input element im2col
 // copied it from, so elements shared by overlapping windows sum their
 // gradients. gradient is contiguous in input's logical shape.
-_backward_im2col :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), kernel_height, kernel_width, stride: int) -> Tensor_Error where intrinsics.type_is_float(T) #no_bounds_check {
+_backward_im2col :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), kernel_height, kernel_width, stride: int) -> Tensor_Error where intrinsics.type_is_float(T) {
 	shape_buffer: [MAX_RANK]int
 	rank := _im2col_shape(input.shape, kernel_height, kernel_width, stride, shape_buffer[:]) or_return
 	if !_shapes_match(output_grad.shape, shape_buffer[:rank]) || !_shapes_match(gradient.shape, input.shape) {
@@ -135,26 +153,43 @@ _backward_im2col :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: T
 	if len(output_grad.data) == 0 {
 		return .None
 	}
-	height, width, channels := input.shape[rank-3], input.shape[rank-2], input.shape[rank-1]
-	out_height, out_width := shape_buffer[rank-3], shape_buffer[rank-2]
-	image_size := height * width * channels
-	row_length := kernel_width * channels
-	batch_count := len(gradient.data) / image_size
-	upstream := output_grad.data
-	next := 0
-	for batch in 0..<batch_count {
+	// Overlapping windows of one image add into the same elements, so the
+	// images, whose gradients don't overlap, are what threads split.
+	job := _Im2col_Backward_Job(T){gradient = gradient.data, upstream = output_grad.data, kernel_height = kernel_height, kernel_width = kernel_width, stride = stride}
+	job.height, job.width, job.channels = input.shape[rank-3], input.shape[rank-2], input.shape[rank-1]
+	job.out_height, job.out_width = shape_buffer[rank-3], shape_buffer[rank-2]
+	image_size := job.height * job.width * job.channels
+	_parallel_ranges(len(gradient.data)/image_size, 1, proc(data: rawptr, first, last: int) {
+		_backward_im2col_images((^_Im2col_Backward_Job(T))(data), first, last)
+	}, &job, len(output_grad.data)/(len(gradient.data)/image_size))
+	return .None
+}
+
+_Im2col_Backward_Job :: struct($T: typeid) {
+	gradient, upstream:              []T,
+	kernel_height, kernel_width:     int,
+	stride:                          int,
+	height, width, channels:         int,
+	out_height, out_width:           int,
+}
+
+_backward_im2col_images :: proc(job: ^_Im2col_Backward_Job($T), first, last: int) #no_bounds_check {
+	image_size := job.height * job.width * job.channels
+	row_length := job.kernel_width * job.channels
+	window_size := job.kernel_height * row_length
+	next := first * job.out_height * job.out_width * window_size
+	for batch in first..<last {
 		base := batch * image_size
-		for oy in 0..<out_height {
-			for ox in 0..<out_width {
-				for dy in 0..<kernel_height {
-					target := gradient.data[base + ((oy*stride+dy)*width + ox*stride)*channels:][:row_length]
+		for oy in 0..<job.out_height {
+			for ox in 0..<job.out_width {
+				for dy in 0..<job.kernel_height {
+					target := job.gradient[base + ((oy*job.stride+dy)*job.width + ox*job.stride)*job.channels:][:row_length]
 					for &value, i in target {
-						value += upstream[next+i]
+						value += job.upstream[next+i]
 					}
 					next += row_length
 				}
 			}
 		}
 	}
-	return .None
 }

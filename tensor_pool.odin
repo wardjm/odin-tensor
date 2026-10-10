@@ -88,46 +88,63 @@ _pool_geometry :: proc(source: Tensor_View($T), result_shape: []int) -> (geometr
 	return geometry
 }
 
-// _max_pool2d_kernel fills the contiguous output from a validated source. For
-// each window it starts every channel at the window's first pixel and folds
-// the remaining pixels in row-major order with max_axis's rule, a loop over
-// channels that the compiler can vectorize when channels are contiguous.
-_max_pool2d_kernel :: proc(output: []$T, source: Tensor_View(T), pool_height, pool_width: int, result_shape: []int) #no_bounds_check {
+// _max_pool2d_kernel fills the contiguous output from a validated source,
+// splitting the (image, output row) pairs between threads. For each window it
+// starts every channel at the window's first pixel and folds the remaining
+// pixels in row-major order with max_axis's rule, a loop over channels that
+// the compiler can vectorize when channels are contiguous.
+_max_pool2d_kernel :: proc(output: []$T, source: Tensor_View(T), pool_height, pool_width: int, result_shape: []int) {
 	if len(output) == 0 {
 		return
 	}
-	g := _pool_geometry(source, result_shape)
-	data := source.data
-	next := 0
-	for batch in 0..<g.batch_count {
+	job := _Pool_Job(T){output = output, source = source, pool_height = pool_height, pool_width = pool_width, g = _pool_geometry(source, result_shape)}
+	_parallel_ranges(job.g.batch_count*job.g.out_height, 1, proc(data: rawptr, first, last: int) {
+		_max_pool2d_rows((^_Pool_Job(T))(data), first, last)
+	}, &job, job.g.out_width*job.g.channels*pool_height*pool_width)
+}
+
+_Pool_Job :: struct($T: typeid) {
+	output, gradient:         []T,
+	upstream:                 []T,
+	source:                   Tensor_View(T),
+	pool_height, pool_width:  int,
+	g:                        _Pool_Geometry(T),
+	width:                    int,
+}
+
+_max_pool2d_rows :: proc(job: ^_Pool_Job($T), first, last: int) #no_bounds_check {
+	g := job.g
+	data := job.source.data
+	pool_height, pool_width := job.pool_height, job.pool_width
+	next := first * g.out_width * g.channels
+	for pair in first..<last {
+		batch, oy := pair / g.out_height, pair % g.out_height
 		base := _broadcast_offset(g.batch, g.batch.shape, batch)
-		for oy in 0..<g.out_height {
-			for ox in 0..<g.out_width {
-				window := base + oy*pool_height*g.row_stride + ox*pool_width*g.pixel_stride
-				out := output[next:][:g.channels]
-				for &value, c in out {
-					value = data[window + c*g.channel_stride]
-				}
-				for dy in 0..<pool_height {
-					for dx in 0..<pool_width {
-						if dy == 0 && dx == 0 {
-							continue
-						}
-						pixel := window + dy*g.row_stride + dx*g.pixel_stride
-						if g.channel_stride == 1 {
-							row := data[pixel:][:g.channels]
-							for &value, c in out {
-								value = _combine(value, row[c], _Reduction_Operation.Max)
-							}
-							continue
-						}
+		for ox in 0..<g.out_width {
+			window := base + oy*pool_height*g.row_stride + ox*pool_width*g.pixel_stride
+			out := job.output[next:][:g.channels]
+			for &value, c in out {
+				value = data[window + c*g.channel_stride]
+			}
+			for dy in 0..<pool_height {
+				for dx in 0..<pool_width {
+					if dy == 0 && dx == 0 {
+						continue
+					}
+					pixel := window + dy*g.row_stride + dx*g.pixel_stride
+					if g.channel_stride == 1 {
+						row := data[pixel:][:g.channels]
 						for &value, c in out {
-							value = _combine(value, data[pixel + c*g.channel_stride], _Reduction_Operation.Max)
+							value = _combine(value, row[c], _Reduction_Operation.Max)
 						}
+						continue
+					}
+					for &value, c in out {
+						value = _combine(value, data[pixel + c*g.channel_stride], _Reduction_Operation.Max)
 					}
 				}
-				next += g.channels
 			}
+			next += g.channels
 		}
 	}
 }
@@ -136,7 +153,7 @@ _max_pool2d_kernel :: proc(output: []$T, source: Tensor_View(T), pool_height, po
 // its window that argmax would pick, scanning in row-major order: the first
 // NaN, or else the first maximum. gradient is contiguous in input's logical
 // shape.
-_backward_max_pool2d :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), pool_height, pool_width: int) -> Tensor_Error where intrinsics.type_is_float(T) #no_bounds_check {
+_backward_max_pool2d :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), pool_height, pool_width: int) -> Tensor_Error where intrinsics.type_is_float(T) {
 	_validate_view(input) or_return
 	shape_buffer: [MAX_RANK]int
 	rank := _pool_shape(input.shape, pool_height, pool_width, shape_buffer[:]) or_return
@@ -146,38 +163,47 @@ _backward_max_pool2d :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), inpu
 	if len(output_grad.data) == 0 {
 		return .None
 	}
-	g := _pool_geometry(input, shape_buffer[:rank])
-	width := input.shape[rank-2]
-	image_size := input.shape[rank-3] * width * g.channels
-	data := input.data
-	next := 0
-	for batch in 0..<g.batch_count {
+	// Windows don't overlap, so each (image, output row) pair writes its own
+	// rows of the gradient.
+	job := _Pool_Job(T){gradient = gradient.data, upstream = output_grad.data, source = input, pool_height = pool_height, pool_width = pool_width, g = _pool_geometry(input, shape_buffer[:rank]), width = input.shape[rank-2]}
+	_parallel_ranges(job.g.batch_count*job.g.out_height, 1, proc(data: rawptr, first, last: int) {
+		_backward_max_pool2d_rows((^_Pool_Job(T))(data), first, last)
+	}, &job, job.g.out_width*job.g.channels*pool_height*pool_width)
+	return .None
+}
+
+_backward_max_pool2d_rows :: proc(job: ^_Pool_Job($T), first, last: int) #no_bounds_check {
+	g := job.g
+	data := job.source.data
+	pool_height, pool_width := job.pool_height, job.pool_width
+	rank := len(job.source.shape)
+	image_size := job.source.shape[rank-3] * job.width * g.channels
+	next := first * g.out_width * g.channels
+	for pair in first..<last {
+		batch, oy := pair / g.out_height, pair % g.out_height
 		base := _broadcast_offset(g.batch, g.batch.shape, batch)
 		gradient_base := batch * image_size
-		for oy in 0..<g.out_height {
-			for ox in 0..<g.out_width {
-				window := base + oy*pool_height*g.row_stride + ox*pool_width*g.pixel_stride
-				for c in 0..<g.channels {
-					channel := window + c*g.channel_stride
-					best := data[channel]
-					best_dy, best_dx := 0, 0
-					scan: for dy in 0..<pool_height {
-						for dx in 0..<pool_width {
-							if best != best {
-								break scan
-							}
-							element := data[channel + dy*g.row_stride + dx*g.pixel_stride]
-							if _arg_is_better(element, best, _Reduction_Operation.Max) {
-								best, best_dy, best_dx = element, dy, dx
-							}
+		for ox in 0..<g.out_width {
+			window := base + oy*pool_height*g.row_stride + ox*pool_width*g.pixel_stride
+			for c in 0..<g.channels {
+				channel := window + c*g.channel_stride
+				best := data[channel]
+				best_dy, best_dx := 0, 0
+				scan: for dy in 0..<pool_height {
+					for dx in 0..<pool_width {
+						if best != best {
+							break scan
+						}
+						element := data[channel + dy*g.row_stride + dx*g.pixel_stride]
+						if _arg_is_better(element, best, _Reduction_Operation.Max) {
+							best, best_dy, best_dx = element, dy, dx
 						}
 					}
-					y, x := oy*pool_height + best_dy, ox*pool_width + best_dx
-					gradient.data[gradient_base + (y*width + x)*g.channels + c] += output_grad.data[next]
-					next += 1
 				}
+				y, x := oy*pool_height + best_dy, ox*pool_width + best_dx
+				job.gradient[gradient_base + (y*job.width + x)*g.channels + c] += job.upstream[next]
+				next += 1
 			}
 		}
 	}
-	return .None
 }

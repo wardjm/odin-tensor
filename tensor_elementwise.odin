@@ -85,14 +85,32 @@ _validate_division :: proc(dividends, divisors: Tensor_View($T), result_shape: [
 // after its inputs are read, so output may be the storage of an input that has
 // the full result shape.
 _binary_kernel :: proc(output: []$T, a, b: Tensor_View(T), result_shape: []int, $operation: _Binary_Operation) {
-	count := len(output)
-	if count == 0 {
+	if len(output) == 0 {
 		return
 	}
-	if _shapes_match(a.shape, result_shape) && _shapes_match(b.shape, result_shape) && _is_contiguous_view(a) && _is_contiguous_view(b) {
-		a_data := a.data[a.offset:][:count]
-		b_data := b.data[b.offset:][:count]
-		for i in 0..<count {
+	job := _Binary_Job(T){output = output, a = a, b = b, shape = result_shape}
+	job.contiguous = _shapes_match(a.shape, result_shape) && _shapes_match(b.shape, result_shape) && _is_contiguous_view(a) && _is_contiguous_view(b)
+	_parallel_ranges(len(output), 1 if job.contiguous else _row_length(result_shape), proc(data: rawptr, first, last: int) {
+		job := (^_Binary_Job(T))(data)
+		_binary_range(job, first, last, operation)
+	}, &job)
+}
+
+_Binary_Job :: struct($T: typeid) {
+	output:     []T,
+	a, b:       Tensor_View(T),
+	shape:      []int,
+	contiguous: bool,
+}
+
+// _binary_range fills output[first:last]; for broadcast views first is a
+// multiple of the row length.
+_binary_range :: proc(job: ^_Binary_Job($T), first, last: int, $operation: _Binary_Operation) {
+	output, a, b, result_shape := job.output, job.a, job.b, job.shape
+	if job.contiguous {
+		a_data := a.data[a.offset:]
+		b_data := b.data[b.offset:]
+		for i in first..<last {
 			output[i] = _apply_binary_operation(a_data[i], b_data[i], operation)
 		}
 		return
@@ -100,7 +118,7 @@ _binary_kernel :: proc(output: []$T, a, b: Tensor_View(T), result_shape: []int, 
 	row := _row_length(result_shape)
 	a_step := _inner_step(a, result_shape)
 	b_step := _inner_step(b, result_shape)
-	for start := 0; start < count; start += row {
+	for start := first; start < last; start += row {
 		a_offset := _broadcast_offset(a, result_shape, start)
 		b_offset := _broadcast_offset(b, result_shape, start)
 		for i in start..<start+row {
@@ -111,8 +129,6 @@ _binary_kernel :: proc(output: []$T, a, b: Tensor_View(T), result_shape: []int, 
 	}
 }
 
-// _binary_views_into validates both views and an exactly shaped output, then
-// writes the broadcast result. On any error, output is left unchanged.
 _binary_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T), $operation: _Binary_Operation) -> Tensor_Error {
 	_validate_view(a) or_return
 	_validate_view(b) or_return

@@ -147,7 +147,7 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 ## Threads
 
-The library is single-threaded by default. `set_thread_count(n)` lets matrix products (`dot`, `matmul` and their tape and backward forms) use up to `n` threads, counting the caller; `thread_count()` reports the setting, and `set_thread_count(1)` joins the workers again. A product with at least 2¹⁸ multiply-adds is split into one range of output rows per thread, and a batched `matmul` of many small matrices is split by matrix. Each output element is still computed on one thread, adding its products in the same order, so results are identical for every thread count.
+The library is single-threaded by default. `set_thread_count(n)` lets it use up to `n` threads, counting the caller; `thread_count()` reports the setting, and `set_thread_count(1)` joins the workers again. Threads are used by matrix products (`dot`, `matmul`), element-wise arithmetic and unary operations, `im2col` and `max_pool2d`, and by the backward pass of each of these and of reshapes. Work is split into one range per thread once it is large enough: 2¹⁸ multiply-adds for a product, 2¹⁶ elements for element-wise work. A product is split by output rows, a batched `matmul` of many small matrices by matrix, `im2col` and pooling by output row, and their backward passes by image or row so no two threads write the same gradient. Each output element is still computed on one thread, combining its inputs in the same order, so results are identical for every thread count.
 
 ```odin
 package main
@@ -247,7 +247,7 @@ Not differentiable yet: `var`/`std`, the several-axes `*_axes` reductions, `perm
 ## Limitations
 
 - Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products are cache-blocked with register tiles, but there is no hand-written SIMD, so large products are well short of a BLAS.
-- Only matrix products use more than one thread. Element-wise operations, reductions, `im2col` and pooling stay on the calling thread.
+- Reductions (`sum_axis`, `max_all`, ...) and the backward pass of a general broadcast, other than the bias pattern, stay on the calling thread: splitting them would change the order of their sums.
 
 ## Tests
 
