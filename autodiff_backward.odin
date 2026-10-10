@@ -118,6 +118,8 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			err = _backward_view(&scratch[a], scratch[node_id], node.operation, node.axis, node.start, node.step)
 		case .Im2col:
 			err = _backward_im2col(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width, node.step)
+		case .Max_Pool2D:
+			err = _backward_max_pool2d(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width)
 		case .Leaf:
 		}
 		if err != .None {

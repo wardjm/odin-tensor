@@ -166,6 +166,28 @@ tape_im2col :: proc(tape: ^Tape($T), x: Tape_Value(T), kernel_height, kernel_wid
 	})
 }
 
+// tape_max_pool2d records max_pool2d of x. Each upstream value goes to the one
+// element of its window that argmax picks: the first NaN, or else the first
+// maximum in row-major order. PyTorch also sends a tie's gradient to a single
+// element.
+tape_max_pool2d :: proc(tape: ^Tape($T), x: Tape_Value(T), pool_height, pool_width: int) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+	parent_node := _tape_node(tape, x)
+	if parent_node == nil {
+		return result, .Invalid_Tape
+	}
+	output := max_pool2d_views(parent_node.value, pool_height, pool_width, tape.allocator) or_return
+	defer release(&output)
+	return _tape_take_output(tape, &output, _Tape_Node(T){
+		requires_grad = parent_node.requires_grad,
+		operation     = .Max_Pool2D,
+		parent_a      = x.id,
+		parent_b      = -1,
+		parent_count  = 1,
+		kernel_height = pool_height,
+		kernel_width  = pool_width,
+	})
+}
+
 _tape_binary :: proc(tape: ^Tape($T), a, b: Tape_Value(T), operation: Tape_Operation) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
 	a_view := tape_value(tape, a) or_return
 	b_view := tape_value(tape, b) or_return

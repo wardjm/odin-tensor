@@ -34,6 +34,7 @@ Tape_Operation :: enum {
 	Slice,
 	Reshape,
 	Im2col,
+	Max_Pool2D,
 }
 
 _Tape_Node :: struct($T: typeid) {
@@ -51,6 +52,8 @@ _Tape_Node :: struct($T: typeid) {
 	start:         int,
 	// step is a Slice's step or an Im2col's stride.
 	step:          int,
+	// kernel_height and kernel_width are an Im2col's kernel or a
+	// Max_Pool2D's window.
 	kernel_height: int,
 	kernel_width:  int,
 }
