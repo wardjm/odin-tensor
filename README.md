@@ -145,6 +145,40 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 `max_pool2d(source, pool_height, pool_width, allocator)` takes the maximum of each non-overlapping window, per channel, so `[..., height, width, channels]` becomes `[..., height/pool_height, width/pool_width, channels]`, rounding down. A NaN in a window wins, as in `max_axis`. It has `_views`, `_into`, and `_views_into` forms and the same errors as `im2col`.
 
+## Threads
+
+The library is single-threaded by default. `set_thread_count(n)` lets matrix products (`dot`, `matmul` and their tape and backward forms) use up to `n` threads, counting the caller; `thread_count()` reports the setting, and `set_thread_count(1)` joins the workers again. A product with at least 2¹⁸ multiply-adds is split into one range of output rows per thread, and a batched `matmul` of many small matrices is split by matrix. Each output element is still computed on one thread, adding its products in the same order, so results are identical for every thread count.
+
+```odin
+package main
+
+import "core:fmt"
+import "core:sys/info"
+import tensor "path/to/odin-tensor"
+
+main :: proc() {
+    physical, _, _ := info.cpu_core_count()
+    if err := tensor.set_thread_count(max(physical, 1)); err != .None {
+        fmt.eprintln("threads:", err)
+        return
+    }
+    defer tensor.set_thread_count(1)
+
+    a, _ := tensor.new_tensor(f32, []int{512, 512})
+    defer tensor.release(&a)
+    tensor.fill(&a, 0.5)
+    product, err := tensor.matmul(a, a) // split across the threads
+    if err != .None {
+        fmt.eprintln("matmul:", err)
+        return
+    }
+    defer tensor.release(&product)
+    fmt.println(tensor.thread_count(), "threads:", product.data[0]) // 128
+}
+```
+
+Physical cores are the right ceiling: on an 8-core, 16-thread CPU, 16 threads were slower than 8. Product shapes with few rows and a long inner dimension, such as a convolution's weight gradient, split poorly. `set_thread_count` is safe to call while other threads use the library. If several threads multiply at once, one gets the workers and the others run on their own threads.
+
 ## Allocators
 
 Every procedure that returns a new tensor takes `allocator := context.allocator` as its last parameter, so results never silently inherit an operand's allocator. `_into` and `_in_place` forms never allocate.
@@ -212,7 +246,8 @@ Not differentiable yet: `var`/`std`, the several-axes `*_axes` reductions, `perm
 
 ## Limitations
 
-- Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products are cache-blocked with register tiles, but there is no hand-written SIMD and no multithreading, so large products are well short of a BLAS.
+- Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products are cache-blocked with register tiles, but there is no hand-written SIMD, so large products are well short of a BLAS.
+- Only matrix products use more than one thread. Element-wise operations, reductions, `im2col` and pooling stay on the calling thread.
 
 ## Tests
 

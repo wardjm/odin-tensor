@@ -58,15 +58,17 @@ _PRODUCT_STRIDED_BLOCK_DEPTH :: 64
 _PRODUCT_MIN_BLOCKED_DEPTH :: 8
 _PRODUCT_MIN_TILE_COLUMNS :: 4
 
-// _product_kernel computes output = a @ b, or output += a @ b when accumulate
-// is set, treating a vector a as a row and a vector b as a column. Products
+// _product_kernel_serial computes output = a @ b, or output += a @ b when
+// accumulate is set, on the calling thread, treating a vector a as a row and a
+// vector b as a column. _product_kernel, in tensor_threads.odin, is the entry
+// point that may split it across threads. Products
 // with at least _PRODUCT_TILE_ROWS rows and _PRODUCT_MIN_BLOCKED_DEPTH inner
 // elements are blocked, in the widest column tile n fills: _PRODUCT_TILE_BYTES,
 // or a half or quarter of it down to _PRODUCT_MIN_TILE_COLUMNS. Halving keeps
 // narrow products such as [m, k] @ [k, 8] in f32 on the blocked path instead
 // of the much slower i-k-j loop. Each output element still adds its k products
 // in order, so neither blocking nor the tile width changes the result.
-_product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) #no_bounds_check {
+_product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) #no_bounds_check {
 	FULL :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
@@ -285,25 +287,56 @@ _matmul_result_shape :: proc(a_shape, b_shape, shape_buffer: []int) -> (rank: in
 
 // _matmul_kernel runs _product_kernel once per batch index, each writing one
 // contiguous matrix of output. a and b must be validated and result_shape must
-// come from _matmul_result_shape.
+// come from _matmul_result_shape. When each product is too small to split but
+// there are many, the batches are divided between threads instead; their
+// outputs don't overlap, so results are the same.
 _matmul_kernel :: proc(output: []$T, a, b: Tensor_View(T), result_shape: []int) {
 	a_batch_rank := max(len(a.shape)-2, 0)
 	b_batch_rank := max(len(b.shape)-2, 0)
-	a_batch := Tensor_View(T){data = a.data, shape = a.shape[:a_batch_rank], strides = a.strides[:a_batch_rank], offset = a.offset}
-	b_batch := Tensor_View(T){data = b.data, shape = b.shape[:b_batch_rank], strides = b.strides[:b_batch_rank], offset = b.offset}
-	a_matrix := Tensor_View(T){data = a.data, shape = a.shape[a_batch_rank:], strides = a.strides[a_batch_rank:]}
-	b_matrix := Tensor_View(T){data = b.data, shape = b.shape[b_batch_rank:], strides = b.strides[b_batch_rank:]}
 	batch_shape := result_shape[:max(a_batch_rank, b_batch_rank)]
 	batch_count, _ := _element_count(batch_shape)
 	if batch_count == 0 {
 		return
 	}
-	matrix_size := len(output) / batch_count
-	for batch in 0..<batch_count {
-		a_matrix.offset = _broadcast_offset(a_batch, batch_shape, batch)
-		b_matrix.offset = _broadcast_offset(b_batch, batch_shape, batch)
-		_product_kernel(output[batch*matrix_size:][:matrix_size], a_matrix, b_matrix)
+	job := _Matmul_Batches(T){output = output, a = a, b = b, batch_shape = batch_shape, matrix_size = len(output) / batch_count, batch_count = batch_count, per_chunk = batch_count}
+	a_matrix, b_matrix := _matmul_matrices(&job)
+	m := a_matrix.shape[0] if len(a_matrix.shape) == 2 else 1
+	k := a_matrix.shape[len(a_matrix.shape)-1]
+	n := b_matrix.shape[1] if len(b_matrix.shape) == 2 else 1
+	chunks := 1
+	if batch_count > 1 && thread_count() > 1 && m*k*n < _PARALLEL_MIN_WORK && batch_count*m*k*n >= _PARALLEL_MIN_WORK {
+		job.per_chunk, chunks = _parallel_chunks(batch_count, 1)
 	}
+	_parallel_for(chunks, proc(data: rawptr, chunk: int) {
+		job := (^_Matmul_Batches(T))(data)
+		a_matrix, b_matrix := _matmul_matrices(job)
+		a_batch := Tensor_View(T){data = job.a.data, shape = job.a.shape[:max(len(job.a.shape)-2, 0)], strides = job.a.strides[:max(len(job.a.shape)-2, 0)], offset = job.a.offset}
+		b_batch := Tensor_View(T){data = job.b.data, shape = job.b.shape[:max(len(job.b.shape)-2, 0)], strides = job.b.strides[:max(len(job.b.shape)-2, 0)], offset = job.b.offset}
+		first := chunk * job.per_chunk
+		for batch in first..<min(first+job.per_chunk, job.batch_count) {
+			a_matrix.offset = _broadcast_offset(a_batch, job.batch_shape, batch)
+			b_matrix.offset = _broadcast_offset(b_batch, job.batch_shape, batch)
+			_product_kernel(job.output[batch*job.matrix_size:][:job.matrix_size], a_matrix, b_matrix)
+		}
+	}, &job)
+}
+
+_Matmul_Batches :: struct($T: typeid) {
+	output:      []T,
+	a, b:        Tensor_View(T),
+	batch_shape: []int,
+	matrix_size: int,
+	batch_count: int,
+	per_chunk:   int,
+}
+
+// _matmul_matrices views the trailing matrix (or vector) axes of a and b.
+_matmul_matrices :: proc(job: ^_Matmul_Batches($T)) -> (a_matrix, b_matrix: Tensor_View(T)) {
+	a_batch_rank := max(len(job.a.shape)-2, 0)
+	b_batch_rank := max(len(job.b.shape)-2, 0)
+	a_matrix = Tensor_View(T){data = job.a.data, shape = job.a.shape[a_batch_rank:], strides = job.a.strides[a_batch_rank:]}
+	b_matrix = Tensor_View(T){data = job.b.data, shape = job.b.shape[b_batch_rank:], strides = job.b.strides[b_batch_rank:]}
+	return
 }
 
 _matmul_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_Error {
