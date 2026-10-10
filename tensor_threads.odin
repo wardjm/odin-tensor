@@ -214,11 +214,38 @@ _Product_Rows :: struct($T: typeid) {
 	m, n:       int,
 }
 
+// A product with a long inner dimension and few outputs, such as a
+// convolution's weight gradient [kh·kw·c, positions] @ [positions, filters],
+// has too few rows to split, and every thread would stream both operands.
+// Its inner dimension is cut into _DEPTH_SPLIT_SLICE-long slices instead,
+// whose partial products are added in order. Whether and where to cut depends
+// only on the shape, so the result is the same on any number of threads; it
+// differs from one unsliced sum only in rounding.
+_DEPTH_SPLIT_MIN_DEPTH :: 1 << 13
+_DEPTH_SPLIT_SLICE :: 1 << 11
+// _DEPTH_SPLIT_MAX_PARTIALS bounds the partial products, held on the stack.
+_DEPTH_SPLIT_MAX_PARTIALS :: 1 << 14
+
+_Product_Depth :: struct($T: typeid) {
+	partials: []T,
+	a, b:     Tensor_View(T),
+	m, k, n:  int,
+}
+
 // _product_kernel computes output = a @ b, or output += a @ b when accumulate
-// is set, splitting a product with enough work into row ranges across
-// threads. Each range is a product of a's rows with all of b, computed by
-// _product_kernel_serial into its own rows of output.
+// is set. Products with a long inner dimension and a small output are summed
+// over slices of it; others with enough work are split into row ranges across
+// threads, each computed by _product_kernel_serial into its own rows of
+// output.
 _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) {
+	if len(a.shape) == 2 && len(b.shape) == 2 {
+		m, k, n := a.shape[0], a.shape[1], b.shape[1]
+		slices := (k + _DEPTH_SPLIT_SLICE - 1) / _DEPTH_SPLIT_SLICE
+		if k >= _DEPTH_SPLIT_MIN_DEPTH && slices*m*n <= _DEPTH_SPLIT_MAX_PARTIALS {
+			_product_depth_split(output, a, b, accumulate, m, k, n, slices)
+			return
+		}
+	}
 	if len(a.shape) == 2 && thread_count() > 1 {
 		m, k := a.shape[0], a.shape[1]
 		n := b.shape[1] if len(b.shape) == 2 else 1
@@ -239,4 +266,34 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false)
 		}
 	}
 	_product_kernel_serial(output, a, b, accumulate)
+}
+
+// _product_depth_split computes each slice's partial product, in parallel
+// when there are threads, then adds them into output in slice order.
+_product_depth_split :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, m, k, n, slices: int) {
+	buffer: [_DEPTH_SPLIT_MAX_PARTIALS]T = ---
+	job := _Product_Depth(T){partials = buffer[:slices*m*n], a = a, b = b, m = m, k = k, n = n}
+	_parallel_for(slices, proc(data: rawptr, chunk: int) {
+		job := (^_Product_Depth(T))(data)
+		first := chunk * _DEPTH_SPLIT_SLICE
+		depth := min(_DEPTH_SPLIT_SLICE, job.k - first)
+		a_shape := [2]int{job.m, depth}
+		b_shape := [2]int{depth, job.n}
+		a, b := job.a, job.b
+		a.shape, b.shape = a_shape[:], b_shape[:]
+		a.offset += first * job.a.strides[1]
+		b.offset += first * job.b.strides[0]
+		_product_kernel_serial(job.partials[chunk*job.m*job.n:][:job.m*job.n], a, b)
+	}, &job)
+	if !accumulate {
+		for &value in output {
+			value = 0
+		}
+	}
+	for chunk in 0..<slices {
+		partial := job.partials[chunk*m*n:][:m*n]
+		for &value, i in output {
+			value += partial[i]
+		}
+	}
 }

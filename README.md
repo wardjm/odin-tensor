@@ -149,6 +149,8 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 The library is single-threaded by default. `set_thread_count(n)` lets it use up to `n` threads, counting the caller; `thread_count()` reports the setting, and `set_thread_count(1)` joins the workers again. Threads are used by matrix products (`dot`, `matmul`), element-wise arithmetic and unary operations, `im2col` and `max_pool2d`, and by the backward pass of each of these and of reshapes. Work is split into one range per thread once it is large enough: 2¹⁸ multiply-adds for a product, 2¹⁶ elements for element-wise work. A product is split by output rows, a batched `matmul` of many small matrices by matrix, `im2col` and pooling by output row, and their backward passes by image or row so no two threads write the same gradient. Each output element is still computed on one thread, combining its inputs in the same order, so results are identical for every thread count.
 
+One case is split differently: a product with an inner dimension of at least 8192 and a small output, such as a convolution's weight gradient `[k·k·c, positions] @ [positions, filters]`, has too few rows to share. Its inner dimension is cut into 2048-long slices whose partial products are added in order. The cut depends only on the shape, and applies on one thread too, so these results are also the same for every thread count. They differ from a single running sum only in rounding: about 4e-5 relative in `f32` over 36,864 terms, slightly closer to the exact sum than the running sum was.
+
 ```odin
 package main
 
@@ -177,7 +179,7 @@ main :: proc() {
 }
 ```
 
-Physical cores are the right ceiling: on an 8-core, 16-thread CPU, 16 threads were slower than 8. Product shapes with few rows and a long inner dimension, such as a convolution's weight gradient, split poorly. `set_thread_count` is safe to call while other threads use the library. If several threads multiply at once, one gets the workers and the others run on their own threads.
+Physical cores are the right ceiling: on an 8-core, 16-thread CPU, 16 threads were slower than 8. `set_thread_count` is safe to call while other threads use the library. If several threads multiply at once, one gets the workers and the others run on their own threads.
 
 ## Allocators
 

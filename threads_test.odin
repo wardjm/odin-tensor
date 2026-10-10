@@ -90,6 +90,25 @@ all_products :: proc() -> (results: [dynamic][]f64, integer_results: [dynamic][]
 			append(&results, slice.clone(gradient.data))
 		}
 	}
+	{
+		// The weight gradient here is xᵀ @ upstream, [4, 20000] @ [20000, 3]:
+		// a depth-split product that adds into an existing gradient.
+		tape := tape_init(f64) or_else panic("tape")
+		defer tape_release(&tape)
+		inputs := filled([]int{20000, 4}, 9)
+		defer release(&inputs)
+		weights := filled([]int{4, 3}, 10)
+		defer release(&weights)
+		x := tape_add_leaf_borrow(&tape, &inputs, false) or_else panic("leaf")
+		w := tape_add_leaf_borrow(&tape, &weights) or_else panic("leaf")
+		product := tape_matmul(&tape, x, w) or_else panic("matmul")
+		total := tape_sum_all(&tape, tape_tanh(&tape, product) or_else panic("tanh")) or_else panic("sum")
+		for _ in 0..<2 {
+			if tape_backward(&tape, total) != .None do panic("backward")
+		}
+		gradient := tape_gradient(&tape, w) or_else panic("gradient")
+		append(&results, slice.clone(gradient.data))
+	}
 	return
 }
 
@@ -277,4 +296,50 @@ test_threaded_products_match_one_thread :: proc(t: ^testing.T) {
 	}
 	require_ok(t, set_thread_count(1))
 	testing.expect_value(t, thread_count(), 1)
+}
+
+// expect_sliced_product checks a long product against the definition of the
+// depth split: the in-order sum of the products of 2048-long slices of k,
+// each computed whole. transpose_a stores a as [k, m], as a weight gradient
+// reads its input.
+expect_sliced_product :: proc(t: ^testing.T, m, k, n: int, transpose_a: bool, loc := #caller_location) {
+	a_storage := new_tensor(f64, []int{k, m} if transpose_a else []int{m, k}) or_else panic("a")
+	defer release(&a_storage)
+	b_storage := new_tensor(f64, []int{k, n}) or_else panic("b")
+	defer release(&b_storage)
+	fill_product_operand(a_storage.data, 0)
+	fill_product_operand(b_storage.data, 3)
+	a, b := as_view(a_storage), as_view(b_storage)
+	a_shape, a_strides: [2]int
+	if transpose_a {
+		a = transpose_view(a, a_shape[:], a_strides[:]) or_else panic("transpose")
+	}
+	product := matmul_views(a, b) or_else panic("matmul")
+	defer release(&product)
+
+	expected := new_tensor(f64, []int{m, n}) or_else panic("expected")
+	defer release(&expected)
+	for first := 0; first < k; first += _DEPTH_SPLIT_SLICE {
+		depth := min(_DEPTH_SPLIT_SLICE, k-first)
+		a_slice_shape, a_slice_strides, b_slice_shape, b_slice_strides: [2]int
+		a_slice := slice_view(a, 1, first, depth, 1, a_slice_shape[:], a_slice_strides[:]) or_else panic("slice")
+		b_slice := slice_view(b, 0, first, depth, 1, b_slice_shape[:], b_slice_strides[:]) or_else panic("slice")
+		partial := matmul_views(a_slice, b_slice) or_else panic("partial")
+		defer release(&partial)
+		expect_product_matches_naive(t, partial.data, a_slice, b_slice, loc = loc)
+		for &value, i in expected.data do value += partial.data[i]
+	}
+	testing.expectf(t, slice.equal(product.data, expected.data), "[%d, %d] @ [%d, %d] is not the in-order sum of its slices' products", m, k, k, n, loc = loc)
+}
+
+@(test)
+test_long_products_sum_fixed_slices :: proc(t: ^testing.T) {
+	// From 2^13 inner elements, with a small output, the product sums slices.
+	expect_sliced_product(t, 3, 8192, 5, false)
+	expect_sliced_product(t, 25, 20000, 8, true)
+	expect_sliced_product(t, 7, 9000, 16, true)
+	// Just below the threshold, or with too many partial products to hold,
+	// it is one sequential sum, exactly the naive product.
+	expect_matmul_matches_naive(t, f64, 3, 8191, 5, false, false)
+	expect_matmul_matches_naive(t, f32, 300, 9000, 16, true, false)
 }
