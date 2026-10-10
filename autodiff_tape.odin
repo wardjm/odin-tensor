@@ -42,7 +42,10 @@ _Tape_Node :: struct($T: typeid) {
 	owned_value:   Tensor(T),
 	owns_value:    bool,
 	requires_grad: bool,
+	// grad is allocated by the first backward pass that reaches the node, or
+	// by tape_gradient; has_grad says whether it exists yet.
 	grad:          Tensor(T),
+	has_grad:      bool,
 	operation:     Tape_Operation,
 	parent_a:      int,
 	parent_b:      int,
@@ -65,7 +68,10 @@ _Tape_Node :: struct($T: typeid) {
 Tape :: struct($T: typeid) {
 	nodes:     [dynamic]_Tape_Node(T),
 	identity:  u64,
+	// allocator draws every tape-owned buffer from recycler, which keeps the
+	// blocks tape_reset frees for the next graph.
 	allocator: mem.Allocator,
+	recycler:  ^_Recycler,
 }
 
 // Tape_Value identifies one node of one tape. It holds no pointer, so it stays
@@ -91,13 +97,16 @@ tape_init :: proc($T: typeid, reserve := 0, allocator := context.allocator) -> (
 	if reserve < 0 {
 		return tape, .Invalid_Shape
 	}
-	nodes, alloc_err := make([dynamic]_Tape_Node(T), 0, reserve, allocator)
+	recycler := _recycler_create(allocator) or_return
+	nodes, alloc_err := make([dynamic]_Tape_Node(T), 0, reserve, _recycler_allocator(recycler))
 	if alloc_err != nil {
+		_recycler_destroy(recycler)
 		return tape, .Allocation_Failed
 	}
 	tape.nodes = nodes
 	tape.identity = _new_tape_identity()
-	tape.allocator = allocator
+	tape.allocator = _recycler_allocator(recycler)
+	tape.recycler = recycler
 	return tape, .None
 }
 
@@ -111,17 +120,20 @@ _tape_release_nodes :: proc(tape: ^Tape($T)) {
 	clear(&tape.nodes)
 }
 
-// tape_release releases every gradient and operation result owned by the tape.
-// Borrowed leaf values are not released.
+// tape_release releases every gradient and operation result owned by the tape
+// and returns all of its memory, including blocks kept for reuse, to the
+// allocator tape_init was given. Borrowed leaf values are not released.
 tape_release :: proc(tape: ^Tape($T)) {
 	_tape_release_nodes(tape)
 	delete(tape.nodes)
+	_recycler_destroy(tape.recycler)
 	tape^ = {}
 }
 
-// tape_reset releases every node but keeps the node storage, so a training
-// loop can rebuild its graph each step without reallocating the tape. Handles
-// obtained before the reset become invalid.
+// tape_reset releases every node but keeps the node storage and the freed
+// buffers, so a training loop that rebuilds the same graph each step reuses
+// the previous step's memory instead of allocating again. Handles obtained
+// before the reset become invalid.
 tape_reset :: proc(tape: ^Tape($T)) {
 	_tape_release_nodes(tape)
 	tape.identity = _new_tape_identity()
@@ -159,22 +171,13 @@ tape_add_leaf_view :: proc(tape: ^Tape($T), value: Tensor_View(T), requires_grad
 	if err = _validate_autodiff_view(value); err != .None {
 		return result, err
 	}
-	grad: Tensor(T)
-	if requires_grad {
-		grad = new_tensor(T, value.shape, tape.allocator) or_return
-	}
-	result, err = _tape_append(tape, _Tape_Node(T){
+	return _tape_append(tape, _Tape_Node(T){
 		value         = value,
 		requires_grad = requires_grad,
-		grad          = grad,
 		operation     = .Leaf,
 		parent_a      = -1,
 		parent_b      = -1,
 	})
-	if err != .None {
-		release(&grad)
-	}
-	return
 }
 
 // tape_add_leaf_copy copies a view, in logical order, into tape-owned
@@ -374,15 +377,11 @@ _tape_take_output :: proc(tape: ^Tape($T), output: ^Tensor(T), template: _Tape_N
 // On failure storage remains owned by the caller.
 _tape_take_storage :: proc(tape: ^Tape($T), storage: ^Tensor(T), value: Tensor_View(T), template: _Tape_Node(T)) -> (result: Tape_Value(T), err: Tensor_Error) {
 	node := template
-	if node.requires_grad {
-		node.grad = new_tensor(T, value.shape, tape.allocator) or_return
-	}
 	node.value = value
 	node.owned_value = storage^
 	node.owns_value = true
 	result, err = _tape_append(tape, node)
 	if err != .None {
-		release(&node.grad)
 		return result, err
 	}
 	storage^ = {}
@@ -400,7 +399,8 @@ tape_value :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> (view: Tensor_View(
 }
 
 // tape_gradient returns a borrowed view of a node's accumulated gradient. The
-// node must require gradients.
+// node must require gradients. A node no backward pass has reached gets a
+// zero gradient, allocated on this first request.
 tape_gradient :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> (view: Tensor_View(T), err: Tensor_Error) {
 	node := _tape_node(tape, value)
 	if node == nil {
@@ -409,13 +409,17 @@ tape_gradient :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> (view: Tensor_Vi
 	if !node.requires_grad {
 		return view, .Gradient_Not_Tracked
 	}
+	if !node.has_grad {
+		node.grad = new_tensor(T, node.value.shape, tape.allocator) or_return
+		node.has_grad = true
+	}
 	return as_view(node.grad), .None
 }
 
 // tape_zero_grad clears every allocated gradient on the tape.
 tape_zero_grad :: proc(tape: ^Tape($T)) {
 	for &node in tape.nodes {
-		if node.requires_grad {
+		if node.has_grad {
 			fill(&node.grad, 0)
 		}
 	}

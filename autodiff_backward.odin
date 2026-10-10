@@ -127,12 +127,20 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		}
 	}
 
+	// A node's first gradient takes over its scratch buffer; later backward
+	// passes add into it.
 	for i in 0..<node_count {
-		if reached[i] && tape.nodes[i].requires_grad {
-			gradient, contribution := tape.nodes[i].grad.data, scratch[i].data
-			for j in 0..<len(gradient) {
-				gradient[j] += contribution[j]
-			}
+		node := &tape.nodes[i]
+		if !reached[i] || !node.requires_grad {
+			continue
+		}
+		if !node.has_grad {
+			node.grad, scratch[i] = scratch[i], {}
+			node.has_grad = true
+			continue
+		}
+		for &value, j in node.grad.data {
+			value += scratch[i].data[j]
 		}
 	}
 	return .None
@@ -418,7 +426,14 @@ _backward_view :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), operation:
 		}
 		target = slice_view(target, axis, start, output_grad.shape[axis], step, shape_buffer[:], strides_buffer[:]) or_return
 	case .Reshape:
-		target.shape, target.strides = output_grad.shape, output_grad.strides
+		// Both gradients are contiguous in the same row-major order.
+		if len(gradient.data) != len(output_grad.data) {
+			return .Shape_Mismatch
+		}
+		for &value, i in gradient.data {
+			value += output_grad.data[i]
+		}
+		return .None
 	case:
 		return .Unsupported_Operation
 	}
@@ -473,10 +488,22 @@ _backward_activation :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), inpu
 	return .None
 }
 
-// _backward_activation_kernel is specialized per operation at compile time and
-// finds storage offsets once per row, stepping along it. Both views must be
-// validated and share the shape of the contiguous gradient and upstream.
-_backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Tensor_View(T), $operation: Tape_Operation) {
+// _backward_activation_kernel is specialized per operation at compile time.
+// Contiguous views take one flat loop; otherwise it finds storage offsets once
+// per row, stepping along it. Both views must be validated and share the shape
+// of the contiguous gradient and upstream.
+_backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Tensor_View(T), $operation: Tape_Operation) #no_bounds_check {
+	if _is_contiguous_view(input) && _is_contiguous_view(output) {
+		// One flat loop with no offset arithmetic, which the compiler can
+		// vectorize.
+		count := len(upstream)
+		inputs := input.data[input.offset:][:count]
+		outputs := output.data[output.offset:][:count]
+		for i in 0..<count {
+			gradient[i] += upstream[i] * _activation_derivative(inputs[i], outputs[i], operation)
+		}
+		return
+	}
 	row := _row_length(input.shape)
 	input_step := _inner_step(input, input.shape)
 	output_step := _inner_step(output, output.shape)
@@ -484,23 +511,7 @@ _backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Ten
 		input_offset := _broadcast_offset(input, input.shape, start)
 		output_offset := _broadcast_offset(output, output.shape, start)
 		for i in start..<start+row {
-			derivative: T
-			when operation == .Relu {
-				derivative = 1 if input.data[input_offset] > 0 else 0
-			} else when operation == .Sigmoid {
-				value := output.data[output_offset]
-				derivative = value * (1-value)
-			} else when operation == .Tanh {
-				value := output.data[output_offset]
-				derivative = 1 - value*value
-			} else when operation == .Exp {
-				derivative = output.data[output_offset]
-			} else when operation == .Log {
-				derivative = 1 / input.data[input_offset]
-			} else when operation == .Sqrt {
-				derivative = 1 / (2*output.data[output_offset])
-			}
-			gradient[i] += upstream[i] * derivative
+			gradient[i] += upstream[i] * _activation_derivative(input.data[input_offset], output.data[output_offset], operation)
 			input_offset += input_step
 			output_offset += output_step
 		}
@@ -509,6 +520,24 @@ _backward_activation_kernel :: proc(gradient, upstream: []$T, input, output: Ten
 
 // _backward_binary_elementwise applies one binary VJP and reduces broadcasted
 // contributions into each parent's original shape.
+// _activation_derivative is d output / d input for one element, from whichever
+// of the forward input and output the rule needs.
+_activation_derivative :: #force_inline proc(input, output: $T, $operation: Tape_Operation) -> T {
+	when operation == .Relu {
+		return 1 if input > 0 else 0
+	} else when operation == .Sigmoid {
+		return output * (1-output)
+	} else when operation == .Tanh {
+		return 1 - output*output
+	} else when operation == .Exp {
+		return output
+	} else when operation == .Log {
+		return 1 / input
+	} else when operation == .Sqrt {
+		return 1 / (2*output)
+	}
+}
+
 _backward_binary_elementwise :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a, b: Tensor_View(T), operation: Tape_Operation) -> Tensor_Error where intrinsics.type_is_float(T) {
 	_validate_view(a) or_return
 	_validate_view(b) or_return
@@ -547,6 +576,10 @@ _binary_vjp :: #force_inline proc(upstream, a, b: $T, $operation: Tape_Operation
 // steps along it; a parent broadcast along the last axis steps by zero, so its
 // contributions sum in place. grad_a or grad_b is nil when not tracked.
 _backward_binary_kernel :: proc(grad_a, grad_b: []$T, output_grad: Tensor(T), a, b: Tensor_View(T), $operation: Tape_Operation) -> Tensor_Error {
+	if a_period, b_period, ok := _repeating_operands(a, b, output_grad.shape); ok {
+		_backward_binary_repeating(grad_a, grad_b, output_grad.data, a, b, a_period, b_period, operation)
+		return .None
+	}
 	shape := output_grad.shape
 	row := _row_length(shape)
 	a_step := _inner_step(a, shape)
@@ -581,6 +614,68 @@ _backward_binary_kernel :: proc(grad_a, grad_b: []$T, output_grad: Tensor(T), a,
 // _gradient_inner_step is the step between consecutive output elements along
 // the last axis in a parent's contiguous gradient, or zero when the parent is
 // broadcast along that axis.
+// _repeating_operands reports whether a and b are contiguous and each either
+// fills result_shape or broadcasts only along leading axes, like a bias added
+// to a batch, so in row-major order it repeats every period elements. At least
+// one must fill the result.
+_repeating_operands :: proc(a, b: Tensor_View($T), result_shape: []int) -> (a_period, b_period: int, ok: bool) {
+	if !_is_contiguous_view(a) || !_is_contiguous_view(b) {
+		return 0, 0, false
+	}
+	total, valid := _element_count(result_shape)
+	if !valid {
+		return 0, 0, false
+	}
+	a_period = _suffix_period(a.shape, result_shape) or_return
+	b_period = _suffix_period(b.shape, result_shape) or_return
+	return a_period, b_period, (a_period == total || b_period == total) && a_period > 0 && b_period > 0
+}
+
+// _suffix_period is the element count of shape when, without its leading
+// ones, it equals the trailing axes of result_shape.
+_suffix_period :: proc(shape, result_shape: []int) -> (period: int, ok: bool) {
+	trimmed := shape
+	for len(trimmed) > 0 && trimmed[0] == 1 {
+		trimmed = trimmed[1:]
+	}
+	if len(trimmed) > len(result_shape) || !_shapes_match(trimmed, result_shape[len(result_shape)-len(trimmed):]) {
+		return 0, false
+	}
+	period = 1
+	for dim in trimmed {
+		period *= dim
+	}
+	return period, true
+}
+
+// _backward_binary_repeating is _backward_binary_kernel for operands found by
+// _repeating_operands: blocks of the shorter period, each a flat loop the
+// compiler can vectorize.
+_backward_binary_repeating :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T), a_period, b_period: int, $operation: Tape_Operation) #no_bounds_check {
+	period := min(a_period, b_period)
+	a_values := a.data[a.offset:][:a_period]
+	b_values := b.data[b.offset:][:b_period]
+	for block := 0; block < len(upstream); block += period {
+		g := upstream[block:][:period]
+		a_block := a_values[block:][:period] if a_period > period else a_values
+		b_block := b_values[block:][:period] if b_period > period else b_values
+		if grad_a != nil {
+			a_grad := grad_a[block:][:period] if a_period > period else grad_a
+			for j in 0..<period {
+				contribution, _ := _binary_vjp(g[j], a_block[j], b_block[j], operation)
+				a_grad[j] += contribution
+			}
+		}
+		if grad_b != nil {
+			b_grad := grad_b[block:][:period] if b_period > period else grad_b
+			for j in 0..<period {
+				_, contribution := _binary_vjp(g[j], a_block[j], b_block[j], operation)
+				b_grad[j] += contribution
+			}
+		}
+	}
+}
+
 _gradient_inner_step :: proc(shape: []int) -> int {
 	if len(shape) == 0 || shape[len(shape)-1] == 1 {
 		return 0
