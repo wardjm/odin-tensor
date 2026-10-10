@@ -1901,6 +1901,8 @@ apply_tape_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Ta
 		return tape_slice(tape, a, -1, -1, 2, -2)
 	case .Reshape:
 		return tape_reshape(tape, a, []int{-1, 2})
+	case .Im2col:
+		return tape_im2col(tape, a, 2, 2)
 	}
 	return {}, .Unsupported_Operation
 }

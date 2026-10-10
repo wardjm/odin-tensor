@@ -33,6 +33,7 @@ Tape_Operation :: enum {
 	Transpose,
 	Slice,
 	Reshape,
+	Im2col,
 }
 
 _Tape_Node :: struct($T: typeid) {
@@ -48,7 +49,10 @@ _Tape_Node :: struct($T: typeid) {
 	axis:          int,
 	keep_dims:     bool,
 	start:         int,
+	// step is a Slice's step or an Im2col's stride.
 	step:          int,
+	kernel_height: int,
+	kernel_width:  int,
 }
 
 // Tape owns all recorded operation outputs and gradient buffers. Leaf values

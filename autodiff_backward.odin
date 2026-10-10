@@ -116,6 +116,8 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Min)
 		case .Transpose, .Slice, .Reshape:
 			err = _backward_view(&scratch[a], scratch[node_id], node.operation, node.axis, node.start, node.step)
+		case .Im2col:
+			err = _backward_im2col(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width, node.step)
 		case .Leaf:
 		}
 		if err != .None {
