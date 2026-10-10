@@ -45,7 +45,8 @@ _dot_result_shape :: proc(a_shape, b_shape, shape_buffer: []int) -> (rank: int, 
 // of columns. k is split into blocks of _PRODUCT_BLOCK_DEPTH so each tile's
 // slice of b packs into a panel that stays in L1 while every row tile reuses
 // it. Products too small to repay packing (under _PRODUCT_TILE_ROWS rows,
-// _PRODUCT_MIN_BLOCKED_DEPTH inner elements, or one column tile) skip it.
+// _PRODUCT_MIN_BLOCKED_DEPTH inner elements, or _PRODUCT_MIN_TILE_COLUMNS
+// columns) skip it.
 _PRODUCT_TILE_ROWS :: 2
 _PRODUCT_TILE_BYTES :: 64
 _PRODUCT_BLOCK_DEPTH :: 256
@@ -55,16 +56,54 @@ _PRODUCT_BLOCK_DEPTH :: 256
 // product in the backward bench by a quarter.
 _PRODUCT_STRIDED_BLOCK_DEPTH :: 64
 _PRODUCT_MIN_BLOCKED_DEPTH :: 8
+_PRODUCT_MIN_TILE_COLUMNS :: 4
 
 // _product_kernel computes output = a @ b, or output += a @ b when accumulate
-// is set, treating a vector a as a row and a vector b as a column. For each k
-// block, every column tile packs its panel of b and sweeps the row tiles;
-// columns past the last full tile take the unpacked i-k-j loop. Each output
-// element still adds its k products in order, so blocking doesn't change the
-// result. The inlining directives on the _product_strip calls were measured:
-// flipping either costs narrow or tail-heavy products 10-15%.
+// is set, treating a vector a as a row and a vector b as a column. Products
+// with at least _PRODUCT_TILE_ROWS rows and _PRODUCT_MIN_BLOCKED_DEPTH inner
+// elements are blocked, in the widest column tile n fills: _PRODUCT_TILE_BYTES,
+// or a half or quarter of it down to _PRODUCT_MIN_TILE_COLUMNS. Halving keeps
+// narrow products such as [m, k] @ [k, 8] in f32 on the blocked path instead
+// of the much slower i-k-j loop. Each output element still adds its k products
+// in order, so neither blocking nor the tile width changes the result.
 _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) #no_bounds_check {
-	TILE_COLUMNS :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
+	FULL :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
+	a_rank, b_rank := len(a.shape), len(b.shape)
+	m := a.shape[0] if a_rank == 2 else 1
+	k := a.shape[a_rank-1]
+	n := b.shape[1] if b_rank == 2 else 1
+	if !accumulate {
+		for &value in output {
+			value = 0
+		}
+	}
+	if m >= _PRODUCT_TILE_ROWS && k >= _PRODUCT_MIN_BLOCKED_DEPTH {
+		if n >= FULL {
+			_product_blocked(output, a, b, FULL)
+			return
+		}
+		when FULL/2 >= _PRODUCT_MIN_TILE_COLUMNS {
+			if n >= FULL/2 {
+				_product_blocked(output, a, b, FULL/2)
+				return
+			}
+		}
+		when FULL/4 >= _PRODUCT_MIN_TILE_COLUMNS {
+			if n >= FULL/4 {
+				_product_blocked(output, a, b, FULL/4)
+				return
+			}
+		}
+	}
+	#force_inline _product_strip(output, a, b, 0, k, 0, n)
+}
+
+// _product_blocked adds a @ b into output in register tiles TILE_COLUMNS
+// wide. For each k block, every column tile packs its panel of b and sweeps
+// the row tiles; columns past the last full tile take the unpacked i-k-j
+// loop. The inlining directives on the _product_strip calls were measured:
+// flipping either costs narrow or tail-heavy products 10-15%.
+_product_blocked :: proc(output: []$T, a, b: Tensor_View(T), $TILE_COLUMNS: int) #no_bounds_check {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
 	k := a.shape[a_rank-1]
@@ -73,15 +112,6 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false)
 	a_inner_stride := a.strides[a_rank-1]
 	b_row_stride := b.strides[0]
 	b_column_stride := b.strides[1] if b_rank == 2 else 0
-	if !accumulate {
-		for &value in output {
-			value = 0
-		}
-	}
-	if m < _PRODUCT_TILE_ROWS || k < _PRODUCT_MIN_BLOCKED_DEPTH || n < TILE_COLUMNS {
-		#force_inline _product_strip(output, a, b, 0, k, 0, n)
-		return
-	}
 	full_rows := m - m%_PRODUCT_TILE_ROWS
 	full_columns := n - n%TILE_COLUMNS
 	panel: [_PRODUCT_BLOCK_DEPTH*TILE_COLUMNS]T = ---

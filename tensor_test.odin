@@ -1133,6 +1133,17 @@ test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
 	expect_matmul_matches_naive(t, f32, 1, 300, 37, false, false)
 	expect_matmul_matches_naive(t, f32, 6, 300, 1, false, false)
 	expect_matmul_matches_naive(t, f32, 8, 3, 40, false, false)
+	// Products narrower than one 64-byte column tile use half or quarter tiles:
+	// f32 at 8 and 4 columns (13 leaves a 5-column remainder), f64 at 4, and
+	// i8 at 16.
+	expect_matmul_matches_naive(t, f32, 37, 25, 8, false, false)
+	expect_matmul_matches_naive(t, f32, 37, 300, 8, true, false)
+	expect_matmul_matches_naive(t, f32, 9, 40, 13, false, true)
+	expect_matmul_matches_naive(t, f32, 9, 40, 4, true, true)
+	expect_matmul_matches_naive(t, f32, 9, 40, 3, false, false)
+	expect_matmul_matches_naive(t, f64, 11, 30, 5, false, false)
+	expect_matmul_matches_naive(t, f64, 11, 300, 4, true, false)
+	expect_matmul_matches_naive(t, i8, 5, 12, 20, false, true)
 	expect_vector_products_match_naive(t, f32, 600, 37)
 	expect_vector_products_match_naive(t, f64, 257, 8)
 }
