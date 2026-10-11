@@ -16,11 +16,11 @@ _product_instructions :: proc() -> (avx, fma: bool) {
 }
 
 @(enable_target_feature = "avx,fma")
-_product_kernel_fma :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool) {
-	#force_inline _product_paths(output, a, b, accumulate, true, 32)
+_product_kernel_fma :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, bias: []T) {
+	#force_inline _product_paths(output, a, b, accumulate, bias, true, 32)
 }
 
 @(enable_target_feature = "avx")
-_product_kernel_avx :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool) {
-	#force_inline _product_paths(output, a, b, accumulate, false, 32)
+_product_kernel_avx :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, bias: []T) {
+	#force_inline _product_paths(output, a, b, accumulate, bias, false, 32)
 }

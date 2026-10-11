@@ -101,12 +101,12 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		if !reached[node_id] || !node.requires_grad || node.operation == .Leaf {
 			continue
 		}
-		parents := [2]int{node.parent_a, node.parent_b}
+		parents := [3]int{node.parent_a, node.parent_b, node.parent_c}
 		// A node whose gradient passes unchanged to a parent, as a reshape's
 		// does, or an addition's to an operand of the same shape, gives that
 		// parent a copy of it when it reaches the parent first, so the buffer
 		// is written without being zeroed first.
-		copies_to_parent: [2]bool
+		copies_to_parent: [3]bool
 		for parent, index in parents[:node.parent_count] {
 			if parent < 0 || parent >= node_id {
 				return .Invalid_Tape
@@ -121,7 +121,7 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 				reached[parent] = true
 			}
 		}
-		a, b := node.parent_a, node.parent_b
+		a, b, c := node.parent_a, node.parent_b, node.parent_c
 		err: Tensor_Error
 		switch node.operation {
 		case .Add, .Sub:
@@ -177,7 +177,9 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		case .Im2col:
 			err = _backward_im2col(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width, node.step, node.padding)
 		case .Batch_Norm:
-			err = _backward_batch_norm(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.saved, tape.allocator)
+			err = _backward_batch_norm(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.saved, tape.allocator)
+		case .Linear:
+			err = _backward_linear(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
 		case .Max_Pool2D:
 			err = _backward_max_pool2d(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width)
 		case .Leaf:
@@ -643,7 +645,7 @@ _add_into :: proc(target, source: []$T) {
 // scale / deviation · (g - Σg/N - x̂ · Σ g·x̂ / N), the usual closed form, which
 // includes the statistics' dependence on x. Both sums are pairwise column
 // sums; the second pass is split between threads by rows.
-_backward_batch_norm :: proc(grad_x, grad_scale: ^Tensor($T), upstream: Tensor(T), x, scale: Tensor_View(T), saved: Tensor(T), allocator: mem.Allocator) -> (err: Tensor_Error) where intrinsics.type_is_float(T) {
+_backward_batch_norm :: proc(grad_x, grad_scale, grad_shift: ^Tensor($T), upstream: Tensor(T), x, scale: Tensor_View(T), saved: Tensor(T), allocator: mem.Allocator) -> (err: Tensor_Error) where intrinsics.type_is_float(T) {
 	features := len(saved.data) / 2
 	if features == 0 || len(upstream.data) % features != 0 {
 		return .Shape_Mismatch
@@ -667,6 +669,11 @@ _backward_batch_norm :: proc(grad_x, grad_scale: ^Tensor($T), upstream: Tensor(T
 	if grad_scale.data != nil {
 		for f in 0..<features {
 			grad_scale.data[f] += product_sums[f]
+		}
+	}
+	if grad_shift.data != nil {
+		for f in 0..<features {
+			grad_shift.data[f] += upstream_sums[f]
 		}
 	}
 	if grad_x.data == nil {
@@ -697,6 +704,23 @@ _backward_batch_norm :: proc(grad_x, grad_scale: ^Tensor($T), upstream: Tensor(T
 			}
 		}
 	}, &job, 2*features)
+	return .None
+}
+
+// _backward_linear adds linear's gradients: upstream @ weightsᵀ to x's,
+// xᵀ @ upstream to the weights', and each column's pairwise sum of upstream to
+// the bias's.
+_backward_linear :: proc(grad_x, grad_weights, grad_bias: ^Tensor($T), upstream: Tensor(T), x, weights: Tensor_View(T)) -> Tensor_Error where intrinsics.type_is_float(T) {
+	if len(x.shape) != 2 || len(weights.shape) != 2 || !_shapes_match(upstream.shape, []int{x.shape[0], weights.shape[1]}) {
+		return .Shape_Mismatch
+	}
+	_backward_matrix_product(grad_x.data, grad_weights.data, upstream.data, x, weights) or_return
+	if grad_bias.data != nil {
+		if len(grad_bias.data) != weights.shape[1] {
+			return .Shape_Mismatch
+		}
+		_column_sums(grad_bias.data, upstream.data, 0, x.shape[0], weights.shape[1], nil, nil, nil, .Value, accumulate = true)
+	}
 	return .None
 }
 

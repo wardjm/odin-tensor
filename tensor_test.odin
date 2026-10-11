@@ -1208,18 +1208,18 @@ expect_product_copies_match_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: in
 	product, err = new_tensor(T, []int{m, n})
 	require_ok(t, err, loc)
 	defer release(&product)
-	_product_paths(product.data, a, as_view(b), false, false, 16)
+	_product_paths(product.data, a, as_view(b), false, nil, false, 16)
 	expect_product_matches_naive_fused(t, product.data, a, as_view(b), false, loc)
-	_product_paths(product.data, a, as_view(b), false, true, 16)
+	_product_paths(product.data, a, as_view(b), false, nil, true, 16)
 	expect_product_matches_naive_fused(t, product.data, a, as_view(b), true, loc)
 	when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
 		avx, fma := _product_instructions()
 		if avx {
-			_product_kernel_avx(product.data, a, as_view(b), false)
+			_product_kernel_avx(product.data, a, as_view(b), false, nil)
 			expect_product_matches_naive_fused(t, product.data, a, as_view(b), false, loc)
 		}
 		if fma {
-			_product_kernel_fma(product.data, a, as_view(b), false)
+			_product_kernel_fma(product.data, a, as_view(b), false, nil)
 			expect_product_matches_naive_fused(t, product.data, a, as_view(b), true, loc)
 		}
 	}

@@ -206,6 +206,24 @@ all_elementwise :: proc() -> (results: [dynamic][]f64) {
 		gradient := tape_gradient(&tape, value) or_else panic("gradient")
 		append(&results, slice.clone(gradient.data))
 	}
+
+	// A dense layer's affine map, whose bias gradient sums 600 rows.
+	dense_weights := filled([]int{256, 40}, 9)
+	defer release(&dense_weights)
+	dense_bias := filled([]int{40}, 10)
+	defer release(&dense_bias)
+	keep(&results, linear(wide, dense_weights, dense_bias) or_else panic("linear"))
+	tape_reset(&tape)
+	wide_value = tape_add_leaf_borrow(&tape, &wide) or_else panic("leaf")
+	weights_value := tape_add_leaf_borrow(&tape, &dense_weights) or_else panic("leaf")
+	bias_value := tape_add_leaf_borrow(&tape, &dense_bias) or_else panic("leaf")
+	affine := tape_linear(&tape, wide_value, weights_value, bias_value) or_else panic("linear")
+	affine_total := tape_sum_all(&tape, tape_tanh(&tape, affine) or_else panic("tanh")) or_else panic("sum")
+	if tape_backward(&tape, affine_total) != .None do panic("backward")
+	for value in ([]Tape_Value(f64){wide_value, weights_value, bias_value}) {
+		gradient := tape_gradient(&tape, value) or_else panic("gradient")
+		append(&results, slice.clone(gradient.data))
+	}
 	return
 }
 

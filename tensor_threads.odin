@@ -210,6 +210,7 @@ _Product_Rows :: struct($T: typeid) {
 	output:     []T,
 	a, b:       Tensor_View(T),
 	accumulate: bool,
+	bias:       []T,
 	rows:       int,
 	m, n:       int,
 }
@@ -233,16 +234,17 @@ _Product_Depth :: struct($T: typeid) {
 }
 
 // _product_kernel computes output = a @ b, or output += a @ b when accumulate
-// is set. Products with a long inner dimension and a small output are summed
+// is set. Without accumulate, a bias of one value per column starts each
+// output element's sum in place of zero. Products with a long inner dimension and a small output are summed
 // over slices of it; others with enough work are split into row ranges across
 // threads, each computed by _product_kernel_serial into its own rows of
 // output.
-_product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) {
+_product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false, bias: []T = nil) {
 	if len(a.shape) == 2 && len(b.shape) == 2 {
 		m, k, n := a.shape[0], a.shape[1], b.shape[1]
 		slices := (k + _DEPTH_SPLIT_SLICE - 1) / _DEPTH_SPLIT_SLICE
 		if k >= _DEPTH_SPLIT_MIN_DEPTH && slices*m*n <= _DEPTH_SPLIT_MAX_PARTIALS {
-			_product_depth_split(output, a, b, accumulate, m, k, n, slices)
+			_product_depth_split(output, a, b, accumulate, bias, m, k, n, slices)
 			return
 		}
 	}
@@ -251,7 +253,7 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false)
 		n := b.shape[1] if len(b.shape) == 2 else 1
 		if m >= 2*_PRODUCT_TILE_ROWS && m*k*n >= _PARALLEL_MIN_WORK {
 			rows, chunks := _parallel_chunks(m, _PRODUCT_TILE_ROWS)
-			job := _Product_Rows(T){output = output, a = a, b = b, accumulate = accumulate, rows = rows, m = m, n = n}
+			job := _Product_Rows(T){output = output, a = a, b = b, accumulate = accumulate, bias = bias, rows = rows, m = m, n = n}
 			_parallel_for(chunks, proc(data: rawptr, chunk: int) {
 				job := (^_Product_Rows(T))(data)
 				first := chunk * job.rows
@@ -260,17 +262,18 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false)
 				a := job.a
 				a.shape = shape[:]
 				a.offset += first * job.a.strides[0]
-				_product_kernel_serial(job.output[first*job.n:][:rows*job.n], a, job.b, job.accumulate)
+				_product_kernel_serial(job.output[first*job.n:][:rows*job.n], a, job.b, job.accumulate, job.bias)
 			}, &job)
 			return
 		}
 	}
-	_product_kernel_serial(output, a, b, accumulate)
+	_product_kernel_serial(output, a, b, accumulate, bias)
 }
 
 // _product_depth_split computes each slice's partial product, in parallel
-// when there are threads, then adds them into output in slice order.
-_product_depth_split :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, m, k, n, slices: int) {
+// when there are threads, then adds them into output, or into the bias, in
+// slice order.
+_product_depth_split :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, bias: []T, m, k, n, slices: int) {
 	buffer: [_DEPTH_SPLIT_MAX_PARTIALS]T = ---
 	job := _Product_Depth(T){partials = buffer[:slices*m*n], a = a, b = b, m = m, k = k, n = n}
 	_parallel_for(slices, proc(data: rawptr, chunk: int) {
@@ -286,9 +289,7 @@ _product_depth_split :: proc(output: []$T, a, b: Tensor_View(T), accumulate: boo
 		_product_kernel_serial(job.partials[chunk*job.m*job.n:][:job.m*job.n], a, b)
 	}, &job)
 	if !accumulate {
-		for &value in output {
-			value = 0
-		}
+		_fill_product_start(output, n, bias)
 	}
 	for chunk in 0..<slices {
 		partial := job.partials[chunk*m*n:][:m*n]

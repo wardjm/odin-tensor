@@ -4,15 +4,42 @@ import "core:math"
 import "core:mem"
 import "core:testing"
 
-batch_norm_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
-	return tape_batch_norm(tape, a, b, 1e-3)
+// constant_feature_leaf adds an untracked leaf of features values, each
+// value plus a small step per feature.
+constant_feature_leaf :: proc(tape: ^Tape(f64), features: int, value: f64) -> (result: Tape_Value(f64), err: Tensor_Error) {
+	values := new_tensor(f64, []int{features}) or_return
+	defer release(&values)
+	for &element, i in values.data {
+		element = value + 0.1*f64(i)
+	}
+	return tape_add_leaf_copy(tape, as_view(values), false)
+}
+
+// batch_norm_helper normalizes a with scale b and a constant shift.
+batch_norm_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
+	scale := tape_value(tape, b) or_return
+	shift := constant_feature_leaf(tape, scale.shape[0], 0.25) or_return
+	return tape_batch_norm(tape, a, b, shift, 1e-3)
+}
+
+// batch_norm_shift_helper normalizes a with a constant scale and shift b.
+batch_norm_shift_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
+	shift := tape_value(tape, b) or_return
+	scale := constant_feature_leaf(tape, shift.shape[0], 1.5) or_return
+	return tape_batch_norm(tape, a, scale, b, 1e-3)
+}
+
+// batch_norm_shared_helper uses b as both scale and shift, so one parent
+// receives two gradients from the node.
+batch_norm_shared_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
+	return tape_batch_norm(tape, a, b, b, 1e-3)
 }
 
 // transposed_batch_norm_helper normalizes a transposed view, so x is not
 // contiguous in either pass.
 transposed_batch_norm_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
 	transposed := tape_transpose(tape, a) or_return
-	return tape_batch_norm(tape, transposed, b, 1e-3)
+	return tape_batch_norm(tape, transposed, b, b, 1e-3)
 }
 
 @(test)
@@ -28,14 +55,19 @@ test_tape_batch_norm_matches_direct_formula :: proc(t: ^testing.T) {
 	scale, err = from_slice(f64, []f64{2, -1, 0.5, 1.25}, []int{FEATURES})
 	require_ok(t, err)
 	defer release(&scale)
+	shift: Tensor(f64)
+	shift, err = from_slice(f64, []f64{0.5, 0, -3, 1}, []int{FEATURES})
+	require_ok(t, err)
+	defer release(&shift)
 	tape: Tape(f64)
 	tape, err = tape_init(f64)
 	require_ok(t, err)
 	defer tape_release(&tape)
 	xv := tape_add_leaf_borrow(&tape, &x) or_else panic("leaf")
 	sv := tape_add_leaf_borrow(&tape, &scale) or_else panic("leaf")
+	hv := tape_add_leaf_borrow(&tape, &shift) or_else panic("leaf")
 	mean, variance: [FEATURES]f64
-	normalized := tape_batch_norm(&tape, xv, sv, 1e-5, mean[:], variance[:]) or_else panic("batch_norm")
+	normalized := tape_batch_norm(&tape, xv, sv, hv, 1e-5, mean[:], variance[:]) or_else panic("batch_norm")
 	value := tape_value(&tape, normalized) or_else panic("value")
 	expect_shape(t, value.shape, []int{2, 3, FEATURES})
 
@@ -50,7 +82,7 @@ test_tape_batch_norm_matches_direct_formula :: proc(t: ^testing.T) {
 		}
 		testing.expect(t, abs(mean[f]-want_mean) < 1e-12 && abs(variance[f]-want_variance) < 1e-12, "statistics")
 		for row in 0..<ROWS {
-			want := (x.data[row*FEATURES + f] - want_mean) / math.sqrt(want_variance+1e-5) * scale.data[f]
+			want := (x.data[row*FEATURES + f] - want_mean) / math.sqrt(want_variance+1e-5) * scale.data[f] + shift.data[f]
 			testing.expectf(t, abs(value.data[value.offset + row*FEATURES + f]-want) < 1e-12, "element %d, %d: got %v, want %v", row, f, value.data[value.offset + row*FEATURES + f], want)
 		}
 	}
@@ -74,6 +106,13 @@ test_tape_batch_norm_forward_matches_composition_exactly :: proc(t: ^testing.T) 
 	for &value, i in scale.data {
 		value = 0.5 + f32(i)/7
 	}
+	shift: Tensor(f32)
+	shift, err = new_tensor(f32, []int{FEATURES})
+	require_ok(t, err)
+	defer release(&shift)
+	for &value, i in shift.data {
+		value = f32(i%5) - 1.75
+	}
 	epsilon_value: Tensor(f32)
 	epsilon_value, err = from_slice(f32, []f32{1e-5}, []int{1})
 	require_ok(t, err)
@@ -84,8 +123,9 @@ test_tape_batch_norm_forward_matches_composition_exactly :: proc(t: ^testing.T) 
 	defer tape_release(&tape)
 	xv := tape_add_leaf_borrow(&tape, &x) or_else panic("leaf")
 	sv := tape_add_leaf_borrow(&tape, &scale) or_else panic("leaf")
+	hv := tape_add_leaf_borrow(&tape, &shift) or_else panic("leaf")
 	ev := tape_add_leaf_borrow(&tape, &epsilon_value, false) or_else panic("leaf")
-	fused := tape_batch_norm(&tape, xv, sv, 1e-5) or_else panic("batch_norm")
+	fused := tape_batch_norm(&tape, xv, sv, hv, 1e-5) or_else panic("batch_norm")
 
 	mean := tape_mean_axis(&tape, xv, 0, keep_dims = true) or_else panic("mean")
 	centered := tape_sub(&tape, xv, mean) or_else panic("sub")
@@ -94,7 +134,8 @@ test_tape_batch_norm_forward_matches_composition_exactly :: proc(t: ^testing.T) 
 	shifted := tape_add(&tape, variance, ev) or_else panic("add")
 	deviation := tape_sqrt(&tape, shifted) or_else panic("sqrt")
 	normalized := tape_div(&tape, centered, deviation) or_else panic("div")
-	composed := tape_mul(&tape, normalized, sv) or_else panic("mul")
+	scaled := tape_mul(&tape, normalized, sv) or_else panic("mul")
+	composed := tape_add(&tape, scaled, hv) or_else panic("add")
 
 	fused_value := tape_value(&tape, fused) or_else panic("value")
 	composed_value := tape_value(&tape, composed) or_else panic("value")
@@ -112,6 +153,8 @@ test_tape_batch_norm_matches_finite_differences :: proc(t: ^testing.T) {
 	}
 	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_helper)
 	check_tape_helper(t, .Batch_Norm, values[:12], []int{12, 1}, []f64{0.8}, []int{1}, batch_norm_helper)
+	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_shift_helper)
+	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_shared_helper)
 	// [3, 4] transposed is [4, 3]: three features over four rows.
 	check_tape_helper(t, .Batch_Norm, values[:12], []int{3, 4}, []f64{1.5, -0.7, 0.4}, []int{3}, transposed_batch_norm_helper)
 }
@@ -138,19 +181,21 @@ test_tape_batch_norm_is_the_same_on_every_thread_count :: proc(t: ^testing.T) {
 		value = f32(math.cos(0.3*f64(i)))
 	}
 
-	run :: proc(t: ^testing.T, x, scale, seed: ^Tensor(f32), threads: int) -> (output, x_grad, scale_grad: []f32) {
+	run :: proc(t: ^testing.T, x, scale, seed: ^Tensor(f32), threads: int) -> (output, x_grad, scale_grad, shift_grad: []f32) {
 		require_ok(t, set_thread_count(threads))
 		tape, err := tape_init(f32)
 		require_ok(t, err)
 		defer tape_release(&tape)
 		xv := tape_add_leaf_borrow(&tape, x) or_else panic("leaf")
 		sv := tape_add_leaf_borrow(&tape, scale) or_else panic("leaf")
-		normalized := tape_batch_norm(&tape, xv, sv, 1e-5) or_else panic("batch_norm")
+		shift := tape_add_leaf_copy(&tape, as_view(scale^)) or_else panic("leaf")
+		normalized := tape_batch_norm(&tape, xv, sv, shift, 1e-5) or_else panic("batch_norm")
 		require_ok(t, tape_backward_with_seed(&tape, normalized, seed^))
 		value := tape_value(&tape, normalized) or_else panic("value")
 		x_gradient := tape_gradient(&tape, xv) or_else panic("gradient")
 		scale_gradient := tape_gradient(&tape, sv) or_else panic("gradient")
-		return slice_clone(value.data), slice_clone(x_gradient.data), slice_clone(scale_gradient.data)
+		shift_gradient := tape_gradient(&tape, shift) or_else panic("gradient")
+		return slice_clone(value.data), slice_clone(x_gradient.data), slice_clone(scale_gradient.data), slice_clone(shift_gradient.data)
 	}
 	slice_clone :: proc(values: []f32) -> []f32 {
 		result := make([]f32, len(values))
@@ -158,11 +203,11 @@ test_tape_batch_norm_is_the_same_on_every_thread_count :: proc(t: ^testing.T) {
 		return result
 	}
 	defer set_thread_count(1)
-	serial := [3][]f32{}
-	serial[0], serial[1], serial[2] = run(t, &x, &scale, &seed, 1)
-	threaded := [3][]f32{}
-	threaded[0], threaded[1], threaded[2] = run(t, &x, &scale, &seed, 4)
-	for which in 0..<3 {
+	serial := [4][]f32{}
+	serial[0], serial[1], serial[2], serial[3] = run(t, &x, &scale, &seed, 1)
+	threaded := [4][]f32{}
+	threaded[0], threaded[1], threaded[2], threaded[3] = run(t, &x, &scale, &seed, 4)
+	for which in 0..<4 {
 		defer delete(serial[which])
 		defer delete(threaded[which])
 		mismatches := 0
@@ -201,20 +246,24 @@ test_tape_batch_norm_validates_arguments :: proc(t: ^testing.T) {
 	wv := tape_add_leaf_borrow(&tape, &wrong_scale) or_else panic("leaf")
 	ev := tape_add_leaf_borrow(&tape, &empty) or_else panic("leaf")
 
-	_, err = tape_batch_norm(&tape, xv, wv, 1e-5)
+	_, err = tape_batch_norm(&tape, xv, wv, sv, 1e-5)
+	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
+	_, err = tape_batch_norm(&tape, xv, sv, wv, 1e-5)
 	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
 	short: [2]f64
-	_, err = tape_batch_norm(&tape, xv, sv, 1e-5, mean = short[:])
+	_, err = tape_batch_norm(&tape, xv, sv, sv, 1e-5, mean = short[:])
 	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
-	_, err = tape_batch_norm(&tape, ev, sv, 1e-5)
+	_, err = tape_batch_norm(&tape, ev, sv, sv, 1e-5)
 	testing.expect_value(t, err, Tensor_Error.Empty_Reduction)
-	_, err = tape_batch_norm(&tape, Tape_Value(f64){}, sv, 1e-5)
+	_, err = tape_batch_norm(&tape, Tape_Value(f64){}, sv, sv, 1e-5)
+	testing.expect_value(t, err, Tensor_Error.Invalid_Tape)
+	_, err = tape_batch_norm(&tape, xv, sv, Tape_Value(f64){}, 1e-5)
 	testing.expect_value(t, err, Tensor_Error.Invalid_Tape)
 
 	// Without tracked parents the result has no gradient.
 	constant := tape_add_leaf_borrow(&tape, &x, false) or_else panic("leaf")
 	constant_scale := tape_add_leaf_borrow(&tape, &scale, false) or_else panic("leaf")
-	normalized := tape_batch_norm(&tape, constant, constant_scale, 1e-5) or_else panic("batch_norm")
+	normalized := tape_batch_norm(&tape, constant, constant_scale, constant_scale, 1e-5) or_else panic("batch_norm")
 	_, grad_err := tape_gradient(&tape, normalized)
 	testing.expect_value(t, grad_err, Tensor_Error.Gradient_Not_Tracked)
 }
@@ -237,8 +286,8 @@ batch_norm_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error
 	other_scale := new_tensor(f64, []int{4}, allocator) or_return
 	defer release(&other_scale)
 	ov := tape_add_leaf_borrow(&tape, &other_scale) or_return
-	first := tape_batch_norm(&tape, xv, sv, 1e-5) or_return
-	second := tape_batch_norm(&tape, transposed, ov, 1e-5) or_return
+	first := tape_batch_norm(&tape, xv, sv, sv, 1e-5) or_return
+	second := tape_batch_norm(&tape, transposed, ov, ov, 1e-5) or_return
 	first_total := tape_sum_all(&tape, first) or_return
 	second_total := tape_sum_all(&tape, second) or_return
 	total := tape_add(&tape, first_total, second_total) or_return

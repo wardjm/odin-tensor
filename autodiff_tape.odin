@@ -36,6 +36,7 @@ Tape_Operation :: enum {
 	Im2col,
 	Max_Pool2D,
 	Batch_Norm,
+	Linear,
 }
 
 _Tape_Node :: struct($T: typeid) {
@@ -48,8 +49,11 @@ _Tape_Node :: struct($T: typeid) {
 	grad:          Tensor(T),
 	has_grad:      bool,
 	operation:     Tape_Operation,
+	// The first parent_count of parent_a, parent_b and parent_c are the
+	// node's inputs.
 	parent_a:      int,
 	parent_b:      int,
+	parent_c:      int,
 	parent_count:  int,
 	axis:          int,
 	keep_dims:     bool,

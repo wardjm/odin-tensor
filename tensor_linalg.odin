@@ -63,27 +63,28 @@ _PRODUCT_COLUMN_ROWS :: 8
 
 // _product_kernel_serial computes output = a @ b, or output += a @ b when
 // accumulate is set, on the calling thread, treating a vector a as a row and a
-// vector b as a column. _product_kernel, in tensor_threads.odin, is the entry
-// point that may split it across threads. It runs one of several compiled
-// copies of the same paths: on x86, one for AVX with FMA, one for AVX alone,
-// and one for SSE; elsewhere one, with 16-byte vectors, which NEON fuses. Each
-// output element adds its k products in order, on every path, so for a given
-// CPU neither the path nor the blocking changes the result. Float products are
-// fused multiply-adds where _product_fused reports it, and otherwise a
-// multiply then an add.
-_product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) {
+// vector b as a column. Without accumulate, a bias of n values, when given,
+// starts each column's sums in place of zero. _product_kernel, in
+// tensor_threads.odin, is the entry point that may split it across threads.
+// It runs one of several compiled copies of the same paths: on x86, one for
+// AVX with FMA, one for AVX alone, and one for SSE; elsewhere one, with
+// 16-byte vectors, which NEON fuses. Each output element adds its k products
+// in order to its start, on every path, so for a given CPU neither the path
+// nor the blocking changes the result. Float products are fused multiply-adds
+// where _product_fused reports it, and otherwise a multiply then an add.
+_product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false, bias: []T = nil) {
 	when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
 		avx, fma := _product_instructions()
 		if fma {
-			_product_kernel_fma(output, a, b, accumulate)
+			_product_kernel_fma(output, a, b, accumulate, bias)
 			return
 		}
 		if avx {
-			_product_kernel_avx(output, a, b, accumulate)
+			_product_kernel_avx(output, a, b, accumulate, bias)
 			return
 		}
 	}
-	#force_inline _product_paths(output, a, b, accumulate, _PRODUCT_FUSED_WITHOUT_AVX, 16)
+	#force_inline _product_paths(output, a, b, accumulate, bias, _PRODUCT_FUSED_WITHOUT_AVX, 16)
 }
 
 // _PRODUCT_FUSED_WITHOUT_AVX is whether the copy built without x86 features
@@ -99,7 +100,7 @@ _product_fused :: proc() -> bool {
 
 // _product_paths picks the path for _product_kernel_serial, with FUSED
 // choosing fused multiply-adds and VECTOR_BYTES the packed tile's vector size.
-_product_paths :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, $FUSED: bool, $VECTOR_BYTES: int) #no_bounds_check {
+_product_paths :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, bias: []T, $FUSED: bool, $VECTOR_BYTES: int) #no_bounds_check {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
 	k := a.shape[a_rank-1]
@@ -109,19 +110,31 @@ _product_paths :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumul
 	b_contiguous := b_rank == 1 || b.strides[1] == 1
 	min_rows := _PRODUCT_TILE_ROWS if b_contiguous else 2
 	if m >= min_rows && k >= _PRODUCT_MIN_BLOCKED_DEPTH && n >= _PRODUCT_MIN_TILE_COLUMNS {
-		#force_inline _product_packed(output, a, b, accumulate, FUSED, 2, max(1, VECTOR_BYTES/size_of(T)))
+		#force_inline _product_packed(output, a, b, accumulate, bias, FUSED, 2, max(1, VECTOR_BYTES/size_of(T)))
 		return
 	}
 	if !accumulate {
-		for &value in output {
-			value = 0
-		}
+		_fill_product_start(output, n, bias)
 	}
 	if m >= _PRODUCT_COLUMN_ROWS && k >= _PRODUCT_MIN_BLOCKED_DEPTH && n < _PRODUCT_MIN_TILE_COLUMNS {
 		#force_inline _product_columns(output, a, b, FUSED)
 		return
 	}
 	#force_inline _product_strip(output, a, b, FUSED)
+}
+
+// _fill_product_start sets each n-element row of output to bias, or to zero
+// without one.
+_fill_product_start :: proc(output: []$T, n: int, bias: []T) {
+	if bias == nil {
+		for &value in output {
+			value = 0
+		}
+		return
+	}
+	for start := 0; start < len(output); start += n {
+		copy(output[start:][:n], bias[:n])
+	}
 }
 
 // _multiply_add returns sum + x*y, as one fused operation when FUSED is set
@@ -136,11 +149,11 @@ _multiply_add :: #force_inline proc "contextless" (x, y, sum: $V, $FUSED: bool) 
 
 // _product_packed computes output = a @ b, or output += a @ b when accumulate
 // is set, with the packed path, in a tile VECTORS vectors of LANES elements
-// wide. Without accumulate, the first k block's tiles start from zero rather
-// than reading output, which saves a pass over it. a_pack holds row panel t's
+// wide. Without accumulate, the first k block's tiles start from zero, or
+// from the bias, rather than reading output, which saves a pass over it. a_pack holds row panel t's
 // column p at a_pack[(t*depth + p)*ROWS:][:ROWS], and b_vectors column panel
 // t's row p at b_vectors[(t*depth + p)*VECTORS:][:VECTORS].
-_product_packed :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, $FUSED: bool, $VECTORS, $LANES: int) #no_bounds_check {
+_product_packed :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, bias: []T, $FUSED: bool, $VECTORS, $LANES: int) #no_bounds_check {
 	Vector :: #simd[LANES]T
 	ROWS :: _PRODUCT_TILE_ROWS
 	COLUMNS :: VECTORS * LANES
@@ -182,16 +195,21 @@ _product_packed :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumu
 						a_panel := ([^]T)(&a_pack[row_panel*depth*ROWS])
 						first := (i0 + row_panel*ROWS)*n + j0 + column_panel*COLUMNS
 						if height == ROWS && width == COLUMNS {
-							_product_tile(ROWS, VECTORS, Vector, FUSED, ([^]T)(&output[first]), n, a_panel, b_panel, depth, load)
+							start: [^]T = nil if load || bias == nil else ([^]T)(&bias[j0 + column_panel*COLUMNS])
+							_product_tile(ROWS, VECTORS, Vector, FUSED, ([^]T)(&output[first]), n, a_panel, b_panel, depth, load, start)
 							continue
 						}
 						edge: [ROWS*COLUMNS]T
 						for r in 0..<height {
 							for j in 0..<width {
-								edge[r*COLUMNS + j] = output[first + r*n + j] if load else 0
+								if load {
+									edge[r*COLUMNS + j] = output[first + r*n + j]
+								} else if bias != nil {
+									edge[r*COLUMNS + j] = bias[j0 + column_panel*COLUMNS + j]
+								}
 							}
 						}
-						_product_tile(ROWS, VECTORS, Vector, FUSED, ([^]T)(&edge[0]), COLUMNS, a_panel, b_panel, depth, true)
+						_product_tile(ROWS, VECTORS, Vector, FUSED, ([^]T)(&edge[0]), COLUMNS, a_panel, b_panel, depth, true, nil)
 						for r in 0..<height {
 							for j in 0..<width {
 								output[first + r*n + j] = edge[r*COLUMNS + j]
@@ -305,14 +323,22 @@ _product_columns :: #force_inline proc(output: []$T, a, b: Tensor_View(T), $FUSE
 
 // _product_tile adds the ROWS x VECTORS*LANES tile a_panel @ b_panel, depth
 // deep, into the matching output tile, whose first element is output[0] and
-// whose rows are row_length apart, or stores it there when load is false. The
+// whose rows are row_length apart, or stores it there when load is false,
+// starting every row from the VECTORS*LANES values at start when given. The
 // tile is accumulated in locals so the compiler can keep it in registers.
-_product_tile :: #force_inline proc($ROWS, $VECTORS: int, $Vector: typeid/#simd[$LANES]$T, $FUSED: bool, output: [^]T, row_length: int, a_panel: [^]T, b_panel: [^]Vector, depth: int, load: bool) #no_bounds_check {
+_product_tile :: #force_inline proc($ROWS, $VECTORS: int, $Vector: typeid/#simd[$LANES]$T, $FUSED: bool, output: [^]T, row_length: int, a_panel: [^]T, b_panel: [^]Vector, depth: int, load: bool, start: [^]T) #no_bounds_check {
 	tile: [ROWS][VECTORS]Vector
 	if load {
 		for r in 0..<ROWS {
 			for v in 0..<VECTORS {
 				tile[r][v] = intrinsics.unaligned_load((^Vector)(&output[r*row_length + v*LANES]))
+			}
+		}
+	} else if start != nil {
+		for v in 0..<VECTORS {
+			first_row := intrinsics.unaligned_load((^Vector)(&start[v*LANES]))
+			for r in 0..<ROWS {
+				tile[r][v] = first_row
 			}
 		}
 	}
@@ -546,6 +572,39 @@ matmul_into :: proc(output: ^Tensor($T), a, b: Tensor(T)) -> Tensor_Error where 
 
 matmul_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_Error where intrinsics.type_is_numeric(T) {
 	return _matmul_views_into(output, a, b)
+}
+
+// linear computes x @ weights + bias for an [m, k] x, [k, n] weights and an
+// [n] bias, the affine map of a dense layer. The bias starts each output
+// element's sum, to which its k products are added in order, so it needs no
+// pass of its own. Other ranks or mismatched sizes return Shape_Mismatch.
+linear :: proc(x, weights, bias: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
+	return linear_views(as_view(x), as_view(weights), as_view(bias), allocator)
+}
+
+linear_views :: proc(x, weights, bias: Tensor_View($T), allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) where intrinsics.type_is_numeric(T) {
+	_validate_view(x) or_return
+	_validate_view(weights) or_return
+	_validate_view(bias) or_return
+	if !_linear_shapes_match(x.shape, weights.shape, bias.shape) {
+		return result, .Shape_Mismatch
+	}
+	starts := bias
+	contiguous: Tensor(T)
+	defer release(&contiguous)
+	if !_is_contiguous_view(bias) {
+		contiguous = copy_view(bias, allocator) or_return
+		starts = as_view(contiguous)
+	}
+	result = _new_tensor(T, []int{x.shape[0], weights.shape[1]}, false, allocator) or_return
+	_product_kernel(result.data, x, weights, bias = starts.data[starts.offset:][:weights.shape[1]])
+	return result, .None
+}
+
+// _linear_shapes_match reports whether x, weights and bias are [m, k], [k, n]
+// and [n].
+_linear_shapes_match :: proc(x, weights, bias: []int) -> bool {
+	return len(x) == 2 && len(weights) == 2 && len(bias) == 1 && x[1] == weights[0] && bias[0] == weights[1]
 }
 
 // scale_in_place multiplies every element by a scalar without allocating.
