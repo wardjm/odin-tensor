@@ -632,8 +632,6 @@ _backward_activation_range :: proc(job: ^_Activation_Job($T), first, last: int, 
 	}
 }
 
-// _backward_binary_elementwise applies one binary VJP and reduces broadcasted
-// contributions into each parent's original shape.
 // _add_into adds source into target element by element, split between
 // threads when large.
 _add_into :: proc(target, source: []$T) {
@@ -820,6 +818,8 @@ _activation_derivative :: #force_inline proc(input, output: $T, $operation: Tape
 	}
 }
 
+// _backward_binary_elementwise applies one binary VJP and reduces broadcasted
+// contributions into each parent's original shape.
 _backward_binary_elementwise :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a, b: Tensor_View(T), operation: Tape_Operation) -> Tensor_Error where intrinsics.type_is_float(T) {
 	_validate_view(a) or_return
 	_validate_view(b) or_return
@@ -934,9 +934,6 @@ _broadcast_walk_move :: #force_inline proc(walk: ^_Broadcast_Walk, axis, count: 
 	walk.gradient += count * walk.gradient_steps[axis]
 }
 
-// _gradient_inner_step is the step between consecutive output elements along
-// the last axis in a parent's contiguous gradient, or zero when the parent is
-// broadcast along that axis.
 // _repeating_operands reports whether a and b are contiguous and each either
 // fills result_shape or broadcasts only along leading axes, like a bias added
 // to a batch, so in row-major order it repeats every period elements. At least
@@ -1069,6 +1066,9 @@ _repeating_sums :: proc(job: ^_Repeating_Job($T), first, last: int, $operation: 
 	}
 }
 
+// _gradient_inner_step is the step between consecutive output elements along
+// the last axis in a parent's contiguous gradient, or zero when the parent is
+// broadcast along that axis.
 _gradient_inner_step :: proc(shape: []int) -> int {
 	if len(shape) == 0 || shape[len(shape)-1] == 1 {
 		return 0

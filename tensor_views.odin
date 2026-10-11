@@ -80,6 +80,7 @@ transpose_copy :: proc(source: Tensor_View($T), allocator := context.allocator) 
 	return copy_view(transposed, allocator)
 }
 
+// transpose_copy_tensor is transpose_copy for an owned tensor.
 transpose_copy_tensor :: proc(source: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) {
 	return transpose_copy(as_view(source), allocator)
 }

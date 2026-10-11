@@ -68,12 +68,12 @@ _reduce_run :: #force_inline proc(data: []$T, offset, step, count: int, $operati
 	return value
 }
 
-// PAIRWISE_BLOCK is the run length below which _pairwise_sum stops splitting,
+// _PAIRWISE_BLOCK is the run length below which _pairwise_sum stops splitting,
 // as in NumPy.
-PAIRWISE_BLOCK :: 128
+_PAIRWISE_BLOCK :: 128
 
 // _pairwise_sum adds count elements starting at offset and advancing by step.
-// Runs longer than PAIRWISE_BLOCK are split in half and the halves summed
+// Runs longer than _PAIRWISE_BLOCK are split in half and the halves summed
 // recursively, so rounding error grows with log(count) rather than count. Within
 // a block, eight interleaved accumulators keep each partial sum short, as
 // NumPy's pairwise_sum does. With squared, it adds (element - center)² instead.
@@ -85,7 +85,7 @@ _pairwise_sum :: proc(data: []$T, offset, step, count: int, center: T, $squared:
 		}
 		return value
 	}
-	if count <= PAIRWISE_BLOCK {
+	if count <= _PAIRWISE_BLOCK {
 		partial: [8]T
 		for lane in 0..<8 {
 			partial[lane] = _pairwise_term(data[offset + lane*step], center, squared)
@@ -188,7 +188,7 @@ _pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int, terms
 		}
 		return value
 	}
-	if count <= PAIRWISE_BLOCK {
+	if count <= _PAIRWISE_BLOCK {
 		partial: [8][_PAIRWISE_COLUMNS]T
 		// second_partial holds a paired term's accumulators; unpaired terms
 		// leave it untouched.
@@ -287,7 +287,7 @@ _column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, 
 	if runs < threads && runs <= _COLUMN_SUM_TASKS/2 && rows*_PAIRWISE_COLUMNS >= _PARALLEL_MIN_ELEMENTS {
 		// Aim for a few pieces per thread, within the partials' room.
 		pieces := min(_COLUMN_SUM_TASKS/runs, 4*threads/runs)
-		job.leaf_rows = max(PAIRWISE_BLOCK, (rows + pieces - 1) / pieces)
+		job.leaf_rows = max(_PAIRWISE_BLOCK, (rows + pieces - 1) / pieces)
 		for {
 			job.leaf_count = 0
 			if _pairwise_leaves(&job.leaves, &job.leaf_count, 0, rows, job.leaf_rows) && job.leaf_count*runs <= _COLUMN_SUM_TASKS {
@@ -356,7 +356,7 @@ _Row_Range :: struct {
 // until each has at most limit rows or stops splitting. It returns false if
 // leaves runs out of room.
 _pairwise_leaves :: proc(leaves: ^[_COLUMN_SUM_TASKS]_Row_Range, leaf_count: ^int, first, count, limit: int) -> bool {
-	if count <= limit || count <= PAIRWISE_BLOCK {
+	if count <= limit || count <= _PAIRWISE_BLOCK {
 		if leaf_count^ == len(leaves) {
 			return false
 		}
@@ -373,7 +373,7 @@ _pairwise_leaves :: proc(leaves: ^[_COLUMN_SUM_TASKS]_Row_Range, leaf_count: ^in
 // for count rows, starting at partials[next^], in the shape of the pairwise
 // sum's tree.
 _combine_leaves :: proc(partials: [][2][_PAIRWISE_COLUMNS]$T, next: ^int, count, limit, width: int) -> (value: [2][_PAIRWISE_COLUMNS]T) {
-	if count <= limit || count <= PAIRWISE_BLOCK {
+	if count <= limit || count <= _PAIRWISE_BLOCK {
 		value = partials[next^]
 		next^ += 1
 		return value

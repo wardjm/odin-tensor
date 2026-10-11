@@ -2,20 +2,22 @@ package tensor
 
 import "core:mem"
 
+// Tensor_Error is returned by every fallible procedure; nothing panics on bad
+// input.
 Tensor_Error :: enum {
 	None,
-	Invalid_Shape,
-	Shape_Mismatch,
-	Out_Of_Bounds,
+	Invalid_Shape,         // a malformed shape, a repeated axis, or a rank the operation doesn't take
+	Shape_Mismatch,        // operand shapes that don't broadcast, multiply, or match an output
+	Out_Of_Bounds,         // an index, axis, or slice outside its tensor
 	Allocation_Failed,
-	Insufficient_Buffer,
-	Division_By_Zero,
-	Integer_Overflow,
-	Aliased_Output,
-	Empty_Reduction,
-	Gradient_Not_Tracked,
-	Invalid_Tape,
-	Unsupported_Operation,
+	Insufficient_Buffer,   // a caller-provided shape or stride buffer is too short
+	Division_By_Zero,      // integer division by zero
+	Integer_Overflow,      // signed integer min(T) / -1
+	Aliased_Output,        // an _into output overlaps an input in an unsafe way
+	Empty_Reduction,       // mean, max, min, var, std, or arg* of no elements
+	Gradient_Not_Tracked,  // the tape value was recorded without requires_grad
+	Invalid_Tape,          // a tape handle from another tape or an earlier reset
+	Unsupported_Operation, // a tape_record_* call naming an operation it doesn't record
 }
 
 // MAX_RANK is the largest supported number of dimensions, matching NumPy.
@@ -315,6 +317,7 @@ fill :: proc(t: ^Tensor($T), value: T) {
 	}
 }
 
+// set_linear and get_linear address a tensor's flat row-major data.
 set_linear :: proc(t: ^Tensor($T), index: int, value: T) -> Tensor_Error {
 	if index < 0 || index >= len(t.data) {
 		return .Out_Of_Bounds

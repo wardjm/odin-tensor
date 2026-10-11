@@ -3,11 +3,11 @@ package tensor
 // Worker threads.
 //
 // The library is single-threaded until set_thread_count asks for more. Large
-// matrix products, element-wise operations, im2col and pooling, forward and
-// backward, are then split into ranges, one per thread, with the calling
-// thread taking one range and waiting for the rest. Each output element is
-// still computed by one thread, combining its inputs in the same order, so
-// the thread count never changes a result.
+// matrix products, element-wise operations, im2col, pooling, batch
+// normalization and column sums, forward and backward, are then split into
+// ranges, one per thread, with the calling thread taking one range and
+// waiting for the rest. Every split keeps each result's order of operations,
+// so the thread count never changes a result.
 
 import "base:intrinsics"
 import "core:sync"
@@ -52,13 +52,13 @@ _Pool :: struct {
 @(private)
 _pool := _Pool{count = 1}
 
-// set_thread_count sets how many threads matrix products may use, counting
-// the calling thread; n = 1, the default, keeps everything on the caller and
+// set_thread_count sets how many threads the library may use, counting the
+// calling thread; n = 1, the default, keeps everything on the caller and
 // joins any workers. It starts or stops worker threads, created with
 // context.allocator, and returns Invalid_Shape for n < 1. Physical cores are
 // a good choice: hyperthreads rarely help these kernels. It is safe to call
-// while other threads run tensor operations; a product already in progress
-// finishes first.
+// while other threads run tensor operations; an operation already in
+// progress finishes first.
 set_thread_count :: proc(n: int) -> Tensor_Error {
 	if n < 1 {
 		return .Invalid_Shape
@@ -82,7 +82,7 @@ set_thread_count :: proc(n: int) -> Tensor_Error {
 	return .None
 }
 
-// thread_count is the number of threads matrix products may use.
+// thread_count is the number of threads the library may use.
 thread_count :: proc() -> int {
 	return intrinsics.atomic_load(&_pool.count)
 }
@@ -237,10 +237,10 @@ _Product_Depth :: struct($T: typeid) {
 
 // _product_kernel computes output = a @ b, or output += a @ b when accumulate
 // is set. Without accumulate, a bias of one value per column starts each
-// output element's sum in place of zero. Products with a long inner dimension and a small output are summed
-// over slices of it; others with enough work are split into row ranges across
-// threads, each computed by _product_kernel_serial into its own rows of
-// output.
+// output element's sum in place of zero. Products with a long inner dimension
+// and a small output are summed over slices of it; others with enough work are
+// split into row ranges across threads, each computed by
+// _product_kernel_serial into its own rows of output.
 _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false, bias: []T = nil) {
 	if len(a.shape) == 2 && len(b.shape) == 2 {
 		m, k, n := a.shape[0], a.shape[1], b.shape[1]

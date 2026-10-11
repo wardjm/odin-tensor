@@ -150,9 +150,10 @@ _multiply_add :: #force_inline proc "contextless" (x, y, sum: $V, $FUSED: bool) 
 // _product_packed computes output = a @ b, or output += a @ b when accumulate
 // is set, with the packed path, in a tile VECTORS vectors of LANES elements
 // wide. Without accumulate, the first k block's tiles start from zero, or
-// from the bias, rather than reading output, which saves a pass over it. a_pack holds row panel t's
-// column p at a_pack[(t*depth + p)*ROWS:][:ROWS], and b_vectors column panel
-// t's row p at b_vectors[(t*depth + p)*VECTORS:][:VECTORS].
+// from the bias, rather than reading output, which saves a pass over it.
+// a_pack holds row panel t's column p at a_pack[(t*depth + p)*ROWS:][:ROWS],
+// and b_vectors column panel t's row p at
+// b_vectors[(t*depth + p)*VECTORS:][:VECTORS].
 _product_packed :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, bias: []T, $FUSED: bool, $VECTORS, $LANES: int) #no_bounds_check {
 	Vector :: #simd[LANES]T
 	ROWS :: _PRODUCT_TILE_ROWS
