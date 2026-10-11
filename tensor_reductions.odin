@@ -108,6 +108,97 @@ _pairwise_sum :: proc(data: []$T, offset, step, count: int, center: T, $squared:
 	return _pairwise_sum(data, offset, step, half, center, squared) + _pairwise_sum(data, offset + half*step, step, count-half, center, squared)
 }
 
+// _PAIRWISE_COLUMNS adjacent columns are summed together by
+// _pairwise_sum_columns.
+_PAIRWISE_COLUMNS :: 16
+
+// _pairwise_sum_columns runs _pairwise_sum on width <= _PAIRWISE_COLUMNS
+// adjacent columns at once: column c sums data[offset + c + i*step] for i in
+// 0..<count. The splits and accumulators are _pairwise_sum's, so each column's
+// sum is bit-identical to it, but every step reads a contiguous run of a row
+// instead of one element per row.
+_pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int) -> (value: [_PAIRWISE_COLUMNS]T) #no_bounds_check {
+	if count < 8 {
+		for i in 0..<count {
+			row := data[offset + i*step:][:width]
+			for c in 0..<width {
+				value[c] += row[c]
+			}
+		}
+		return value
+	}
+	if count <= PAIRWISE_BLOCK {
+		partial: [8][_PAIRWISE_COLUMNS]T
+		for lane in 0..<8 {
+			row := data[offset + lane*step:][:width]
+			for c in 0..<width {
+				partial[lane][c] = row[c]
+			}
+		}
+		i := 8
+		for ; i <= count-8; i += 8 {
+			base := offset + i*step
+			for lane in 0..<8 {
+				row := data[base + lane*step:][:width]
+				for c in 0..<width {
+					partial[lane][c] += row[c]
+				}
+			}
+		}
+		for c in 0..<width {
+			value[c] = ((partial[0][c]+partial[1][c]) + (partial[2][c]+partial[3][c])) + ((partial[4][c]+partial[5][c]) + (partial[6][c]+partial[7][c]))
+		}
+		for ; i < count; i += 1 {
+			row := data[offset + i*step:][:width]
+			for c in 0..<width {
+				value[c] += row[c]
+			}
+		}
+		return value
+	}
+	half := count/2
+	half -= half % 8
+	left := _pairwise_sum_columns(data, offset, step, half, width)
+	right := _pairwise_sum_columns(data, offset + half*step, step, count-half, width)
+	for c in 0..<width {
+		value[c] = left[c] + right[c]
+	}
+	return value
+}
+
+// _reduce_columns is a float sum or mean along an axis of a contiguous
+// source, viewed as [outer, reduced_count, inner]. Each output is the pairwise
+// sum _reduce_run would compute, but runs of _PAIRWISE_COLUMNS outputs are
+// summed together along contiguous rows, and the runs are split between
+// threads, each output still computed on one thread in the same order.
+_reduce_columns :: proc(output: []$T, source: Tensor_View(T), reduced_count, inner: int, $operation: _Reduction_Operation) {
+	Job :: struct {
+		output:                       []T,
+		source:                       Tensor_View(T),
+		reduced_count, inner, chunks: int,
+	}
+	job := Job{output = output, source = source, reduced_count = reduced_count, inner = inner}
+	job.chunks = (inner + _PAIRWISE_COLUMNS - 1) / _PAIRWISE_COLUMNS
+	outer := len(output) / inner
+	_parallel_ranges(outer*job.chunks, 1, proc(data: rawptr, first, last: int) {
+		job := (^Job)(data)
+		for run in first..<last {
+			outer_index, chunk := run / job.chunks, run % job.chunks
+			first_column := chunk * _PAIRWISE_COLUMNS
+			width := min(_PAIRWISE_COLUMNS, job.inner - first_column)
+			base := job.source.offset + outer_index*job.reduced_count*job.inner + first_column
+			sums := _pairwise_sum_columns(job.source.data, base, job.inner, job.reduced_count, width)
+			for c in 0..<width {
+				value := sums[c]
+				when operation == .Mean {
+					value /= T(job.reduced_count)
+				}
+				job.output[outer_index*job.inner + first_column + c] = value
+			}
+		}
+	}, &job, reduced_count*_PAIRWISE_COLUMNS)
+}
+
 // _pairwise_term is the element _pairwise_sum adds: element itself, or with
 // squared, its squared deviation from center.
 _pairwise_term :: #force_inline proc(element, center: $T, $squared: bool) -> T {
@@ -165,6 +256,12 @@ _reduce_axis_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), axi
 	}
 
 	inner := _reduction_inner_count(source.shape, reduced_axis)
+	when (operation == .Sum || operation == .Mean) && intrinsics.type_is_float(T) {
+		if inner > 1 && reduced_count > 0 && _is_contiguous_view(source) {
+			_reduce_columns(output.data, source, reduced_count, inner, operation)
+			return .None
+		}
+	}
 	reduced_stride := source.strides[reduced_axis]
 	for output_index in 0..<len(output.data) {
 		base_offset := _reduction_base_offset(source, reduced_axis, inner, output_index)

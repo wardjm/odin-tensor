@@ -3,6 +3,7 @@ package tensor
 // Reverse traversal and gradient kernels.
 
 import "base:intrinsics"
+import "core:mem"
 
 // tape_backward_with_seed accumulates a same-shaped seed at a graph value and
 // propagates its contribution in reverse topological order. Repeated calls
@@ -39,6 +40,18 @@ tape_backward :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> Tensor_Error whe
 	return _tape_backward_seeded(tape, value.id, seed[:])
 }
 
+// _new_gradient allocates a zeroed gradient buffer, clearing it between
+// threads when it is large, since most of a backward pass's buffers are.
+_new_gradient :: proc($T: typeid, shape: []int, allocator: mem.Allocator) -> (gradient: Tensor(T), err: Tensor_Error) {
+	gradient = _new_tensor(T, shape, false, allocator) or_return
+	values := gradient.data
+	_parallel_ranges(len(values), 1, proc(data: rawptr, first, last: int) {
+		values := (^[]T)(data)^
+		mem.zero_slice(values[first:last])
+	}, &values)
+	return gradient, .None
+}
+
 // _tape_backward_seeded runs the reverse pass in temporary gradient buffers and
 // commits only if every active node is supported. It visits only nodes
 // reachable from root, so unrelated branches contribute nothing, not even NaN
@@ -61,7 +74,7 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 	}
 	defer delete(reached, tape.allocator)
 
-	scratch[root] = new_tensor(T, tape.nodes[root].value.shape, tape.allocator) or_return
+	scratch[root] = _new_tensor(T, tape.nodes[root].value.shape, false, tape.allocator) or_return
 	reached[root] = true
 	if len(seed) != len(scratch[root].data) {
 		return .Shape_Mismatch
@@ -74,12 +87,21 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			continue
 		}
 		parents := [2]int{node.parent_a, node.parent_b}
+		// A reshape that first reaches its parent gives it a copy of its own
+		// gradient, the same elements in the same order, so that buffer is
+		// written without being zeroed first.
+		copies_to_parent := false
 		for parent in parents[:node.parent_count] {
 			if parent < 0 || parent >= node_id {
 				return .Invalid_Tape
 			}
 			if tape.nodes[parent].requires_grad && !reached[parent] {
-				scratch[parent] = new_tensor(T, tape.nodes[parent].value.shape, tape.allocator) or_return
+				if node.operation == .Reshape {
+					scratch[parent] = _new_tensor(T, tape.nodes[parent].value.shape, false, tape.allocator) or_return
+					copies_to_parent = true
+				} else {
+					scratch[parent] = _new_gradient(T, tape.nodes[parent].value.shape, tape.allocator) or_return
+				}
 				reached[parent] = true
 			}
 		}
@@ -115,7 +137,11 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		case .Min_Axis:
 			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Min)
 		case .Transpose, .Slice, .Reshape:
-			err = _backward_view(&scratch[a], scratch[node_id], node.operation, node.axis, node.start, node.step)
+			if copies_to_parent {
+				err = _copy_gradient(scratch[a].data, scratch[node_id].data)
+			} else {
+				err = _backward_view(&scratch[a], scratch[node_id], node.operation, node.axis, node.start, node.step)
+			}
 		case .Im2col:
 			err = _backward_im2col(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width, node.step, node.padding)
 		case .Max_Pool2D:
@@ -575,6 +601,23 @@ _add_into :: proc(target, source: []$T) {
 			value += source[i]
 		}
 	}, &job)
+}
+
+// _copy_gradient copies source into target, which has the same length, split
+// between threads when large.
+_copy_gradient :: proc(target, source: []$T) -> Tensor_Error {
+	if len(target) != len(source) {
+		return .Shape_Mismatch
+	}
+	Job :: struct {
+		target, source: []T,
+	}
+	job := Job{target, source}
+	_parallel_ranges(len(target), 1, proc(data: rawptr, first, last: int) {
+		job := (^Job)(data)
+		copy(job.target[first:last], job.source[first:last])
+	}, &job)
+	return .None
 }
 
 // _activation_derivative is d output / d input for one element, from whichever

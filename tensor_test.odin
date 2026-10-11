@@ -2792,6 +2792,51 @@ test_integer_sum_max_and_min :: proc(t: ^testing.T) {
 	expect_i32_data(t, smallest.data, []i32{1})
 }
 
+// expect_column_sums_match_pairwise reduces axis 1 of an [outer, count,
+// inner] tensor, which takes the column path, and compares every output
+// exactly with _reduce_run along a strided view of the same column.
+expect_column_sums_match_pairwise :: proc(t: ^testing.T, $T: typeid, outer, count, inner: int, loc := #caller_location) {
+	source, err := new_tensor(T, []int{outer, count, inner})
+	require_ok(t, err, loc)
+	defer release(&source)
+	for &value, i in source.data {
+		value = T(math.sin(0.37*f64(i))) * 1000
+	}
+	sums: Tensor(T)
+	sums, err = sum_axis(source, 1)
+	require_ok(t, err, loc)
+	defer release(&sums)
+	means: Tensor(T)
+	means, err = mean_axis(source, 1)
+	require_ok(t, err, loc)
+	defer release(&means)
+	mismatches := 0
+	for o in 0..<outer {
+		for c in 0..<inner {
+			base := (o*count)*inner + c
+			if sums.data[o*inner + c] != _reduce_run(source.data, base, inner, count, .Sum) || means.data[o*inner + c] != _reduce_run(source.data, base, inner, count, .Mean) {
+				mismatches += 1
+			}
+		}
+	}
+	testing.expectf(t, mismatches == 0, "%v [%d, %d, %d]: %d outputs differ from the pairwise sum", typeid_of(T), outer, count, inner, mismatches, loc = loc)
+}
+
+@(test)
+test_column_sums_match_pairwise_sums :: proc(t: ^testing.T) {
+	// Counts below 8, within one pairwise block, and split once or several
+	// times; widths below, at and past one run of 16 columns.
+	expect_column_sums_match_pairwise(t, f32, 1, 5, 2)
+	expect_column_sums_match_pairwise(t, f32, 3, 100, 16)
+	expect_column_sums_match_pairwise(t, f32, 2, 129, 17)
+	expect_column_sums_match_pairwise(t, f64, 2, 1000, 33)
+	expect_column_sums_match_pairwise(t, f32, 1, 65536, 32)
+	// Enough work to split between threads.
+	set_thread_count(4)
+	defer set_thread_count(1)
+	expect_column_sums_match_pairwise(t, f32, 5, 3000, 40)
+}
+
 @(test)
 test_float_sums_are_pairwise :: proc(t: ^testing.T) {
 	// Adding 0.1 to an f32 accumulator ten million times one by one stalls once

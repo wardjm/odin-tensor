@@ -2531,3 +2531,49 @@ test_tape_mul_backward_sums_interior_broadcasts :: proc(t: ^testing.T) {
 		testing.expect_value(t, value, expected_y[i])
 	}
 }
+
+// x feeds a chain of reshapes and, through an earlier node, a product. The
+// reshapes reach x first and copy their gradient into it, then the product
+// adds its own; a second backward pass accumulates on top.
+@(test)
+test_tape_reshape_gradient_copy_then_accumulate :: proc(t: ^testing.T) {
+	x, err := from_slice(f64, []f64{1, -2, 3, 0.5, 4, -1}, []int{2, 3})
+	require_ok(t, err)
+	defer release(&x)
+	c: Tensor(f64)
+	c, err = from_slice(f64, []f64{0.25, 2, -3, 1.5, 0.5, 7}, []int{2, 3})
+	require_ok(t, err)
+	defer release(&c)
+	seed: Tensor(f64)
+	seed, err = from_slice(f64, []f64{0.3, -1.1, 2.5, 0.7, -0.2, 1.9}, []int{2, 3})
+	require_ok(t, err)
+	defer release(&seed)
+
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	require_ok(t, err)
+	defer tape_release(&tape)
+	xv := tape_add_leaf_borrow(&tape, &x) or_else panic("leaf")
+	cv := tape_add_leaf_borrow(&tape, &c, false) or_else panic("leaf")
+	product := tape_mul(&tape, xv, cv) or_else panic("mul")
+	reshaped := tape_reshape(&tape, xv, []int{3, 2}) or_else panic("reshape")
+	restored := tape_reshape(&tape, reshaped, []int{2, 3}) or_else panic("reshape")
+	total := tape_add(&tape, restored, product) or_else panic("add")
+	require_ok(t, tape_backward_with_seed(&tape, total, seed))
+	gradient := tape_gradient(&tape, xv) or_else panic("gradient")
+	for value, i in gradient.data {
+		testing.expect_value(t, value, seed.data[i] + seed.data[i]*c.data[i])
+	}
+	reshaped_gradient := tape_gradient(&tape, reshaped) or_else panic("gradient")
+	expect_shape(t, reshaped_gradient.shape, []int{3, 2})
+	for value, i in reshaped_gradient.data {
+		testing.expect_value(t, value, seed.data[i])
+	}
+
+	require_ok(t, tape_backward_with_seed(&tape, total, seed))
+	gradient = tape_gradient(&tape, xv) or_else panic("gradient")
+	for value, i in gradient.data {
+		once := seed.data[i] + seed.data[i]*c.data[i]
+		testing.expect_value(t, value, once + once)
+	}
+}

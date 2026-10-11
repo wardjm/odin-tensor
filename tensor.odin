@@ -119,6 +119,13 @@ _checked_add :: proc(a, b: int) -> (value: int, ok: bool) {
 
 // new_tensor creates a zero-initialized tensor with the requested shape.
 new_tensor :: proc($T: typeid, shape: []int, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
+	return _new_tensor(T, shape, true, allocator)
+}
+
+// _new_tensor creates a tensor whose elements are zero, or left as the
+// allocator returns them when zeroed is false, for callers that write every
+// element themselves.
+_new_tensor :: proc($T: typeid, shape: []int, zeroed: bool, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	count, valid := _element_count(shape)
 	if !valid || !_strides_are_valid(shape) {
 		return result, .Invalid_Shape
@@ -141,7 +148,13 @@ new_tensor :: proc($T: typeid, shape: []int, allocator := context.allocator) -> 
 	_fill_row_major_strides(owned_shape, owned_strides)
 
 	values: []T
-	values, alloc_err = make([]T, count, allocator)
+	if zeroed {
+		values, alloc_err = make([]T, count, allocator)
+	} else {
+		bytes: []byte
+		bytes, alloc_err = mem.alloc_bytes_non_zeroed(count*size_of(T), align_of(T), allocator)
+		values = ([^]T)(raw_data(bytes))[:count]
+	}
 	if alloc_err != nil {
 		delete(owned_shape, allocator)
 		delete(owned_strides, allocator)

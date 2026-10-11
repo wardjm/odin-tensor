@@ -249,7 +249,7 @@ Not differentiable yet: `var`/`std`, the several-axes `*_axes` reductions, `perm
 ## Limitations
 
 - Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products are cache-blocked with register tiles, but there is no hand-written SIMD, so large products are well short of a BLAS.
-- Reductions (`sum_axis`, `max_all`, ...) and the backward pass of a general broadcast, other than the bias pattern, stay on the calling thread: splitting them would change the order of their sums.
+- Reductions (`sum_axis`, `max_all`, ...) and the backward pass of a general broadcast, other than the bias pattern, stay on the calling thread: splitting them would change the order of their sums. The exception is a float `sum_axis` or `mean_axis` over any axis but the last of a contiguous tensor, which sums 16 neighbouring outputs at a time along contiguous rows and splits those groups between threads, each output keeping its pairwise order.
 
 ## Tests
 
