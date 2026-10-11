@@ -35,6 +35,28 @@ batch_norm_shared_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operat
 	return tape_batch_norm(tape, a, b, b, 1e-3)
 }
 
+// batch_norm_first_helper adds a² to a's batch norm, recording the square
+// first, so the backward pass reaches a from the batch norm first and that
+// writes a's gradient, to which the square then adds.
+batch_norm_first_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
+	square := tape_mul(tape, a, a) or_return
+	normalized := tape_batch_norm(tape, a, b, b, 1e-3) or_return
+	return tape_add(tape, normalized, square)
+}
+
+// batch_norm_last_helper records the square after the batch norm, so the
+// square reaches a first and the batch norm adds to its gradient.
+batch_norm_last_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
+	normalized := tape_batch_norm(tape, a, b, b, 1e-3) or_return
+	square := tape_mul(tape, a, a) or_return
+	return tape_add(tape, normalized, square)
+}
+
+// batch_norm_relu_helper normalizes a with scale b and shift b, then ReLU.
+batch_norm_relu_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
+	return tape_batch_norm(tape, a, b, b, 1e-3, relu = true)
+}
+
 // transposed_batch_norm_helper normalizes a transposed view, so x is not
 // contiguous in either pass.
 transposed_batch_norm_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
@@ -144,6 +166,92 @@ test_tape_batch_norm_forward_matches_composition_exactly :: proc(t: ^testing.T) 
 	}
 }
 
+// With relu, the fused node gives exactly what tape_relu after it gives, in
+// both directions, here with about half the outputs clipped to zero and
+// feature 0 entirely below zero.
+@(test)
+test_tape_batch_norm_relu_matches_tape_relu_exactly :: proc(t: ^testing.T) {
+	ROWS, FEATURES :: 500, 9
+	x, err := new_tensor(f32, []int{ROWS, FEATURES})
+	require_ok(t, err)
+	defer release(&x)
+	for &value, i in x.data {
+		value = f32(math.sin(0.37*f64(i)) * 3 + f64(i%5))
+	}
+	scale: Tensor(f32)
+	scale, err = new_tensor(f32, []int{FEATURES})
+	require_ok(t, err)
+	defer release(&scale)
+	shift: Tensor(f32)
+	shift, err = new_tensor(f32, []int{FEATURES})
+	require_ok(t, err)
+	defer release(&shift)
+	for f in 0..<FEATURES {
+		scale.data[f] = 0.5 + f32(f)/4
+		shift.data[f] = f32(f%3) - 1
+	}
+	shift.data[0] = -100
+	seed: Tensor(f32)
+	seed, err = new_tensor(f32, []int{ROWS, FEATURES})
+	require_ok(t, err)
+	defer release(&seed)
+	for &value, i in seed.data {
+		value = f32(math.cos(0.23*f64(i)))
+	}
+
+	run :: proc(t: ^testing.T, x, scale, shift, seed: ^Tensor(f32), fused: bool) -> (results: [4][]f32) {
+		tape, err := tape_init(f32)
+		require_ok(t, err)
+		defer tape_release(&tape)
+		xv := tape_add_leaf_borrow(&tape, x) or_else panic("leaf")
+		sv := tape_add_leaf_borrow(&tape, scale) or_else panic("leaf")
+		hv := tape_add_leaf_borrow(&tape, shift) or_else panic("leaf")
+		// A reshape stands in for the layer before, so x's gradient is written
+		// by the batch norm rather than added.
+		input := tape_reshape(&tape, xv, []int{ROWS, FEATURES}) or_else panic("reshape")
+		output: Tape_Value(f32)
+		if fused {
+			output = tape_batch_norm(&tape, input, sv, hv, 1e-5, relu = true) or_else panic("batch_norm")
+		} else {
+			normalized := tape_batch_norm(&tape, input, sv, hv, 1e-5) or_else panic("batch_norm")
+			output = tape_relu(&tape, normalized) or_else panic("relu")
+		}
+		require_ok(t, tape_backward_with_seed(&tape, output, seed^))
+		value := tape_value(&tape, output) or_else panic("value")
+		results[0] = clone_values(value.data[value.offset:][:ROWS*FEATURES])
+		for leaf, i in ([]Tape_Value(f32){xv, sv, hv}) {
+			gradient := tape_gradient(&tape, leaf) or_else panic("gradient")
+			results[i+1] = clone_values(gradient.data)
+		}
+		return
+	}
+	clone_values :: proc(values: []f32) -> []f32 {
+		result := make([]f32, len(values))
+		copy(result, values)
+		return result
+	}
+	composed := run(t, &x, &scale, &shift, &seed, false)
+	fused := run(t, &x, &scale, &shift, &seed, true)
+	clipped := 0
+	for value in fused[0] {
+		if value == 0 {
+			clipped += 1
+		}
+	}
+	testing.expectf(t, clipped > ROWS*FEATURES/4, "only %d outputs clipped", clipped)
+	for which in 0..<4 {
+		defer delete(composed[which])
+		defer delete(fused[which])
+		mismatches := 0
+		for value, i in composed[which] {
+			if fused[which][i] != value {
+				mismatches += 1
+			}
+		}
+		testing.expectf(t, mismatches == 0, "result %d: %d elements differ from tape_relu after tape_batch_norm", which, mismatches)
+	}
+}
+
 @(test)
 test_tape_batch_norm_matches_finite_differences :: proc(t: ^testing.T) {
 	values := make([]f64, 5*4*3)
@@ -155,69 +263,11 @@ test_tape_batch_norm_matches_finite_differences :: proc(t: ^testing.T) {
 	check_tape_helper(t, .Batch_Norm, values[:12], []int{12, 1}, []f64{0.8}, []int{1}, batch_norm_helper)
 	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_shift_helper)
 	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_shared_helper)
+	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_first_helper)
+	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_relu_helper)
+	check_tape_helper(t, .Batch_Norm, values, []int{5, 4, 3}, []f64{1.5, -0.7, 0.4}, []int{3}, batch_norm_last_helper)
 	// [3, 4] transposed is [4, 3]: three features over four rows.
 	check_tape_helper(t, .Batch_Norm, values[:12], []int{3, 4}, []f64{1.5, -0.7, 0.4}, []int{3}, transposed_batch_norm_helper)
-}
-
-@(test)
-test_tape_batch_norm_is_the_same_on_every_thread_count :: proc(t: ^testing.T) {
-	ROWS, FEATURES :: 2000, 40
-	x, err := new_tensor(f32, []int{ROWS, FEATURES})
-	require_ok(t, err)
-	defer release(&x)
-	for &value, i in x.data {
-		value = f32(math.sin(0.11*f64(i)))
-	}
-	scale: Tensor(f32)
-	scale, err = new_tensor(f32, []int{FEATURES})
-	require_ok(t, err)
-	defer release(&scale)
-	fill(&scale, 1.5)
-	seed: Tensor(f32)
-	seed, err = new_tensor(f32, []int{ROWS, FEATURES})
-	require_ok(t, err)
-	defer release(&seed)
-	for &value, i in seed.data {
-		value = f32(math.cos(0.3*f64(i)))
-	}
-
-	run :: proc(t: ^testing.T, x, scale, seed: ^Tensor(f32), threads: int) -> (output, x_grad, scale_grad, shift_grad: []f32) {
-		require_ok(t, set_thread_count(threads))
-		tape, err := tape_init(f32)
-		require_ok(t, err)
-		defer tape_release(&tape)
-		xv := tape_add_leaf_borrow(&tape, x) or_else panic("leaf")
-		sv := tape_add_leaf_borrow(&tape, scale) or_else panic("leaf")
-		shift := tape_add_leaf_copy(&tape, as_view(scale^)) or_else panic("leaf")
-		normalized := tape_batch_norm(&tape, xv, sv, shift, 1e-5) or_else panic("batch_norm")
-		require_ok(t, tape_backward_with_seed(&tape, normalized, seed^))
-		value := tape_value(&tape, normalized) or_else panic("value")
-		x_gradient := tape_gradient(&tape, xv) or_else panic("gradient")
-		scale_gradient := tape_gradient(&tape, sv) or_else panic("gradient")
-		shift_gradient := tape_gradient(&tape, shift) or_else panic("gradient")
-		return slice_clone(value.data), slice_clone(x_gradient.data), slice_clone(scale_gradient.data), slice_clone(shift_gradient.data)
-	}
-	slice_clone :: proc(values: []f32) -> []f32 {
-		result := make([]f32, len(values))
-		copy(result, values)
-		return result
-	}
-	defer set_thread_count(1)
-	serial := [4][]f32{}
-	serial[0], serial[1], serial[2], serial[3] = run(t, &x, &scale, &seed, 1)
-	threaded := [4][]f32{}
-	threaded[0], threaded[1], threaded[2], threaded[3] = run(t, &x, &scale, &seed, 4)
-	for which in 0..<4 {
-		defer delete(serial[which])
-		defer delete(threaded[which])
-		mismatches := 0
-		for value, i in serial[which] {
-			if threaded[which][i] != value {
-				mismatches += 1
-			}
-		}
-		testing.expectf(t, mismatches == 0, "result %d: %d elements differ between 1 and 4 threads", which, mismatches)
-	}
 }
 
 @(test)

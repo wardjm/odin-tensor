@@ -122,49 +122,88 @@ _Column_Term :: enum {
 	// the same position of a second array: an upstream gradient times the
 	// normalized input of batch normalization.
 	Normalized_Product,
+	// Value and Normalized_Product together, as two sums from one pass.
+	Gradient_Sums,
+	// Gradient_Sums with the element first multiplied by ReLU's derivative
+	// at normalized * scale + shift, as tape_relu's gradient after batch
+	// normalization is: one where that is positive, zero elsewhere.
+	Masked_Gradient_Sums,
 }
 
 // _Column_Terms holds the per-column constants of a _Column_Term, indexed
-// like the columns being summed, and the second array of a
-// Normalized_Product.
+// like the columns being summed, and the second array of the normalized
+// terms, laid out like the data.
 _Column_Terms :: struct($T: typeid) {
-	center, divisor: [_PAIRWISE_COLUMNS]T,
-	other:           []T,
+	center, divisor, scale, shift: [_PAIRWISE_COLUMNS]T,
+	other:                         []T,
 }
 
-// _column_term computes the term for the element at position, in column c.
-_column_term :: #force_inline proc(data: []$T, position, c: int, terms: ^_Column_Terms(T), $term: _Column_Term) -> T #no_bounds_check {
+// _column_term computes the term for the element at position, in column c,
+// and for a pair of sums the second term too.
+_column_term :: #force_inline proc(data: []$T, position, c: int, terms: ^_Column_Terms(T), $term: _Column_Term) -> (first, second: T) #no_bounds_check {
 	when term == .Value {
-		return data[position]
+		return data[position], 0
 	} else when term == .Squared_Deviation {
 		deviation := data[position] - terms.center[c]
-		return deviation * deviation
+		return deviation * deviation, 0
+	} else when term == .Normalized_Product {
+		return data[position] * ((terms.other[position] - terms.center[c]) / terms.divisor[c]), 0
 	} else {
-		return data[position] * ((terms.other[position] - terms.center[c]) / terms.divisor[c])
+		element := data[position]
+		normalized := (terms.other[position] - terms.center[c]) / terms.divisor[c]
+		when term == .Masked_Gradient_Sums {
+			element *= _relu_derivative(normalized * terms.scale[c] + terms.shift[c])
+		}
+		return element, element * normalized
 	}
+}
+
+// _relu_derivative is ReLU's derivative at a point whose ReLU output, or
+// input, is value: one where it is positive, zero elsewhere, including NaN.
+_relu_derivative :: #force_inline proc(value: $T) -> T {
+	return 1 if value > 0 else 0
 }
 
 // _pairwise_sum_columns runs _pairwise_sum on width <= _PAIRWISE_COLUMNS
 // adjacent columns at once: column c sums the terms of data[offset + c +
 // i*step] for i in 0..<count. The splits and accumulators are _pairwise_sum's,
 // so each column's sum is bit-identical to it, but every step reads a
-// contiguous run of a row instead of one element per row.
-_pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int, terms: ^_Column_Terms(T), $term: _Column_Term) -> (value: [_PAIRWISE_COLUMNS]T) #no_bounds_check {
+// contiguous run of a row instead of one element per row. A term that pairs
+// two sums returns the second in value[1], summed the same way.
+_pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int, terms: ^_Column_Terms(T), $term: _Column_Term) -> (value: [2][_PAIRWISE_COLUMNS]T) #no_bounds_check {
+	// PAIR says term produces two sums.
+	PAIR :: term == .Gradient_Sums || term == .Masked_Gradient_Sums
 	if count < 8 {
 		for i in 0..<count {
 			row := offset + i*step
 			for c in 0..<width {
-				value[c] += _column_term(data, row + c, c, terms, term)
+				first, second := _column_term(data, row + c, c, terms, term)
+				value[0][c] += first
+				when PAIR {
+					value[1][c] += second
+				} else {
+					_ = second
+				}
 			}
 		}
 		return value
 	}
 	if count <= PAIRWISE_BLOCK {
 		partial: [8][_PAIRWISE_COLUMNS]T
+		// second_partial holds a paired term's accumulators; unpaired terms
+		// leave it untouched.
+		second_partial: [8][_PAIRWISE_COLUMNS]T
+		_ = second_partial
 		for lane in 0..<8 {
 			row := offset + lane*step
 			for c in 0..<width {
-				partial[lane][c] = _column_term(data, row + c, c, terms, term)
+				first, second := _column_term(data, row + c, c, terms, term)
+				partial[lane][c] = first
+				when PAIR {
+					second_partial[lane][c] = second
+				} else {
+					_ = second
+				}
 			}
 		}
 		i := 8
@@ -173,17 +212,32 @@ _pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int, terms
 			for lane in 0..<8 {
 				row := base + lane*step
 				for c in 0..<width {
-					partial[lane][c] += _column_term(data, row + c, c, terms, term)
+					first, second := _column_term(data, row + c, c, terms, term)
+					partial[lane][c] += first
+					when PAIR {
+						second_partial[lane][c] += second
+					} else {
+						_ = second
+					}
 				}
 			}
 		}
 		for c in 0..<width {
-			value[c] = ((partial[0][c]+partial[1][c]) + (partial[2][c]+partial[3][c])) + ((partial[4][c]+partial[5][c]) + (partial[6][c]+partial[7][c]))
+			value[0][c] = ((partial[0][c]+partial[1][c]) + (partial[2][c]+partial[3][c])) + ((partial[4][c]+partial[5][c]) + (partial[6][c]+partial[7][c]))
+			when PAIR {
+				value[1][c] = ((second_partial[0][c]+second_partial[1][c]) + (second_partial[2][c]+second_partial[3][c])) + ((second_partial[4][c]+second_partial[5][c]) + (second_partial[6][c]+second_partial[7][c]))
+			}
 		}
 		for ; i < count; i += 1 {
 			row := offset + i*step
 			for c in 0..<width {
-				value[c] += _column_term(data, row + c, c, terms, term)
+				first, second := _column_term(data, row + c, c, terms, term)
+				value[0][c] += first
+				when PAIR {
+					value[1][c] += second
+				} else {
+					_ = second
+				}
 			}
 		}
 		return value
@@ -193,35 +247,41 @@ _pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int, terms
 	left := _pairwise_sum_columns(data, offset, step, half, width, terms, term)
 	right := _pairwise_sum_columns(data, offset + half*step, step, count-half, width, terms, term)
 	for c in 0..<width {
-		value[c] = left[c] + right[c]
+		value[0][c] = left[0][c] + right[0][c]
+		when PAIR {
+			value[1][c] = left[1][c] + right[1][c]
+		}
 	}
 	return value
 }
 
 // _column_sums computes the pairwise sum of the terms of each column of the
 // contiguous rows x columns matrix starting at data[offset], and stores it in
-// sums[column], or adds it there with accumulate. center and divisor, when the
-// term uses them, hold one value per column, and other, for a
-// Normalized_Product, is laid out like data.
+// sums[column], or adds it there with accumulate. A term that pairs two sums
+// puts the second in second_sums the same way. center, divisor, scale and
+// shift, when the term uses them, hold one value per column, and other, for
+// the normalized terms, is laid out like data.
 //
 // Runs of _PAIRWISE_COLUMNS columns are split between threads. With fewer
 // runs than threads, the rows are split too, along the pairwise sum's own
 // halving: each piece is one subtree of that sum, summed on its own, and the
 // pieces are combined in the tree's shape, so every sum is bit-identical to
 // _pairwise_sum_columns over all the rows, whatever the split.
-_column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, divisor, other: []T, $term: _Column_Term, accumulate := false) {
+_column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, divisor, other: []T, $term: _Column_Term, accumulate := false, second_sums: []T = nil, scale: []T = nil, shift: []T = nil) {
+	// PAIR says term produces two sums.
+	PAIR :: term == .Gradient_Sums || term == .Masked_Gradient_Sums
 	Job :: struct {
-		sums, data, center, divisor, other: []T,
+		sums, second_sums, data, center, divisor, other, scale, shift: []T,
 		offset, rows, columns:              int,
 		accumulate:                         bool,
 		// Rows are split into subtrees of at most leaf_rows; leaves holds them
 		// in order, and partials each run's sum over each leaf.
 		leaf_rows, leaf_count:              int,
 		leaves:                             [_COLUMN_SUM_TASKS]_Row_Range,
-		partials:                           [_COLUMN_SUM_TASKS][_PAIRWISE_COLUMNS]T,
+		partials:                           [_COLUMN_SUM_TASKS][2][_PAIRWISE_COLUMNS]T,
 	}
 	runs := (columns + _PAIRWISE_COLUMNS - 1) / _PAIRWISE_COLUMNS
-	job := Job{sums = sums, data = data, center = center, divisor = divisor, other = other, offset = offset, rows = rows, columns = columns, accumulate = accumulate}
+	job := Job{sums = sums, second_sums = second_sums, data = data, center = center, divisor = divisor, other = other, scale = scale, shift = shift, offset = offset, rows = rows, columns = columns, accumulate = accumulate}
 	job.leaf_rows = rows
 	threads := thread_count()
 	if runs < threads && runs <= _COLUMN_SUM_TASKS/2 && rows*_PAIRWISE_COLUMNS >= _PARALLEL_MIN_ELEMENTS {
@@ -249,13 +309,20 @@ _column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, 
 			when term != .Value {
 				copy(terms.center[:width], job.center[first_column:][:width])
 			}
-			when term == .Normalized_Product {
+			when term == .Normalized_Product || term == .Gradient_Sums || term == .Masked_Gradient_Sums {
 				copy(terms.divisor[:width], job.divisor[first_column:][:width])
+			}
+			when term == .Masked_Gradient_Sums {
+				copy(terms.scale[:width], job.scale[first_column:][:width])
+				copy(terms.shift[:width], job.shift[first_column:][:width])
 			}
 			piece := job.leaves[leaf]
 			column_sums := _pairwise_sum_columns(job.data, job.offset + piece.first*job.columns + first_column, job.columns, piece.count, width, &terms, term)
 			if job.leaf_count == 1 {
-				_store_column_sums(job.sums[first_column:][:width], column_sums[:width], job.accumulate)
+				_store_column_sums(job.sums[first_column:][:width], column_sums[0][:width], job.accumulate)
+				when PAIR {
+					_store_column_sums(job.second_sums[first_column:][:width], column_sums[1][:width], job.accumulate)
+				}
 			} else {
 				job.partials[task] = column_sums
 			}
@@ -269,7 +336,10 @@ _column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, 
 		width := min(_PAIRWISE_COLUMNS, columns - first_column)
 		next := run * job.leaf_count
 		column_sums := _combine_leaves(job.partials[:], &next, rows, job.leaf_rows, width)
-		_store_column_sums(sums[first_column:][:width], column_sums[:width], accumulate)
+		_store_column_sums(sums[first_column:][:width], column_sums[0][:width], accumulate)
+		when PAIR {
+			_store_column_sums(second_sums[first_column:][:width], column_sums[1][:width], accumulate)
+		}
 	}
 }
 
@@ -302,7 +372,7 @@ _pairwise_leaves :: proc(leaves: ^[_COLUMN_SUM_TASKS]_Row_Range, leaf_count: ^in
 // _combine_leaves adds the partial sums of the leaves _pairwise_leaves found
 // for count rows, starting at partials[next^], in the shape of the pairwise
 // sum's tree.
-_combine_leaves :: proc(partials: [][_PAIRWISE_COLUMNS]$T, next: ^int, count, limit, width: int) -> (value: [_PAIRWISE_COLUMNS]T) {
+_combine_leaves :: proc(partials: [][2][_PAIRWISE_COLUMNS]$T, next: ^int, count, limit, width: int) -> (value: [2][_PAIRWISE_COLUMNS]T) {
 	if count <= limit || count <= PAIRWISE_BLOCK {
 		value = partials[next^]
 		next^ += 1
@@ -312,8 +382,10 @@ _combine_leaves :: proc(partials: [][_PAIRWISE_COLUMNS]$T, next: ^int, count, li
 	half -= half % 8
 	left := _combine_leaves(partials, next, half, limit, width)
 	right := _combine_leaves(partials, next, count - half, limit, width)
-	for c in 0..<width {
-		value[c] = left[c] + right[c]
+	for s in 0..<2 {
+		for c in 0..<width {
+			value[s][c] = left[s][c] + right[s][c]
+		}
 	}
 	return value
 }
@@ -354,7 +426,7 @@ _reduce_columns :: proc(output: []$T, source: Tensor_View(T), reduced_count, inn
 			terms: _Column_Terms(T)
 			sums := _pairwise_sum_columns(job.source.data, base, job.inner, job.reduced_count, width, &terms, .Value)
 			for c in 0..<width {
-				value := sums[c]
+				value := sums[0][c]
 				when operation == .Mean {
 					value /= T(job.reduced_count)
 				}

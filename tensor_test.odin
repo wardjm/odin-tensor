@@ -2912,9 +2912,7 @@ test_column_sums_match_pairwise_sums :: proc(t: ^testing.T) {
 	expect_column_sums_match_pairwise(t, f32, 2, 129, 17)
 	expect_column_sums_match_pairwise(t, f64, 2, 1000, 33)
 	expect_column_sums_match_pairwise(t, f32, 1, 65536, 32)
-	// Enough work to split between threads.
-	set_thread_count(4)
-	defer set_thread_count(1)
+	// test_threaded_products_match_one_thread runs [5, 3000, 40] on threads.
 	expect_column_sums_match_pairwise(t, f32, 5, 3000, 40)
 }
 
@@ -2950,7 +2948,7 @@ expect_split_column_sums_match_pairwise :: proc(t: ^testing.T, $T: typeid, rows,
 			copy(terms.divisor[:width], divisor[first:][:width])
 			expected := _pairwise_sum_columns(data, first, columns, rows, width, &terms, term)
 			for c in 0..<width {
-				if sums[first+c] != base + expected[c] {
+				if sums[first+c] != base + expected[0][c] {
 					mismatches += 1
 				}
 			}

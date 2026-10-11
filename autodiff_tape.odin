@@ -69,6 +69,8 @@ _Tape_Node :: struct($T: typeid) {
 	// saved holds what a node's backward pass needs beyond its parents'
 	// values: a Batch_Norm's per-feature means and standard deviations.
 	saved:         Tensor(T),
+	// relu says a Batch_Norm applies ReLU to its result.
+	relu:          bool,
 }
 
 // Tape owns all recorded operation outputs and gradient buffers. Leaf values

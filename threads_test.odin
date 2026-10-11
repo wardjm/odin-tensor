@@ -207,6 +207,27 @@ all_elementwise :: proc() -> (results: [dynamic][]f64) {
 		append(&results, slice.clone(gradient.data))
 	}
 
+	// Batch normalization, alone and with ReLU, whose sums split rows.
+	normalized_input := filled([]int{2000, 40}, 11)
+	defer release(&normalized_input)
+	features := filled([]int{40}, 12)
+	defer release(&features)
+	for relu in ([]bool{false, true}) {
+		tape_reset(&tape)
+		input_value := tape_add_leaf_borrow(&tape, &normalized_input) or_else panic("leaf")
+		// The same values scale and shift.
+		features_value := tape_add_leaf_borrow(&tape, &features) or_else panic("leaf")
+		normalized := tape_batch_norm(&tape, input_value, features_value, features_value, 1e-5, relu = relu) or_else panic("batch_norm")
+		normalized_total := tape_sum_all(&tape, tape_tanh(&tape, normalized) or_else panic("tanh")) or_else panic("sum")
+		if tape_backward(&tape, normalized_total) != .None do panic("backward")
+		value := tape_value(&tape, normalized) or_else panic("value")
+		append(&results, slice.clone(value.data[value.offset:][:2000*40]))
+		for leaf in ([]Tape_Value(f64){input_value, features_value}) {
+			gradient := tape_gradient(&tape, leaf) or_else panic("gradient")
+			append(&results, slice.clone(gradient.data))
+		}
+	}
+
 	// A dense layer's affine map, whose bias gradient sums 600 rows.
 	dense_weights := filled([]int{256, 40}, 9)
 	defer release(&dense_weights)
@@ -279,6 +300,7 @@ test_threaded_products_match_one_thread :: proc(t: ^testing.T) {
 		expect_split_column_sums_match_pairwise(t, f32, 20001, 7)
 		expect_split_column_sums_match_pairwise(t, f64, 70000, 1)
 		expect_split_column_sums_match_pairwise(t, f32, 4099, 40)
+		expect_column_sums_match_pairwise(t, f32, 5, 3000, 40)
 	}
 
 	// Several threads multiplying at once: one gets the workers, the rest run

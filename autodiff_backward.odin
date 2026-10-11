@@ -40,10 +40,13 @@ tape_backward :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> Tensor_Error whe
 	return _tape_backward_seeded(tape, value.id, seed[:])
 }
 
-// _passes_gradient reports whether node's gradient reaches its parent at index
-// unchanged: a reshape's always does, and an addition's, or a subtraction's to
-// its first operand, does when the parent has the result's shape.
-_passes_gradient :: proc(node: ^_Tape_Node($T), index: int, parent_shape: []int) -> bool {
+// _writes_gradient reports whether node, reaching its parent at index first,
+// writes that parent's whole gradient rather than adding to it. A reshape
+// copies its gradient to its parent, as an addition does to an operand of the
+// result's shape and a subtraction to its first operand, since those
+// gradients pass unchanged. Batch normalization writes its input's gradient
+// when the input is not also its scale or shift, which it adds to.
+_writes_gradient :: proc(node: ^_Tape_Node($T), index: int, parent_shape: []int) -> bool {
 	#partial switch node.operation {
 	case .Reshape:
 		return true
@@ -51,6 +54,8 @@ _passes_gradient :: proc(node: ^_Tape_Node($T), index: int, parent_shape: []int)
 		return _shapes_match(parent_shape, node.value.shape)
 	case .Sub:
 		return index == 0 && _shapes_match(parent_shape, node.value.shape)
+	case .Batch_Norm:
+		return index == 0 && node.parent_a != node.parent_b && node.parent_a != node.parent_c
 	}
 	return false
 }
@@ -102,19 +107,18 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			continue
 		}
 		parents := [3]int{node.parent_a, node.parent_b, node.parent_c}
-		// A node whose gradient passes unchanged to a parent, as a reshape's
-		// does, or an addition's to an operand of the same shape, gives that
-		// parent a copy of it when it reaches the parent first, so the buffer
-		// is written without being zeroed first.
-		copies_to_parent: [3]bool
+		// A node that reaches a parent first, and can write that parent's
+		// whole gradient rather than add to it, gets a buffer that is not
+		// zeroed first: see _writes_gradient.
+		writes_parent: [3]bool
 		for parent, index in parents[:node.parent_count] {
 			if parent < 0 || parent >= node_id {
 				return .Invalid_Tape
 			}
 			if tape.nodes[parent].requires_grad && !reached[parent] {
-				if _passes_gradient(node, index, tape.nodes[parent].value.shape) {
+				if _writes_gradient(node, index, tape.nodes[parent].value.shape) {
 					scratch[parent] = _new_tensor(T, tape.nodes[parent].value.shape, false, tape.allocator) or_return
-					copies_to_parent[index] = true
+					writes_parent[index] = true
 				} else {
 					scratch[parent] = _new_gradient(T, tape.nodes[parent].value.shape, tape.allocator) or_return
 				}
@@ -129,11 +133,11 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			// the kernel adds the second.
 			grad_a, grad_b := &scratch[a], &scratch[b]
 			copied: Tensor(T)
-			if copies_to_parent[0] {
+			if writes_parent[0] {
 				err = _copy_gradient(scratch[a].data, scratch[node_id].data)
 				grad_a = &copied
 			}
-			if err == .None && copies_to_parent[1] {
+			if err == .None && writes_parent[1] {
 				err = _copy_gradient(scratch[b].data, scratch[node_id].data)
 				grad_b = &copied
 			}
@@ -169,7 +173,7 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		case .Min_Axis:
 			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Min)
 		case .Transpose, .Slice, .Reshape:
-			if copies_to_parent[0] {
+			if writes_parent[0] {
 				err = _copy_gradient(scratch[a].data, scratch[node_id].data)
 			} else {
 				err = _backward_view(&scratch[a], scratch[node_id], node.operation, node.axis, node.start, node.step)
@@ -177,7 +181,7 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		case .Im2col:
 			err = _backward_im2col(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width, node.step, node.padding)
 		case .Batch_Norm:
-			err = _backward_batch_norm(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.saved, tape.allocator)
+			err = _backward_batch_norm(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, tape.nodes[c].value, node.saved, node.relu, writes_parent[0], tape.allocator)
 		case .Linear:
 			err = _backward_linear(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
 		case .Max_Pool2D:
@@ -644,8 +648,11 @@ _add_into :: proc(target, source: []$T) {
 // is Σ g·x̂ over the rows and x's is
 // scale / deviation · (g - Σg/N - x̂ · Σ g·x̂ / N), the usual closed form, which
 // includes the statistics' dependence on x. Both sums are pairwise column
-// sums; the second pass is split between threads by rows.
-_backward_batch_norm :: proc(grad_x, grad_scale, grad_shift: ^Tensor($T), upstream: Tensor(T), x, scale: Tensor_View(T), saved: Tensor(T), allocator: mem.Allocator) -> (err: Tensor_Error) where intrinsics.type_is_float(T) {
+// sums; the second pass is split between threads by rows, and with store_x
+// writes x's gradient instead of adding to it. When the node applied relu, g
+// is first multiplied by ReLU's derivative at x̂ · scale + shift, recomputed
+// exactly as the forward pass computed it, as tape_relu's backward pass would.
+_backward_batch_norm :: proc(grad_x, grad_scale, grad_shift: ^Tensor($T), upstream: Tensor(T), x, scale, shift: Tensor_View(T), saved: Tensor(T), relu, store_x: bool, allocator: mem.Allocator) -> (err: Tensor_Error) where intrinsics.type_is_float(T) {
 	features := len(saved.data) / 2
 	if features == 0 || len(upstream.data) % features != 0 {
 		return .Shape_Mismatch
@@ -658,14 +665,24 @@ _backward_batch_norm :: proc(grad_x, grad_scale, grad_shift: ^Tensor($T), upstre
 		contiguous = copy_view(source, allocator) or_return
 		source = as_view(contiguous)
 	}
-	// sums holds Σg and Σ g·x̂ per feature, then the means, deviations and
-	// scales the second pass reads.
-	sums := new_tensor(T, []int{5, features}, allocator) or_return
+	// sums holds Σg and Σ g·x̂ per feature, then the means, deviations,
+	// scales and shifts both passes read.
+	sums := new_tensor(T, []int{6, features}, allocator) or_return
 	defer release(&sums)
 	upstream_sums, product_sums := sums.data[:features], sums.data[features:2*features]
-	means, deviations := saved.data[:features], saved.data[features:]
-	_column_sums(upstream_sums, upstream.data, 0, rows, features, nil, nil, nil, .Value)
-	_column_sums(product_sums, upstream.data, 0, rows, features, means, deviations, source.data[source.offset:], .Normalized_Product)
+	means, deviations := sums.data[2*features:3*features], sums.data[3*features:4*features]
+	scales, shifts := sums.data[4*features:5*features], sums.data[5*features:]
+	copy(sums.data[2*features:4*features], saved.data)
+	for f in 0..<features {
+		scales[f] = scale.data[scale.offset + f*scale.strides[0]]
+		shifts[f] = shift.data[shift.offset + f*shift.strides[0]]
+	}
+	// One pass gives both sums, each as its own pairwise sum.
+	if relu {
+		_column_sums(upstream_sums, upstream.data, 0, rows, features, means, deviations, source.data[source.offset:], .Masked_Gradient_Sums, second_sums = product_sums, scale = scales, shift = shifts)
+	} else {
+		_column_sums(upstream_sums, upstream.data, 0, rows, features, means, deviations, source.data[source.offset:], .Gradient_Sums, second_sums = product_sums)
+	}
 	if grad_scale.data != nil {
 		for f in 0..<features {
 			grad_scale.data[f] += product_sums[f]
@@ -679,32 +696,59 @@ _backward_batch_norm :: proc(grad_x, grad_scale, grad_shift: ^Tensor($T), upstre
 	if grad_x.data == nil {
 		return .None
 	}
-	copy(sums.data[2*features:4*features], saved.data)
-	for f in 0..<features {
-		sums.data[4*features + f] = scale.data[scale.offset + f*scale.strides[0]]
-	}
 	Job :: struct {
 		gradient, upstream, x, sums: []T,
 		rows, features:              int,
+		relu, store:                 bool,
 	}
-	job := Job{grad_x.data, upstream.data, source.data[source.offset:], sums.data, rows, features}
+	job := Job{grad_x.data, upstream.data, source.data[source.offset:], sums.data, rows, features, relu, store_x}
 	_parallel_ranges(rows, 1, proc(data: rawptr, first, last: int) {
 		job := (^Job)(data)
 		features := job.features
-		count := T(job.rows)
-		upstream_sums, product_sums := job.sums[:features], job.sums[features:2*features]
-		means, deviations, scales := job.sums[2*features:3*features], job.sums[3*features:4*features], job.sums[4*features:]
 		for row in first..<last {
 			gradient := job.gradient[row*features:][:features]
 			upstream := job.upstream[row*features:][:features]
 			x := job.x[row*features:][:features]
-			for f in 0..<features {
-				normalized := (x[f] - means[f]) / deviations[f]
-				gradient[f] += scales[f] / deviations[f] * (upstream[f] - upstream_sums[f]/count - normalized*product_sums[f]/count)
+			switch {
+			case !job.relu && job.store:
+				_batch_norm_gradient_row(gradient, upstream, x, job.sums, job.rows, false, true)
+			case !job.relu:
+				_batch_norm_gradient_row(gradient, upstream, x, job.sums, job.rows, false, false)
+			case job.store:
+				_batch_norm_gradient_row(gradient, upstream, x, job.sums, job.rows, true, true)
+			case:
+				_batch_norm_gradient_row(gradient, upstream, x, job.sums, job.rows, true, false)
 			}
 		}
 	}, &job, 2*features)
 	return .None
+}
+
+// _batch_norm_gradient_row computes one row of x's gradient for
+// _backward_batch_norm from sums, laid out as there. With RELU the upstream
+// value is first multiplied by ReLU's derivative at the forward pass's
+// pre-activation value, x̂ · scale + shift, computed by the same operations.
+// It writes the gradient with STORE and adds it otherwise.
+_batch_norm_gradient_row :: #force_inline proc(gradient, upstream, x, sums: []$T, rows: int, $RELU, $STORE: bool) #no_bounds_check {
+	features := len(gradient)
+	count := T(rows)
+	upstream_sums, product_sums := sums[:features], sums[features:2*features]
+	means, deviations := sums[2*features:3*features], sums[3*features:4*features]
+	scales, shifts := sums[4*features:5*features], sums[5*features:]
+	_ = shifts
+	for f in 0..<features {
+		g := upstream[f]
+		normalized := (x[f] - means[f]) / deviations[f]
+		when RELU {
+			g *= _relu_derivative(normalized * scales[f] + shifts[f])
+		}
+		value := scales[f] / deviations[f] * (g - upstream_sums[f]/count - normalized*product_sums[f]/count)
+		when STORE {
+			gradient[f] = value
+		} else {
+			gradient[f] += value
+		}
+	}
 }
 
 // _backward_linear adds linear's gradients: upstream @ weightsᵀ to x's,

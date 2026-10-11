@@ -199,10 +199,12 @@ tape_im2col :: proc(tape: ^Tape($T), x: Tape_Value(T), kernel_height, kernel_wid
 // gradient flows through the statistics, as for PyTorch's batch_norm in
 // training mode. One fused node replaces the dozen element-wise operations
 // and reductions this would otherwise take, and its backward pass is two
-// passes over the gradient. An x of rank zero, a scale or shift that is not
-// [features], or a mean or variance of another length returns Shape_Mismatch,
-// and an x with no elements returns Empty_Reduction.
-tape_batch_norm :: proc(tape: ^Tape($T), x, scale, shift: Tape_Value(T), epsilon: T, mean: []T = nil, variance: []T = nil) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+// passes over the gradient. With relu, the node also applies ReLU to its
+// result, with exactly tape_relu's values and gradients, saving that node's
+// pass over the output in each direction. An x of rank zero, a scale or shift
+// that is not [features], or a mean or variance of another length returns
+// Shape_Mismatch, and an x with no elements returns Empty_Reduction.
+tape_batch_norm :: proc(tape: ^Tape($T), x, scale, shift: Tape_Value(T), epsilon: T, mean: []T = nil, variance: []T = nil, relu := false) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
 	x_node, scale_node, shift_node := _tape_node(tape, x), _tape_node(tape, scale), _tape_node(tape, shift)
 	if x_node == nil || scale_node == nil || shift_node == nil {
 		return result, .Invalid_Tape
@@ -256,7 +258,7 @@ tape_batch_norm :: proc(tape: ^Tape($T), x, scale, shift: Tape_Value(T), epsilon
 
 	output := _new_tensor(T, x_value.shape, false, tape.allocator) or_return
 	defer release(&output)
-	_batch_norm_rows(output.data, source.data[source.offset:], stats.data, rows, features)
+	_batch_norm_rows(output.data, source.data[source.offset:], stats.data, rows, features, relu)
 	saved := new_tensor(T, []int{2, features}, tape.allocator) or_return
 	copy(saved.data, stats.data[:2*features])
 	result, err = _tape_take_output(tape, &output, _Tape_Node(T){
@@ -267,6 +269,7 @@ tape_batch_norm :: proc(tape: ^Tape($T), x, scale, shift: Tape_Value(T), epsilon
 		parent_c      = shift.id,
 		parent_count  = 3,
 		saved         = saved,
+		relu          = relu,
 	})
 	if err != .None {
 		release(&saved)
@@ -279,15 +282,17 @@ _is_feature_vector :: proc(value: Tensor_View($T), features: int) -> bool {
 	return len(value.shape) == 1 && value.shape[0] == features
 }
 
-// _batch_norm_rows writes (x - mean) / deviation * scale + shift for each of
-// rows contiguous rows of features, split between threads. stats holds the
-// means, deviations, scales and shifts, features each.
-_batch_norm_rows :: proc(output, x, stats: []$T, rows, features: int) {
+// _batch_norm_rows writes (x - mean) / deviation * scale + shift, or its
+// ReLU with relu, for each of rows contiguous rows of features, split between
+// threads. stats holds the means, deviations, scales and shifts, features
+// each.
+_batch_norm_rows :: proc(output, x, stats: []$T, rows, features: int, relu: bool) {
 	Job :: struct {
 		output, x, stats: []T,
 		features:         int,
+		relu:             bool,
 	}
-	job := Job{output, x, stats, features}
+	job := Job{output, x, stats, features, relu}
 	_parallel_ranges(rows, 1, proc(data: rawptr, first, last: int) {
 		job := (^Job)(data)
 		features := job.features
@@ -298,6 +303,11 @@ _batch_norm_rows :: proc(output, x, stats: []$T, rows, features: int) {
 			output := job.output[row*features:][:features]
 			for f in 0..<features {
 				output[f] = (x[f] - means[f]) / deviations[f] * scales[f] + shifts[f]
+			}
+			if job.relu {
+				for &value in output {
+					value = value if value > 0 else 0
+				}
 			}
 		}
 	}, &job, features)
