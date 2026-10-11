@@ -3,7 +3,6 @@ package tensor
 // Vector/matrix dot products, matrix multiplication, and scaled updates.
 
 import "base:intrinsics"
-import "core:sys/info"
 
 // _validate_dot_view accepts rank-one and rank-two views whose addressed
 // elements all lie within their backing data.
@@ -65,10 +64,42 @@ _PRODUCT_COLUMN_ROWS :: 8
 // _product_kernel_serial computes output = a @ b, or output += a @ b when
 // accumulate is set, on the calling thread, treating a vector a as a row and a
 // vector b as a column. _product_kernel, in tensor_threads.odin, is the entry
-// point that may split it across threads. Each output element adds its k
-// products in order, one multiply and one add at a time, on every path, so
-// neither the path nor the blocking changes the result.
-_product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) #no_bounds_check {
+// point that may split it across threads. It runs one of several compiled
+// copies of the same paths: on x86, one for AVX with FMA, one for AVX alone,
+// and one for SSE; elsewhere one, with 16-byte vectors, which NEON fuses. Each
+// output element adds its k products in order, on every path, so for a given
+// CPU neither the path nor the blocking changes the result. Float products are
+// fused multiply-adds where _product_fused reports it, and otherwise a
+// multiply then an add.
+_product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) {
+	when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
+		avx, fma := _product_instructions()
+		if fma {
+			_product_kernel_fma(output, a, b, accumulate)
+			return
+		}
+		if avx {
+			_product_kernel_avx(output, a, b, accumulate)
+			return
+		}
+	}
+	#force_inline _product_paths(output, a, b, accumulate, _PRODUCT_FUSED_WITHOUT_AVX, 16)
+}
+
+// _PRODUCT_FUSED_WITHOUT_AVX is whether the copy built without x86 features
+// fuses: on ARM64 every CPU has fused multiply-adds.
+_PRODUCT_FUSED_WITHOUT_AVX :: ODIN_ARCH == .arm64
+
+// _product_fused reports whether float products fuse each multiply-add on this
+// CPU.
+_product_fused :: proc() -> bool {
+	avx, fma := _product_instructions()
+	return fma if avx else _PRODUCT_FUSED_WITHOUT_AVX
+}
+
+// _product_paths picks the path for _product_kernel_serial, with FUSED
+// choosing fused multiply-adds and VECTOR_BYTES the packed tile's vector size.
+_product_paths :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, $FUSED: bool, $VECTOR_BYTES: int) #no_bounds_check {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
 	k := a.shape[a_rank-1]
@@ -78,7 +109,7 @@ _product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate :=
 	b_contiguous := b_rank == 1 || b.strides[1] == 1
 	min_rows := _PRODUCT_TILE_ROWS if b_contiguous else 2
 	if m >= min_rows && k >= _PRODUCT_MIN_BLOCKED_DEPTH && n >= _PRODUCT_MIN_TILE_COLUMNS {
-		_product_packed(output, a, b, accumulate)
+		#force_inline _product_packed(output, a, b, accumulate, FUSED, 2, max(1, VECTOR_BYTES/size_of(T)))
 		return
 	}
 	if !accumulate {
@@ -87,41 +118,29 @@ _product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate :=
 		}
 	}
 	if m >= _PRODUCT_COLUMN_ROWS && k >= _PRODUCT_MIN_BLOCKED_DEPTH && n < _PRODUCT_MIN_TILE_COLUMNS {
-		_product_columns(output, a, b)
+		#force_inline _product_columns(output, a, b, FUSED)
 		return
 	}
-	#force_inline _product_strip(output, a, b, 0, k, 0, n)
+	#force_inline _product_strip(output, a, b, FUSED)
+}
+
+// _multiply_add returns sum + x*y, as one fused operation when FUSED is set
+// and the elements are floats.
+_multiply_add :: #force_inline proc "contextless" (x, y, sum: $V, $FUSED: bool) -> V {
+	when FUSED && intrinsics.type_is_float(intrinsics.type_elem_type(V)) {
+		return intrinsics.fused_mul_add(x, y, sum)
+	} else {
+		return sum + x*y
+	}
 }
 
 // _product_packed computes output = a @ b, or output += a @ b when accumulate
-// is set, with the packed path. Without accumulate, the first k block's tiles
-// start from zero rather than reading output, which saves a pass over it. On x86 CPUs
-// with AVX it runs a copy compiled for AVX, whose tile is 64 bytes of columns
-// by _PRODUCT_TILE_ROWS rows in 32-byte vectors; elsewhere the tile's vectors
-// are 16 bytes, which SSE and NEON provide. Both multiply and then add, without
-// fusing, so they give the same results.
-_product_packed :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool) {
-	when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
-		if .avx in info.cpu_features() {
-			_product_packed_avx(output, a, b, accumulate)
-			return
-		}
-	}
-	#force_inline _product_packed_vectors(output, a, b, accumulate, 2, max(1, 16/size_of(T)))
-}
-
-when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
-	@(enable_target_feature = "avx")
-	_product_packed_avx :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool) {
-		#force_inline _product_packed_vectors(output, a, b, accumulate, 2, max(1, 32/size_of(T)))
-	}
-}
-
-// _product_packed_vectors is _product_packed with a tile VECTORS vectors of
-// LANES elements wide. a_pack holds row panel t's column p at
-// a_pack[(t*depth + p)*ROWS:][:ROWS], and b_vectors column panel t's row p at
-// b_vectors[(t*depth + p)*VECTORS:][:VECTORS].
-_product_packed_vectors :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, $VECTORS, $LANES: int) #no_bounds_check {
+// is set, with the packed path, in a tile VECTORS vectors of LANES elements
+// wide. Without accumulate, the first k block's tiles start from zero rather
+// than reading output, which saves a pass over it. a_pack holds row panel t's
+// column p at a_pack[(t*depth + p)*ROWS:][:ROWS], and b_vectors column panel
+// t's row p at b_vectors[(t*depth + p)*VECTORS:][:VECTORS].
+_product_packed :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, $FUSED: bool, $VECTORS, $LANES: int) #no_bounds_check {
 	Vector :: #simd[LANES]T
 	ROWS :: _PRODUCT_TILE_ROWS
 	COLUMNS :: VECTORS * LANES
@@ -163,7 +182,7 @@ _product_packed_vectors :: #force_inline proc(output: []$T, a, b: Tensor_View(T)
 						a_panel := ([^]T)(&a_pack[row_panel*depth*ROWS])
 						first := (i0 + row_panel*ROWS)*n + j0 + column_panel*COLUMNS
 						if height == ROWS && width == COLUMNS {
-							_product_tile(ROWS, VECTORS, Vector, ([^]T)(&output[first]), n, a_panel, b_panel, depth, load)
+							_product_tile(ROWS, VECTORS, Vector, FUSED, ([^]T)(&output[first]), n, a_panel, b_panel, depth, load)
 							continue
 						}
 						edge: [ROWS*COLUMNS]T
@@ -172,7 +191,7 @@ _product_packed_vectors :: #force_inline proc(output: []$T, a, b: Tensor_View(T)
 								edge[r*COLUMNS + j] = output[first + r*n + j] if load else 0
 							}
 						}
-						_product_tile(ROWS, VECTORS, Vector, ([^]T)(&edge[0]), COLUMNS, a_panel, b_panel, depth, true)
+						_product_tile(ROWS, VECTORS, Vector, FUSED, ([^]T)(&edge[0]), COLUMNS, a_panel, b_panel, depth, true)
 						for r in 0..<height {
 							for j in 0..<width {
 								output[first + r*n + j] = edge[r*COLUMNS + j]
@@ -244,7 +263,7 @@ _pack_panels :: #force_inline proc(pack: [^]$T, source: Tensor_View(T), depth_st
 // once, each in its own local, so their additions overlap instead of waiting
 // on one another as the i-k-j loop's do, and each output element still adds
 // its k products in order.
-_product_columns :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
+_product_columns :: #force_inline proc(output: []$T, a, b: Tensor_View(T), $FUSED: bool) #no_bounds_check {
 	ROWS :: _PRODUCT_COLUMN_ROWS
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
@@ -266,7 +285,7 @@ _product_columns :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 			for p in 0..<k {
 				scale := b.data[b_offset + p*b_row_stride]
 				for r in 0..<ROWS {
-					sums[r] += a.data[a_offset + r*a_row_stride + p*a_inner_stride] * scale
+					sums[r] = _multiply_add(a.data[a_offset + r*a_row_stride + p*a_inner_stride], scale, sums[r], FUSED)
 				}
 			}
 			for r in 0..<ROWS {
@@ -277,7 +296,7 @@ _product_columns :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 			sum := output[i*n + j]
 			a_offset := a.offset + i*a_row_stride
 			for p in 0..<k {
-				sum += a.data[a_offset + p*a_inner_stride] * b.data[b_offset + p*b_row_stride]
+				sum = _multiply_add(a.data[a_offset + p*a_inner_stride], b.data[b_offset + p*b_row_stride], sum, FUSED)
 			}
 			output[i*n + j] = sum
 		}
@@ -288,7 +307,7 @@ _product_columns :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 // deep, into the matching output tile, whose first element is output[0] and
 // whose rows are row_length apart, or stores it there when load is false. The
 // tile is accumulated in locals so the compiler can keep it in registers.
-_product_tile :: #force_inline proc($ROWS, $VECTORS: int, $Vector: typeid/#simd[$LANES]$T, output: [^]T, row_length: int, a_panel: [^]T, b_panel: [^]Vector, depth: int, load: bool) #no_bounds_check {
+_product_tile :: #force_inline proc($ROWS, $VECTORS: int, $Vector: typeid/#simd[$LANES]$T, $FUSED: bool, output: [^]T, row_length: int, a_panel: [^]T, b_panel: [^]Vector, depth: int, load: bool) #no_bounds_check {
 	tile: [ROWS][VECTORS]Vector
 	if load {
 		for r in 0..<ROWS {
@@ -301,7 +320,7 @@ _product_tile :: #force_inline proc($ROWS, $VECTORS: int, $Vector: typeid/#simd[
 		for r in 0..<ROWS {
 			scale := Vector(a_panel[p*ROWS + r])
 			for v in 0..<VECTORS {
-				tile[r][v] += scale * b_panel[p*VECTORS + v]
+				tile[r][v] = _multiply_add(scale, b_panel[p*VECTORS + v], tile[r][v], FUSED)
 			}
 		}
 	}
@@ -312,11 +331,9 @@ _product_tile :: #force_inline proc($ROWS, $VECTORS: int, $Vector: typeid/#simd[
 	}
 }
 
-// _product_strip adds a[:, k0..<k1] @ b[k0..<k1, j0..<j1] into the matching
-// columns of output. The i-k-j order makes the inner loop walk one row of
-// output and one row of b with fixed steps. Bounds checks stay on: narrow
-// products measured about 10% slower without them.
-_product_strip :: proc(output: []$T, a, b: Tensor_View(T), k0, k1, j0, j1: int) {
+// _product_strip adds a @ b into output. The i-k-j order makes the inner loop
+// walk one row of output and one row of b with fixed steps.
+_product_strip :: #force_inline proc(output: []$T, a, b: Tensor_View(T), $FUSED: bool) #no_bounds_check {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
 	n := b.shape[1] if b_rank == 2 else 1
@@ -324,22 +341,22 @@ _product_strip :: proc(output: []$T, a, b: Tensor_View(T), k0, k1, j0, j1: int) 
 	a_inner_stride := a.strides[a_rank-1]
 	b_row_stride := b.strides[0]
 	b_column_stride := b.strides[1] if b_rank == 2 else 0
-	width := j1 - j0
+	k := a.shape[a_rank-1]
 	for i in 0..<m {
-		output_row := output[i*n + j0:][:width]
-		for inner in k0..<k1 {
+		output_row := output[i*n:][:n]
+		for inner in 0..<k {
 			scale := a.data[a.offset + i*a_row_stride + inner*a_inner_stride]
-			b_offset := b.offset + inner*b_row_stride + j0*b_column_stride
+			b_offset := b.offset + inner*b_row_stride
 			if b_column_stride == 1 {
 				// Contiguous rows of b: a slice loop the compiler can vectorize.
-				b_row := b.data[b_offset:][:width]
-				for j in 0..<width {
-					output_row[j] += scale * b_row[j]
+				b_row := b.data[b_offset:][:n]
+				for j in 0..<n {
+					output_row[j] = _multiply_add(scale, b_row[j], output_row[j], FUSED)
 				}
 				continue
 			}
-			for j in 0..<width {
-				output_row[j] += scale * b.data[b_offset]
+			for j in 0..<n {
+				output_row[j] = _multiply_add(scale, b.data[b_offset], output_row[j], FUSED)
 				b_offset += b_column_stride
 			}
 		}

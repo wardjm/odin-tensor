@@ -1140,7 +1140,7 @@ expect_matmul_backward_matches_naive :: proc(t: ^testing.T, M, K, N: int, loc :=
 			sum: f64 = 0
 			for batch in 0..<BATCHES {
 				for j in 0..<N {
-					sum += seed.data[(batch*M + i)*N + j] * b.data[(batch*K + p)*N + j]
+					sum = naive_multiply_add(seed.data[(batch*M + i)*N + j], b.data[(batch*K + p)*N + j], sum, _product_fused())
 				}
 			}
 			expected_a[p*M + i] = sum
@@ -1153,7 +1153,7 @@ expect_matmul_backward_matches_naive :: proc(t: ^testing.T, M, K, N: int, loc :=
 			for j in 0..<N {
 				sum: f64 = 0
 				for i in 0..<M {
-					sum += a.data[p*M + i] * seed.data[(batch*M + i)*N + j]
+					sum = naive_multiply_add(a.data[p*M + i], seed.data[(batch*M + i)*N + j], sum, _product_fused())
 				}
 				expected_b[(batch*K + p)*N + j] = sum
 			}

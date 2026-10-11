@@ -1023,15 +1023,26 @@ fill_product_operand :: proc(data: []$T, seed: int) {
 	}
 }
 
+// naive_multiply_add returns sum + x*y, fused when fused is set and the values
+// are floats, as the product kernels compute it.
+naive_multiply_add :: proc(x, y, sum: $T, fused: bool) -> T {
+	when intrinsics.type_is_float(T) {
+		if fused {
+			return intrinsics.fused_mul_add(x, y, sum)
+		}
+	}
+	return sum + x*y
+}
+
 // naive_product_element sums a[i, :] * b[:, j] from zero in index order, the
 // order matmul keeps, treating a rank-one a as a row and a rank-one b as a
-// column.
-naive_product_element :: proc(a, b: Tensor_View($T), i, j: int) -> (sum: T) {
+// column. It fuses each multiply-add when fused is set.
+naive_product_element :: proc(a, b: Tensor_View($T), i, j: int, fused: bool) -> (sum: T) {
 	a_row_stride := a.strides[0] if len(a.shape) == 2 else 0
 	a_inner_stride := a.strides[len(a.shape)-1]
 	b_column_stride := b.strides[1] if len(b.shape) == 2 else 0
 	for p in 0..<a.shape[len(a.shape)-1] {
-		sum += a.data[a.offset + i*a_row_stride + p*a_inner_stride] * b.data[b.offset + p*b.strides[0] + j*b_column_stride]
+		sum = naive_multiply_add(a.data[a.offset + i*a_row_stride + p*a_inner_stride], b.data[b.offset + p*b.strides[0] + j*b_column_stride], sum, fused)
 	}
 	return
 }
@@ -1040,18 +1051,24 @@ naive_product_element :: proc(a, b: Tensor_View($T), i, j: int) -> (sum: T) {
 // with naive_product_element. The comparison is exact, so a kernel that adds
 // float products in another order fails it.
 expect_product_matches_naive :: proc(t: ^testing.T, output: []$T, a, b: Tensor_View(T), loc := #caller_location) {
+	expect_product_matches_naive_fused(t, output, a, b, _product_fused(), loc)
+}
+
+// expect_product_matches_naive_fused is expect_product_matches_naive with the
+// naive product fused or not as given, rather than as this CPU's kernels are.
+expect_product_matches_naive_fused :: proc(t: ^testing.T, output: []$T, a, b: Tensor_View(T), fused: bool, loc := #caller_location) {
 	m := a.shape[0] if len(a.shape) == 2 else 1
 	n := b.shape[1] if len(b.shape) == 2 else 1
 	k := a.shape[len(a.shape)-1]
 	mismatches := 0
 	for i in 0..<m {
 		for j in 0..<n {
-			if output[i*n + j] != naive_product_element(a, b, i, j) {
+			if output[i*n + j] != naive_product_element(a, b, i, j, fused) {
 				mismatches += 1
 			}
 		}
 	}
-	testing.expectf(t, mismatches == 0, "%v %v @ %v (k=%d, a strides %v, b strides %v): %d elements differ from the naive product", typeid_of(T), a.shape, b.shape, k, a.strides, b.strides, mismatches, loc = loc)
+	testing.expectf(t, mismatches == 0, "%v %v @ %v (k=%d, a strides %v, b strides %v, fused %v): %d elements differ from the naive product", typeid_of(T), a.shape, b.shape, k, a.strides, b.strides, fused, mismatches, loc = loc)
 }
 
 // expect_matmul_matches_naive multiplies an m×k by a k×n matrix and compares
@@ -1166,10 +1183,12 @@ test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
 	expect_vector_products_match_naive(t, f64, 257, 8)
 }
 
-// expect_packed_fallback_matches_naive runs the packed path with 16-byte
-// vectors, which _product_packed only picks on CPUs without AVX, on an m×k by
-// k×n product and compares it exactly with the naive product.
-expect_packed_fallback_matches_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: int, transpose_a: bool, loc := #caller_location) {
+// expect_product_copies_match_naive runs an m×k by k×n product through each
+// compiled copy of the product paths this CPU can run, whichever one
+// _product_kernel_serial would pick: 16-byte vectors fused and unfused, and on
+// x86 the AVX copies, and compares each exactly with the matching naive
+// product.
+expect_product_copies_match_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: int, transpose_a: bool, loc := #caller_location) {
 	a_storage, err := new_tensor(T, []int{k, m} if transpose_a else []int{m, k})
 	require_ok(t, err, loc)
 	defer release(&a_storage)
@@ -1189,16 +1208,33 @@ expect_packed_fallback_matches_naive :: proc(t: ^testing.T, $T: typeid, m, k, n:
 	product, err = new_tensor(T, []int{m, n})
 	require_ok(t, err, loc)
 	defer release(&product)
-	_product_packed_vectors(product.data, a, as_view(b), false, 2, max(1, 16/size_of(T)))
-	expect_product_matches_naive(t, product.data, a, as_view(b), loc = loc)
+	_product_paths(product.data, a, as_view(b), false, false, 16)
+	expect_product_matches_naive_fused(t, product.data, a, as_view(b), false, loc)
+	_product_paths(product.data, a, as_view(b), false, true, 16)
+	expect_product_matches_naive_fused(t, product.data, a, as_view(b), true, loc)
+	when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
+		avx, fma := _product_instructions()
+		if avx {
+			_product_kernel_avx(product.data, a, as_view(b), false)
+			expect_product_matches_naive_fused(t, product.data, a, as_view(b), false, loc)
+		}
+		if fma {
+			_product_kernel_fma(product.data, a, as_view(b), false)
+			expect_product_matches_naive_fused(t, product.data, a, as_view(b), true, loc)
+		}
+	}
 }
 
 @(test)
-test_packed_fallback_matches_naive_product :: proc(t: ^testing.T) {
-	expect_packed_fallback_matches_naive(t, f32, 131, 270, 150, false)
-	expect_packed_fallback_matches_naive(t, f32, 37, 300, 13, true)
-	expect_packed_fallback_matches_naive(t, f64, 67, 260, 70, true)
-	expect_packed_fallback_matches_naive(t, i32, 13, 20, 9, false)
+test_product_copies_match_naive_product :: proc(t: ^testing.T) {
+	// Packed, with partial blocks and panels.
+	expect_product_copies_match_naive(t, f32, 131, 270, 150, false)
+	expect_product_copies_match_naive(t, f32, 37, 300, 13, true)
+	expect_product_copies_match_naive(t, f64, 67, 260, 70, true)
+	expect_product_copies_match_naive(t, i32, 13, 20, 9, false)
+	// The narrow column path and the unpacked loop.
+	expect_product_copies_match_naive(t, f32, 19, 300, 2, true)
+	expect_product_copies_match_naive(t, f64, 3, 300, 37, false)
 }
 
 @(test)
