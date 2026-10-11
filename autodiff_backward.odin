@@ -629,9 +629,10 @@ _binary_vjp :: #force_inline proc(upstream, a, b: $T, $operation: Tape_Operation
 }
 
 // _backward_binary_kernel is specialized per operation at compile time. It
-// finds storage offsets and gradient indices once per row of the output and
-// steps along it; a parent broadcast along the last axis steps by zero, so its
-// contributions sum in place. grad_a or grad_b is nil when not tracked.
+// walks the rows of the output, moving each parent's storage offset and
+// gradient index from one row to the next, and steps along each row; a parent
+// broadcast along the last axis steps by zero, so its contributions sum in
+// place. grad_a or grad_b is nil when not tracked.
 _backward_binary_kernel :: proc(grad_a, grad_b: []$T, output_grad: Tensor(T), a, b: Tensor_View(T), $operation: Tape_Operation) -> Tensor_Error {
 	if a_period, b_period, ok := _repeating_operands(a, b, output_grad.shape); ok {
 		_backward_binary_repeating(grad_a, grad_b, output_grad.data, a, b, a_period, b_period, operation)
@@ -643,13 +644,24 @@ _backward_binary_kernel :: proc(grad_a, grad_b: []$T, output_grad: Tensor(T), a,
 	b_step := _inner_step(b, shape)
 	a_grad_step := _gradient_inner_step(a.shape)
 	b_grad_step := _gradient_inner_step(b.shape)
+	a_walk := _broadcast_walk(a, shape)
+	b_walk := _broadcast_walk(b, shape)
+	counter: [MAX_RANK]int
 	for start := 0; start < len(output_grad.data); start += row {
-		a_offset := _broadcast_offset(a, shape, start)
-		b_offset := _broadcast_offset(b, shape, start)
-		a_grad_index, a_grad_ok := _broadcast_gradient_index(a.shape, shape, start)
-		b_grad_index, b_grad_ok := _broadcast_gradient_index(b.shape, shape, start)
-		if !a_grad_ok || !b_grad_ok {
-			return .Invalid_Shape
+		a_offset, b_offset := a_walk.offset, b_walk.offset
+		a_grad_index, b_grad_index := a_walk.gradient, b_walk.gradient
+		// Advance to the next row: the last axis but one counts up, carrying
+		// into earlier axes as each wraps around.
+		for axis := len(shape)-2; axis >= 0; axis -= 1 {
+			counter[axis] += 1
+			_broadcast_walk_move(&a_walk, axis, 1)
+			_broadcast_walk_move(&b_walk, axis, 1)
+			if counter[axis] < shape[axis] {
+				break
+			}
+			counter[axis] = 0
+			_broadcast_walk_move(&a_walk, axis, -shape[axis])
+			_broadcast_walk_move(&b_walk, axis, -shape[axis])
 		}
 		for i in start..<start+row {
 			contribution_a, contribution_b := _binary_vjp(output_grad.data[i], a.data[a_offset], b.data[b_offset], operation)
@@ -666,6 +678,35 @@ _backward_binary_kernel :: proc(grad_a, grad_b: []$T, output_grad: Tensor(T), a,
 		}
 	}
 	return .None
+}
+
+// _Broadcast_Walk tracks where one row of a broadcast result starts in an
+// operand's storage and in the operand's contiguous gradient. steps hold how
+// far each moves per step along each result axis: zero along axes the operand
+// is broadcast along or lacks.
+_Broadcast_Walk :: struct {
+	offset, gradient:             int,
+	offset_steps, gradient_steps: [MAX_RANK]int,
+}
+
+// _broadcast_walk starts a walk of view at the first element of result_shape.
+_broadcast_walk :: proc(view: Tensor_View($T), result_shape: []int) -> (walk: _Broadcast_Walk) {
+	walk.offset = view.offset
+	leading := len(result_shape) - len(view.shape)
+	gradient_stride := 1
+	for axis := len(view.shape)-1; axis >= 0; axis -= 1 {
+		if view.shape[axis] != 1 {
+			walk.offset_steps[leading+axis] = view.strides[axis]
+			walk.gradient_steps[leading+axis] = gradient_stride
+		}
+		gradient_stride *= view.shape[axis]
+	}
+	return walk
+}
+
+_broadcast_walk_move :: #force_inline proc(walk: ^_Broadcast_Walk, axis, count: int) {
+	walk.offset += count * walk.offset_steps[axis]
+	walk.gradient += count * walk.gradient_steps[axis]
 }
 
 // _gradient_inner_step is the step between consecutive output elements along

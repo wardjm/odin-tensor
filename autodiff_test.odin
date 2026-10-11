@@ -1082,26 +1082,36 @@ test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) 
 // The other matmul backward tests are too small for the product kernel to
 // block. Here a transposed [9,70] a broadcasts against a [2,70,10] b, so both
 // gradient products hit the register tiles and both tails, k spans two strided
-// blocks, and the second batch accumulates onto the first's gradient.
+// blocks, and the second batch accumulates onto the first's gradient. With 3
+// columns in a, a's gradient product is too narrow for a column tile, and with
+// 1 column in b, so is b's; both then take the narrow column path.
 @(test)
 test_tape_blocked_matmul_backward_matches_naive :: proc(t: ^testing.T) {
-	M, K, N, BATCHES :: 9, 70, 10, 2
+	expect_matmul_backward_matches_naive(t, 9, 70, 10)
+	expect_matmul_backward_matches_naive(t, 9, 3, 12)
+	expect_matmul_backward_matches_naive(t, 9, 70, 1)
+}
+
+// expect_matmul_backward_matches_naive records a transposed [M,K] a times a
+// [2,K,N] b and compares both gradients exactly with naive sums.
+expect_matmul_backward_matches_naive :: proc(t: ^testing.T, M, K, N: int, loc := #caller_location) {
+	BATCHES :: 2
 	a, err := new_tensor(f64, []int{K, M})
-	require_ok(t, err)
+	require_ok(t, err, loc)
 	defer release(&a)
 	for &value, i in a.data {
 		value = math.sin(0.37*f64(i))
 	}
 	b: Tensor(f64)
 	b, err = new_tensor(f64, []int{BATCHES, K, N})
-	require_ok(t, err)
+	require_ok(t, err, loc)
 	defer release(&b)
 	for &value, i in b.data {
 		value = math.cos(0.23*f64(i))
 	}
 	seed: Tensor(f64)
 	seed, err = new_tensor(f64, []int{BATCHES, M, N})
-	require_ok(t, err)
+	require_ok(t, err, loc)
 	defer release(&seed)
 	for &value, i in seed.data {
 		value = 1 + math.sin(f64(i))
@@ -1109,18 +1119,18 @@ test_tape_blocked_matmul_backward_matches_naive :: proc(t: ^testing.T) {
 
 	tape: Tape(f64)
 	tape, err = tape_init(f64)
-	require_ok(t, err)
+	require_ok(t, err, loc)
 	defer tape_release(&tape)
 	av, bv, a_transposed, product: Tape_Value(f64)
 	av, err = tape_add_leaf_borrow(&tape, &a)
-	require_ok(t, err)
+	require_ok(t, err, loc)
 	bv, err = tape_add_leaf_borrow(&tape, &b)
-	require_ok(t, err)
+	require_ok(t, err, loc)
 	a_transposed, err = tape_transpose(&tape, av)
-	require_ok(t, err)
+	require_ok(t, err, loc)
 	product, err = tape_matmul(&tape, a_transposed, bv)
-	require_ok(t, err)
-	testing.expect_value(t, tape_backward_with_seed(&tape, product, seed), Tensor_Error.None)
+	require_ok(t, err, loc)
+	testing.expect_value(t, tape_backward_with_seed(&tape, product, seed), Tensor_Error.None, loc)
 
 	// a's gradient is laid out as a, [K,M]; each element sums over both batches.
 	expected_a := make([]f64, K*M)
@@ -1150,11 +1160,11 @@ test_tape_blocked_matmul_backward_matches_naive :: proc(t: ^testing.T) {
 		}
 	}
 	a_grad, a_grad_err := tape_gradient(&tape, av)
-	require_ok(t, a_grad_err)
-	expect_f64_data(t, a_grad.data, expected_a)
+	require_ok(t, a_grad_err, loc)
+	expect_f64_data(t, a_grad.data, expected_a, loc = loc)
 	b_grad, b_grad_err := tape_gradient(&tape, bv)
-	require_ok(t, b_grad_err)
-	expect_f64_data(t, b_grad.data, expected_b)
+	require_ok(t, b_grad_err, loc)
+	expect_f64_data(t, b_grad.data, expected_b, loc = loc)
 }
 
 @(test)
@@ -2462,5 +2472,62 @@ test_tape_axis_reduction_backward_expands_every_axis :: proc(t: ^testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// Both operands broadcast along interior axes, as when nearest-neighbour
+// upsampling multiplies [n, h, 1, w, 1, c] by [f, 1, f, 1]: each gradient
+// element sums the upstream values of every output it reached, in row-major
+// order.
+@(test)
+test_tape_mul_backward_sums_interior_broadcasts :: proc(t: ^testing.T) {
+	N, H, W, C, F :: 2, 3, 4, 5, 2
+	x, err := new_tensor(f64, []int{N, H, 1, W, 1, C})
+	require_ok(t, err)
+	defer release(&x)
+	for &value, i in x.data {
+		value = math.sin(0.3*f64(i))
+	}
+	y: Tensor(f64)
+	y, err = new_tensor(f64, []int{F, 1, F, 1})
+	require_ok(t, err)
+	defer release(&y)
+	copy(y.data, []f64{0.5, -1.25, 2, 0.75})
+	seed: Tensor(f64)
+	seed, err = new_tensor(f64, []int{N, H, F, W, F, C})
+	require_ok(t, err)
+	defer release(&seed)
+	for &value, i in seed.data {
+		value = math.cos(0.7*f64(i))
+	}
+
+	tape: Tape(f64)
+	tape, err = tape_init(f64)
+	require_ok(t, err)
+	defer tape_release(&tape)
+	xv := tape_add_leaf_borrow(&tape, &x) or_else panic("leaf")
+	yv := tape_add_leaf_borrow(&tape, &y) or_else panic("leaf")
+	product := tape_mul(&tape, xv, yv) or_else panic("mul")
+	require_ok(t, tape_backward_with_seed(&tape, product, seed))
+
+	expected_x := make([]f64, len(x.data))
+	defer delete(expected_x)
+	expected_y := make([]f64, len(y.data))
+	defer delete(expected_y)
+	next := 0
+	for n in 0..<N do for h in 0..<H do for i in 0..<F do for w in 0..<W do for j in 0..<F do for c in 0..<C {
+		x_index := ((n*H + h)*W + w)*C + c
+		y_index := i*F + j
+		expected_x[x_index] += seed.data[next] * y.data[y_index]
+		expected_y[y_index] += seed.data[next] * x.data[x_index]
+		next += 1
+	}
+	x_grad := tape_gradient(&tape, xv) or_else panic("gradient")
+	y_grad := tape_gradient(&tape, yv) or_else panic("gradient")
+	for value, i in x_grad.data {
+		testing.expect_value(t, value, expected_x[i])
+	}
+	for value, i in y_grad.data {
+		testing.expect_value(t, value, expected_y[i])
 	}
 }

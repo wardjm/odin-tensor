@@ -57,6 +57,9 @@ _PRODUCT_BLOCK_DEPTH :: 256
 _PRODUCT_STRIDED_BLOCK_DEPTH :: 64
 _PRODUCT_MIN_BLOCKED_DEPTH :: 8
 _PRODUCT_MIN_TILE_COLUMNS :: 4
+// Products narrower than _PRODUCT_MIN_TILE_COLUMNS, such as a convolution
+// down to one channel, sum _PRODUCT_COLUMN_ROWS rows of each column at once.
+_PRODUCT_COLUMN_ROWS :: 8
 
 // _product_kernel_serial computes output = a @ b, or output += a @ b when
 // accumulate is set, on the calling thread, treating a vector a as a row and a
@@ -78,6 +81,10 @@ _product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate :=
 		for &value in output {
 			value = 0
 		}
+	}
+	if m >= _PRODUCT_COLUMN_ROWS && k >= _PRODUCT_MIN_BLOCKED_DEPTH && n < _PRODUCT_MIN_TILE_COLUMNS {
+		_product_columns(output, a, b)
+		return
 	}
 	if m >= _PRODUCT_TILE_ROWS && k >= _PRODUCT_MIN_BLOCKED_DEPTH {
 		if n >= FULL {
@@ -139,6 +146,51 @@ _product_blocked :: proc(output: []$T, a, b: Tensor_View(T), $TILE_COLUMNS: int)
 		}
 		if full_columns < n {
 			#force_no_inline _product_strip(output, a, b, k0, k0+depth, full_columns, n)
+		}
+	}
+}
+
+// _product_columns adds a @ b into output one column at a time, for products
+// too narrow for a column tile. Each column sums _PRODUCT_COLUMN_ROWS rows at
+// once, each in its own local, so their additions overlap instead of waiting
+// on one another as the i-k-j loop's do, and each output element still adds
+// its k products in order.
+_product_columns :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
+	ROWS :: _PRODUCT_COLUMN_ROWS
+	a_rank, b_rank := len(a.shape), len(b.shape)
+	m := a.shape[0] if a_rank == 2 else 1
+	k := a.shape[a_rank-1]
+	n := b.shape[1] if b_rank == 2 else 1
+	a_row_stride := a.strides[0] if a_rank == 2 else 0
+	a_inner_stride := a.strides[a_rank-1]
+	b_row_stride := b.strides[0]
+	b_column_stride := b.strides[1] if b_rank == 2 else 0
+	full_rows := m - m%ROWS
+	for j in 0..<n {
+		b_offset := b.offset + j*b_column_stride
+		for i0 := 0; i0 < full_rows; i0 += ROWS {
+			sums: [ROWS]T = ---
+			for r in 0..<ROWS {
+				sums[r] = output[(i0+r)*n + j]
+			}
+			a_offset := a.offset + i0*a_row_stride
+			for p in 0..<k {
+				scale := b.data[b_offset + p*b_row_stride]
+				for r in 0..<ROWS {
+					sums[r] += a.data[a_offset + r*a_row_stride + p*a_inner_stride] * scale
+				}
+			}
+			for r in 0..<ROWS {
+				output[(i0+r)*n + j] = sums[r]
+			}
+		}
+		for i in full_rows..<m {
+			sum := output[i*n + j]
+			a_offset := a.offset + i*a_row_stride
+			for p in 0..<k {
+				sum += a.data[a_offset + p*a_inner_stride] * b.data[b_offset + p*b_row_stride]
+			}
+			output[i*n + j] = sum
 		}
 	}
 }

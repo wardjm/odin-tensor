@@ -1144,6 +1144,14 @@ test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
 	expect_matmul_matches_naive(t, f64, 11, 30, 5, false, false)
 	expect_matmul_matches_naive(t, f64, 11, 300, 4, true, false)
 	expect_matmul_matches_naive(t, i8, 5, 12, 20, false, true)
+	// Narrower than a quarter tile, columns are summed 8 rows at a time; 19
+	// and 11 rows leave a remainder.
+	expect_matmul_matches_naive(t, f32, 19, 40, 1, false, false)
+	expect_matmul_matches_naive(t, f32, 19, 300, 2, true, false)
+	expect_matmul_matches_naive(t, f32, 16, 40, 3, false, true)
+	expect_matmul_matches_naive(t, f32, 19, 40, 3, true, true)
+	expect_matmul_matches_naive(t, f64, 11, 300, 2, false, false)
+	expect_matmul_matches_naive(t, i64, 9, 20, 1, true, false)
 	expect_vector_products_match_naive(t, f32, 600, 37)
 	expect_vector_products_match_naive(t, f64, 257, 8)
 }
