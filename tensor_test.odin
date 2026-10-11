@@ -2918,6 +2918,58 @@ test_column_sums_match_pairwise_sums :: proc(t: ^testing.T) {
 	expect_column_sums_match_pairwise(t, f32, 5, 3000, 40)
 }
 
+// expect_split_column_sums_match_pairwise runs _column_sums on a rows x
+// columns matrix with each kind of term, storing and accumulating, and checks
+// each sum exactly against _pairwise_sum_columns over all the rows on one
+// thread.
+expect_split_column_sums_match_pairwise :: proc(t: ^testing.T, $T: typeid, rows, columns: int, loc := #caller_location) {
+	data := make([]T, rows*columns)
+	defer delete(data)
+	other := make([]T, rows*columns)
+	defer delete(other)
+	for i in 0..<len(data) {
+		data[i] = T(math.sin(0.37*f64(i)))
+		other[i] = T(math.cos(0.11*f64(i)))
+	}
+	center := make([]T, columns)
+	defer delete(center)
+	divisor := make([]T, columns)
+	defer delete(divisor)
+	for c in 0..<columns {
+		center[c] = T(0.01*f64(c))
+		divisor[c] = T(1 + 0.1*f64(c))
+	}
+	sums := make([]T, columns)
+	defer delete(sums)
+	check :: proc(t: ^testing.T, sums, data, center, divisor, other: []T, rows, columns: int, $term: _Column_Term, base: T, loc := #caller_location) {
+		mismatches := 0
+		for first := 0; first < columns; first += _PAIRWISE_COLUMNS {
+			width := min(_PAIRWISE_COLUMNS, columns-first)
+			terms := _Column_Terms(T){other = other}
+			copy(terms.center[:width], center[first:][:width])
+			copy(terms.divisor[:width], divisor[first:][:width])
+			expected := _pairwise_sum_columns(data, first, columns, rows, width, &terms, term)
+			for c in 0..<width {
+				if sums[first+c] != base + expected[c] {
+					mismatches += 1
+				}
+			}
+		}
+		testing.expectf(t, mismatches == 0, "%v [%d, %d] %v with %d threads: %d sums differ from one pairwise sum", typeid_of(T), rows, columns, term, thread_count(), mismatches, loc = loc)
+	}
+	_column_sums(sums, data, 0, rows, columns, nil, nil, nil, .Value)
+	check(t, sums, data, center, divisor, other, rows, columns, .Value, 0, loc)
+	_column_sums(sums, data, 0, rows, columns, center, nil, nil, .Squared_Deviation)
+	check(t, sums, data, center, divisor, other, rows, columns, .Squared_Deviation, 0, loc)
+	_column_sums(sums, data, 0, rows, columns, center, divisor, other, .Normalized_Product)
+	check(t, sums, data, center, divisor, other, rows, columns, .Normalized_Product, 0, loc)
+	for &sum in sums {
+		sum = 0.5
+	}
+	_column_sums(sums, data, 0, rows, columns, nil, nil, nil, .Value, accumulate = true)
+	check(t, sums, data, center, divisor, other, rows, columns, .Value, 0.5, loc)
+}
+
 @(test)
 test_float_sums_are_pairwise :: proc(t: ^testing.T) {
 	// Adding 0.1 to an f32 accumulator ten million times one by one stalls once

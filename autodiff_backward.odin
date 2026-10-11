@@ -40,6 +40,21 @@ tape_backward :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> Tensor_Error whe
 	return _tape_backward_seeded(tape, value.id, seed[:])
 }
 
+// _passes_gradient reports whether node's gradient reaches its parent at index
+// unchanged: a reshape's always does, and an addition's, or a subtraction's to
+// its first operand, does when the parent has the result's shape.
+_passes_gradient :: proc(node: ^_Tape_Node($T), index: int, parent_shape: []int) -> bool {
+	#partial switch node.operation {
+	case .Reshape:
+		return true
+	case .Add:
+		return _shapes_match(parent_shape, node.value.shape)
+	case .Sub:
+		return index == 0 && _shapes_match(parent_shape, node.value.shape)
+	}
+	return false
+}
+
 // _new_gradient allocates a zeroed gradient buffer, clearing it between
 // threads when it is large, since most of a backward pass's buffers are.
 _new_gradient :: proc($T: typeid, shape: []int, allocator: mem.Allocator) -> (gradient: Tensor(T), err: Tensor_Error) {
@@ -87,18 +102,19 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			continue
 		}
 		parents := [2]int{node.parent_a, node.parent_b}
-		// A reshape that first reaches its parent gives it a copy of its own
-		// gradient, the same elements in the same order, so that buffer is
-		// written without being zeroed first.
-		copies_to_parent := false
-		for parent in parents[:node.parent_count] {
+		// A node whose gradient passes unchanged to a parent, as a reshape's
+		// does, or an addition's to an operand of the same shape, gives that
+		// parent a copy of it when it reaches the parent first, so the buffer
+		// is written without being zeroed first.
+		copies_to_parent: [2]bool
+		for parent, index in parents[:node.parent_count] {
 			if parent < 0 || parent >= node_id {
 				return .Invalid_Tape
 			}
 			if tape.nodes[parent].requires_grad && !reached[parent] {
-				if node.operation == .Reshape {
+				if _passes_gradient(node, index, tape.nodes[parent].value.shape) {
 					scratch[parent] = _new_tensor(T, tape.nodes[parent].value.shape, false, tape.allocator) or_return
-					copies_to_parent = true
+					copies_to_parent[index] = true
 				} else {
 					scratch[parent] = _new_gradient(T, tape.nodes[parent].value.shape, tape.allocator) or_return
 				}
@@ -108,7 +124,23 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		a, b := node.parent_a, node.parent_b
 		err: Tensor_Error
 		switch node.operation {
-		case .Add, .Sub, .Mul, .Div:
+		case .Add, .Sub:
+			// Copy first: with a + a, the copy is a's first contribution and
+			// the kernel adds the second.
+			grad_a, grad_b := &scratch[a], &scratch[b]
+			copied: Tensor(T)
+			if copies_to_parent[0] {
+				err = _copy_gradient(scratch[a].data, scratch[node_id].data)
+				grad_a = &copied
+			}
+			if err == .None && copies_to_parent[1] {
+				err = _copy_gradient(scratch[b].data, scratch[node_id].data)
+				grad_b = &copied
+			}
+			if err == .None {
+				err = _backward_binary_elementwise(grad_a, grad_b, scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.operation)
+			}
+		case .Mul, .Div:
 			err = _backward_binary_elementwise(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.operation)
 		case .Dot:
 			err = _backward_dot(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
@@ -137,7 +169,7 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		case .Min_Axis:
 			err = _backward_extreme_axis(&scratch[a], scratch[node_id], tape.nodes[a].value, node.axis, node.keep_dims, .Min)
 		case .Transpose, .Slice, .Reshape:
-			if copies_to_parent {
+			if copies_to_parent[0] {
 				err = _copy_gradient(scratch[a].data, scratch[node_id].data)
 			} else {
 				err = _backward_view(&scratch[a], scratch[node_id], node.operation, node.axis, node.start, node.step)
@@ -856,9 +888,10 @@ _suffix_period :: proc(shape, result_shape: []int) -> (period: int, ok: bool) {
 
 // _backward_binary_repeating is _backward_binary_kernel for operands found by
 // _repeating_operands. Gradients of operands that fill the output are split
-// between threads by blocks of the shorter period; the repeating operand's
-// gradient sums over every block, so threads split its elements instead,
-// each adding its blocks in order. Every loop is flat and can vectorize.
+// between threads by blocks of the shorter period. The repeating operand's
+// gradient sums over every block: for an addition, as one pairwise sum per
+// element; otherwise threads split its elements, each adding its blocks in
+// order. Every loop is flat and can vectorize.
 _backward_binary_repeating :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T), a_period, b_period: int, $operation: Tape_Operation) {
 	total := len(upstream)
 	job := _Repeating_Job(T){grad_a = grad_a, grad_b = grad_b, upstream = upstream, a = a.data[a.offset:][:a_period], b = b.data[b.offset:][:b_period], period = min(a_period, b_period), total = total}
@@ -873,6 +906,17 @@ _backward_binary_repeating :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_
 		_parallel_ranges((total + job.block - 1)/job.block, 1, proc(data: rawptr, first, last: int) {
 			_repeating_full_blocks((^_Repeating_Job(T))(data), first, last, operation)
 		}, &job, job.block)
+	}
+	when operation == .Add {
+		// An added operand's gradient is the sum of the upstream blocks: one
+		// pairwise sum per element, split between threads by _column_sums.
+		if grad_a != nil && !job.a_full {
+			_column_sums(grad_a, upstream, 0, total/job.period, job.period, nil, nil, nil, .Value, accumulate = true)
+		}
+		if grad_b != nil && !job.b_full {
+			_column_sums(grad_b, upstream, 0, total/job.period, job.period, nil, nil, nil, .Value, accumulate = true)
+		}
+		return
 	}
 	if (grad_a != nil && !job.a_full) || (grad_b != nil && !job.b_full) {
 		// Each thread reads every block, so only a period long enough for

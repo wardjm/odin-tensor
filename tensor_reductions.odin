@@ -198,22 +198,52 @@ _pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int, terms
 	return value
 }
 
-// _column_sums adds the terms of each column of the contiguous rows x
-// columns matrix starting at data[offset] into sums[column], one pairwise sum
-// per column. Runs of _PAIRWISE_COLUMNS columns are split between threads.
-// center and divisor, when the term uses them, hold one value per column, and
-// other, for a Normalized_Product, is laid out like data.
-_column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, divisor, other: []T, $term: _Column_Term) {
+// _column_sums computes the pairwise sum of the terms of each column of the
+// contiguous rows x columns matrix starting at data[offset], and stores it in
+// sums[column], or adds it there with accumulate. center and divisor, when the
+// term uses them, hold one value per column, and other, for a
+// Normalized_Product, is laid out like data.
+//
+// Runs of _PAIRWISE_COLUMNS columns are split between threads. With fewer
+// runs than threads, the rows are split too, along the pairwise sum's own
+// halving: each piece is one subtree of that sum, summed on its own, and the
+// pieces are combined in the tree's shape, so every sum is bit-identical to
+// _pairwise_sum_columns over all the rows, whatever the split.
+_column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, divisor, other: []T, $term: _Column_Term, accumulate := false) {
 	Job :: struct {
 		sums, data, center, divisor, other: []T,
 		offset, rows, columns:              int,
+		accumulate:                         bool,
+		// Rows are split into subtrees of at most leaf_rows; leaves holds them
+		// in order, and partials each run's sum over each leaf.
+		leaf_rows, leaf_count:              int,
+		leaves:                             [_COLUMN_SUM_TASKS]_Row_Range,
+		partials:                           [_COLUMN_SUM_TASKS][_PAIRWISE_COLUMNS]T,
 	}
-	job := Job{sums = sums, data = data, center = center, divisor = divisor, other = other, offset = offset, rows = rows, columns = columns}
-	chunks := (columns + _PAIRWISE_COLUMNS - 1) / _PAIRWISE_COLUMNS
-	_parallel_ranges(chunks, 1, proc(data: rawptr, first, last: int) {
+	runs := (columns + _PAIRWISE_COLUMNS - 1) / _PAIRWISE_COLUMNS
+	job := Job{sums = sums, data = data, center = center, divisor = divisor, other = other, offset = offset, rows = rows, columns = columns, accumulate = accumulate}
+	job.leaf_rows = rows
+	threads := thread_count()
+	if runs < threads && runs <= _COLUMN_SUM_TASKS/2 && rows*_PAIRWISE_COLUMNS >= _PARALLEL_MIN_ELEMENTS {
+		// Aim for a few pieces per thread, within the partials' room.
+		pieces := min(_COLUMN_SUM_TASKS/runs, 4*threads/runs)
+		job.leaf_rows = max(PAIRWISE_BLOCK, (rows + pieces - 1) / pieces)
+		for {
+			job.leaf_count = 0
+			if _pairwise_leaves(&job.leaves, &job.leaf_count, 0, rows, job.leaf_rows) && job.leaf_count*runs <= _COLUMN_SUM_TASKS {
+				break
+			}
+			job.leaf_rows *= 2
+		}
+	} else {
+		job.leaf_count = 1
+		job.leaves[0] = {0, rows}
+	}
+	_parallel_ranges(runs*job.leaf_count, 1, proc(data: rawptr, first, last: int) {
 		job := (^Job)(data)
-		for chunk in first..<last {
-			first_column := chunk * _PAIRWISE_COLUMNS
+		for task in first..<last {
+			run, leaf := task / job.leaf_count, task % job.leaf_count
+			first_column := run * _PAIRWISE_COLUMNS
 			width := min(_PAIRWISE_COLUMNS, job.columns - first_column)
 			terms := _Column_Terms(T){other = job.other}
 			when term != .Value {
@@ -222,10 +252,82 @@ _column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, 
 			when term == .Normalized_Product {
 				copy(terms.divisor[:width], job.divisor[first_column:][:width])
 			}
-			column_sums := _pairwise_sum_columns(job.data, job.offset + first_column, job.columns, job.rows, width, &terms, term)
-			copy(job.sums[first_column:][:width], column_sums[:width])
+			piece := job.leaves[leaf]
+			column_sums := _pairwise_sum_columns(job.data, job.offset + piece.first*job.columns + first_column, job.columns, piece.count, width, &terms, term)
+			if job.leaf_count == 1 {
+				_store_column_sums(job.sums[first_column:][:width], column_sums[:width], job.accumulate)
+			} else {
+				job.partials[task] = column_sums
+			}
 		}
-	}, &job, rows*_PAIRWISE_COLUMNS)
+	}, &job, rows/job.leaf_count*_PAIRWISE_COLUMNS)
+	if job.leaf_count == 1 {
+		return
+	}
+	for run in 0..<runs {
+		first_column := run * _PAIRWISE_COLUMNS
+		width := min(_PAIRWISE_COLUMNS, columns - first_column)
+		next := run * job.leaf_count
+		column_sums := _combine_leaves(job.partials[:], &next, rows, job.leaf_rows, width)
+		_store_column_sums(sums[first_column:][:width], column_sums[:width], accumulate)
+	}
+}
+
+// _COLUMN_SUM_TASKS bounds how many pieces _column_sums splits into, each
+// holding one partial sum per column of its run.
+_COLUMN_SUM_TASKS :: 64
+
+_Row_Range :: struct {
+	first, count: int,
+}
+
+// _pairwise_leaves appends to leaves, in order, the subtrees of a pairwise sum
+// over rows first..<first+count, splitting as _pairwise_sum_columns does,
+// until each has at most limit rows or stops splitting. It returns false if
+// leaves runs out of room.
+_pairwise_leaves :: proc(leaves: ^[_COLUMN_SUM_TASKS]_Row_Range, leaf_count: ^int, first, count, limit: int) -> bool {
+	if count <= limit || count <= PAIRWISE_BLOCK {
+		if leaf_count^ == len(leaves) {
+			return false
+		}
+		leaves[leaf_count^] = {first, count}
+		leaf_count^ += 1
+		return true
+	}
+	half := count/2
+	half -= half % 8
+	return _pairwise_leaves(leaves, leaf_count, first, half, limit) && _pairwise_leaves(leaves, leaf_count, first + half, count - half, limit)
+}
+
+// _combine_leaves adds the partial sums of the leaves _pairwise_leaves found
+// for count rows, starting at partials[next^], in the shape of the pairwise
+// sum's tree.
+_combine_leaves :: proc(partials: [][_PAIRWISE_COLUMNS]$T, next: ^int, count, limit, width: int) -> (value: [_PAIRWISE_COLUMNS]T) {
+	if count <= limit || count <= PAIRWISE_BLOCK {
+		value = partials[next^]
+		next^ += 1
+		return value
+	}
+	half := count/2
+	half -= half % 8
+	left := _combine_leaves(partials, next, half, limit, width)
+	right := _combine_leaves(partials, next, count - half, limit, width)
+	for c in 0..<width {
+		value[c] = left[c] + right[c]
+	}
+	return value
+}
+
+// _store_column_sums writes column_sums into sums, or adds them with
+// accumulate.
+_store_column_sums :: proc(sums, column_sums: []$T, accumulate: bool) {
+	if accumulate {
+		for &sum, c in sums {
+			sum += column_sums[c]
+		}
+	} else {
+		copy(sums, column_sums)
+	}
 }
 
 // _reduce_columns is a float sum or mean along an axis of a contiguous

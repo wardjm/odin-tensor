@@ -89,29 +89,55 @@ _binary_kernel :: proc(output: []$T, a, b: Tensor_View(T), result_shape: []int, 
 		return
 	}
 	job := _Binary_Job(T){output = output, a = a, b = b, shape = result_shape}
-	job.contiguous = _shapes_match(a.shape, result_shape) && _shapes_match(b.shape, result_shape) && _is_contiguous_view(a) && _is_contiguous_view(b)
-	_parallel_ranges(len(output), 1 if job.contiguous else _row_length(result_shape), proc(data: rawptr, first, last: int) {
+	granule := _row_length(result_shape)
+	if a_period, b_period, ok := _repeating_operands(a, b, result_shape); ok {
+		// Contiguous operands that fill the output or repeat along leading
+		// axes, as a bias does, need no index arithmetic per row.
+		job.a_period, job.b_period = a_period, b_period
+		job.repeating = true
+		granule = min(a_period, b_period)
+		if granule == len(output) {
+			granule = 1
+		}
+	}
+	_parallel_ranges(len(output), granule, proc(data: rawptr, first, last: int) {
 		job := (^_Binary_Job(T))(data)
 		_binary_range(job, first, last, operation)
 	}, &job)
 }
 
 _Binary_Job :: struct($T: typeid) {
-	output:     []T,
-	a, b:       Tensor_View(T),
-	shape:      []int,
-	contiguous: bool,
+	output:             []T,
+	a, b:               Tensor_View(T),
+	shape:              []int,
+	// With repeating, a and b are contiguous and repeat every a_period and
+	// b_period elements, one of which is the whole output.
+	repeating:          bool,
+	a_period, b_period: int,
 }
 
-// _binary_range fills output[first:last]; for broadcast views first is a
-// multiple of the row length.
-_binary_range :: proc(job: ^_Binary_Job($T), first, last: int, $operation: _Binary_Operation) {
+// _binary_range fills output[first:last]; first is a multiple of the shorter
+// period for repeating operands, and of the row length otherwise.
+_binary_range :: proc(job: ^_Binary_Job($T), first, last: int, $operation: _Binary_Operation) #no_bounds_check {
 	output, a, b, result_shape := job.output, job.a, job.b, job.shape
-	if job.contiguous {
-		a_data := a.data[a.offset:]
-		b_data := b.data[b.offset:]
-		for i in first..<last {
-			output[i] = _apply_binary_operation(a_data[i], b_data[i], operation)
+	if job.repeating {
+		total := len(output)
+		// Blocks are one period long, or the whole range when both operands
+		// fill the output.
+		block := min(job.a_period, job.b_period)
+		if block == total {
+			block = last - first
+		}
+		a_data := a.data[a.offset:][:job.a_period]
+		b_data := b.data[b.offset:][:job.b_period]
+		for start := first; start < last; start += block {
+			length := min(block, last-start)
+			a_block := a_data[start:][:length] if job.a_period == total else a_data[:length]
+			b_block := b_data[start:][:length] if job.b_period == total else b_data[:length]
+			out := output[start:][:length]
+			for i in 0..<length {
+				out[i] = _apply_binary_operation(a_block[i], b_block[i], operation)
+			}
 		}
 		return
 	}
@@ -170,7 +196,7 @@ _binary_views :: proc(a, b: Tensor_View($T), $operation: _Binary_Operation, allo
 	when operation == .Divide {
 		_validate_division(a, b, result_shape) or_return
 	}
-	result = new_tensor(T, result_shape, allocator) or_return
+	result = _new_tensor(T, result_shape, false, allocator) or_return
 	_binary_kernel(result.data, a, b, result_shape, operation)
 	return result, .None
 }

@@ -2,6 +2,7 @@ package tensor
 
 import "core:math"
 import "core:mem"
+import "core:slice"
 import "core:testing"
 
 @(test)
@@ -793,6 +794,67 @@ test_tape_elementwise_broadcast_gradient_reduction :: proc(t: ^testing.T) {
 	testing.expect_value(t, grad_b.data[2], 5)
 }
 
+
+// expect_gradient checks value's gradient element by element.
+expect_gradient :: proc(t: ^testing.T, tape: ^Tape(f32), value: Tape_Value(f32), expected: []f32, loc := #caller_location) {
+	gradient, err := tape_gradient(tape, value)
+	require_ok(t, err, loc)
+	testing.expectf(t, slice.equal(gradient.data, expected), "gradient %v, want %v", gradient.data, expected, loc = loc)
+}
+
+@(test)
+test_tape_add_and_sub_copy_gradients_to_same_shaped_operands :: proc(t: ^testing.T) {
+	// An addition gives an operand of its own shape a copy of its gradient
+	// when it reaches that operand first. These graphs reach an operand twice
+	// from one node, and again from another, and keep intermediate gradients.
+	x, x_err := from_slice(f32, []f32{1, 2, 3, 4, 5, 6}, []int{2, 3})
+	require_ok(t, x_err)
+	defer release(&x)
+	y, y_err := from_slice(f32, []f32{-1, 0.5, 2, 3, -4, 1}, []int{2, 3})
+	require_ok(t, y_err)
+	defer release(&y)
+	seed, seed_err := from_slice(f32, []f32{0.5, -1.25, 2, 3, 0.25, -6}, []int{2, 3})
+	require_ok(t, seed_err)
+	defer release(&seed)
+	doubled := []f32{1, -2.5, 4, 6, 0.5, -12}
+	negated := []f32{-0.5, 1.25, -2, -3, -0.25, 6}
+	zeros := []f32{0, 0, 0, 0, 0, 0}
+
+	tape, tape_err := tape_init(f32)
+	require_ok(t, tape_err)
+	defer tape_release(&tape)
+	xv := tape_add_leaf_borrow(&tape, &x) or_else panic("leaf")
+	yv := tape_add_leaf_borrow(&tape, &y) or_else panic("leaf")
+
+	// x + x: the copy is x's first contribution, the second adds to it.
+	sum := tape_add(&tape, xv, xv) or_else panic("add")
+	testing.expect_value(t, tape_backward_with_seed(&tape, sum, seed), Tensor_Error.None)
+	expect_gradient(t, &tape, xv, doubled)
+	expect_gradient(t, &tape, sum, seed.data)
+
+	// x - x cancels.
+	tape_zero_grad(&tape)
+	difference := tape_sub(&tape, xv, xv) or_else panic("sub")
+	testing.expect_value(t, tape_backward_with_seed(&tape, difference, seed), Tensor_Error.None)
+	expect_gradient(t, &tape, xv, zeros)
+
+	// x - y copies to x and negates for y.
+	tape_zero_grad(&tape)
+	difference = tape_sub(&tape, xv, yv) or_else panic("sub")
+	testing.expect_value(t, tape_backward_with_seed(&tape, difference, seed), Tensor_Error.None)
+	expect_gradient(t, &tape, xv, seed.data)
+	expect_gradient(t, &tape, yv, negated)
+
+	// (x + y) + x: the outer addition reaches the inner one and x first, both
+	// by copy, and the inner one then adds to x's copy.
+	tape_zero_grad(&tape)
+	inner := tape_add(&tape, xv, yv) or_else panic("add")
+	outer := tape_add(&tape, inner, xv) or_else panic("add")
+	testing.expect_value(t, tape_backward_with_seed(&tape, outer, seed), Tensor_Error.None)
+	expect_gradient(t, &tape, xv, doubled)
+	expect_gradient(t, &tape, yv, seed.data)
+	expect_gradient(t, &tape, inner, seed.data)
+}
 
 @(test)
 test_tape_activation_reverse_rules :: proc(t: ^testing.T) {

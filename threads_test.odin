@@ -255,6 +255,12 @@ test_threaded_products_match_one_thread :: proc(t: ^testing.T) {
 		for r, i in elementwise_reference {
 			testing.expectf(t, slice.equal(r, elementwise_actual[i]), "%d threads: element-wise result %d differs from one thread", threads, i)
 		}
+		// Few runs of columns leave threads idle, so column sums split the
+		// rows along the pairwise tree; each must still be one pairwise sum.
+		expect_split_column_sums_match_pairwise(t, f32, 65536, 32)
+		expect_split_column_sums_match_pairwise(t, f32, 20001, 7)
+		expect_split_column_sums_match_pairwise(t, f64, 70000, 1)
+		expect_split_column_sums_match_pairwise(t, f32, 4099, 40)
 	}
 
 	// Several threads multiplying at once: one gets the workers, the rest run
