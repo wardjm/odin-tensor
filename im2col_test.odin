@@ -51,6 +51,8 @@ expect_im2col_matches_gather :: proc(t: ^testing.T, source: Tensor_View(f64), ke
 
 @(test)
 test_im2col_matches_direct_gather :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values := make([]f64, 2*5*4*3)
 	defer delete(values)
 	for &value, i in values {
@@ -83,6 +85,8 @@ test_im2col_matches_direct_gather :: proc(t: ^testing.T) {
 
 @(test)
 test_im2col_pads_with_zeros :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values := make([]f64, 2*5*4*3)
 	defer delete(values)
 	for &value, i in values {
@@ -167,6 +171,8 @@ transposed_im2col_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operat
 
 @(test)
 test_tape_im2col_matches_finite_differences :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values := make([]f64, 5*4*2)
 	defer delete(values)
 	for &value, i in values {

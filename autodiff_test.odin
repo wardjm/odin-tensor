@@ -804,6 +804,8 @@ expect_gradient :: proc(t: ^testing.T, tape: ^Tape(f32), value: Tape_Value(f32),
 
 @(test)
 test_tape_add_and_sub_copy_gradients_to_same_shaped_operands :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	// An addition gives an operand of its own shape a copy of its gradient
 	// when it reaches that operand first. These graphs reach an operand twice
 	// from one node, and again from another, and keep intermediate gradients.
@@ -1149,6 +1151,8 @@ test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) 
 // 1 column in b, so is b's; both then take the narrow column path.
 @(test)
 test_tape_blocked_matmul_backward_matches_naive :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	expect_matmul_backward_matches_naive(t, 9, 70, 10)
 	expect_matmul_backward_matches_naive(t, 9, 3, 12)
 	expect_matmul_backward_matches_naive(t, 9, 70, 1)

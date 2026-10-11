@@ -96,7 +96,7 @@ _unary_views_into :: proc(output: ^Tensor($T), source: Tensor_View(T), $operatio
 // returns a new contiguous tensor.
 _unary_views :: proc(source: Tensor_View($T), $operation: _Unary_Operation, allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
 	_validate_view(source) or_return
-	result = new_tensor(T, source.shape, allocator) or_return
+	result = _new_tensor(T, source.shape, false, allocator) or_return
 	_unary_kernel(result.data, source, operation)
 	return result, .None
 }

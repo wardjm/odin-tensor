@@ -47,7 +47,7 @@ tape_matmul :: proc(tape: ^Tape($T), a, b: Tape_Value(T)) -> (Tape_Value(T), Ten
 }
 
 // tape_linear records linear(x, weights, bias), x @ weights + bias for an
-// [m, k] x, [k, n] weights and an [n] bias, as one node. Its gradients are
+// [..., k] x, [k, n] weights and an [n] bias, as one node. Its gradients are
 // the two products' and, for bias, the sum of the upstream rows, so unlike
 // tape_matmul followed by tape_add, neither pass touches a separate copy of
 // the output.

@@ -20,7 +20,7 @@ max_pool2d_views :: proc(source: Tensor_View($T), pool_height, pool_width: int, 
 	_validate_view(source) or_return
 	shape_buffer: [MAX_RANK]int
 	rank := _pool_shape(source.shape, pool_height, pool_width, shape_buffer[:]) or_return
-	result = new_tensor(T, shape_buffer[:rank], allocator) or_return
+	result = _new_tensor(T, shape_buffer[:rank], false, allocator) or_return
 	_max_pool2d_kernel(result.data, source, pool_height, pool_width, shape_buffer[:rank])
 	return result, .None
 }
@@ -110,6 +110,7 @@ _Pool_Job :: struct($T: typeid) {
 	pool_height, pool_width:  int,
 	g:                        _Pool_Geometry(T),
 	width:                    int,
+	store:                    bool,
 }
 
 _max_pool2d_rows :: proc(job: ^_Pool_Job($T), first, last: int) #no_bounds_check {
@@ -152,8 +153,10 @@ _max_pool2d_rows :: proc(job: ^_Pool_Job($T), first, last: int) #no_bounds_check
 // _backward_max_pool2d adds each upstream value to the one input element of
 // its window that argmax would pick, scanning in row-major order: the first
 // NaN, or else the first maximum. gradient is contiguous in input's logical
-// shape.
-_backward_max_pool2d :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), pool_height, pool_width: int) -> Tensor_Error where intrinsics.type_is_float(T) {
+// shape. With store, gradient holds no values yet: each (image, output row)
+// pair first zeroes the rows of it that its windows cover, and the last pair
+// of an image the rows below that no window covers.
+_backward_max_pool2d :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), input: Tensor_View(T), pool_height, pool_width: int, store := false) -> Tensor_Error where intrinsics.type_is_float(T) {
 	_validate_view(input) or_return
 	shape_buffer: [MAX_RANK]int
 	rank := _pool_shape(input.shape, pool_height, pool_width, shape_buffer[:]) or_return
@@ -161,11 +164,14 @@ _backward_max_pool2d :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), inpu
 		return .Shape_Mismatch
 	}
 	if len(output_grad.data) == 0 {
+		if store {
+			_fill_zero(gradient.data)
+		}
 		return .None
 	}
 	// Windows don't overlap, so each (image, output row) pair writes its own
 	// rows of the gradient.
-	job := _Pool_Job(T){gradient = gradient.data, upstream = output_grad.data, source = input, pool_height = pool_height, pool_width = pool_width, g = _pool_geometry(input, shape_buffer[:rank]), width = input.shape[rank-2]}
+	job := _Pool_Job(T){gradient = gradient.data, upstream = output_grad.data, source = input, pool_height = pool_height, pool_width = pool_width, g = _pool_geometry(input, shape_buffer[:rank]), width = input.shape[rank-2], store = store}
 	_parallel_ranges(job.g.batch_count*job.g.out_height, 1, proc(data: rawptr, first, last: int) {
 		_backward_max_pool2d_rows((^_Pool_Job(T))(data), first, last)
 	}, &job, job.g.out_width*job.g.channels*pool_height*pool_width)
@@ -177,14 +183,29 @@ _backward_max_pool2d_rows :: proc(job: ^_Pool_Job($T), first, last: int) #no_bou
 	data := job.source.data
 	pool_height, pool_width := job.pool_height, job.pool_width
 	rank := len(job.source.shape)
-	image_size := job.source.shape[rank-3] * job.width * g.channels
+	height := job.source.shape[rank-3]
+	row_size := job.width * g.channels
+	image_size := height * row_size
 	next := first * g.out_width * g.channels
 	for pair in first..<last {
 		batch, oy := pair / g.out_height, pair % g.out_height
 		base := _broadcast_offset(g.batch, g.batch.shape, batch)
 		gradient_base := batch * image_size
+		if job.store {
+			last_row := (oy+1)*pool_height if oy < g.out_height-1 else height
+			_fill_zero(job.gradient[gradient_base + oy*pool_height*row_size:gradient_base + last_row*row_size])
+		}
 		for ox in 0..<g.out_width {
 			window := base + oy*pool_height*g.row_stride + ox*pool_width*g.pixel_stride
+			if g.channel_stride == 1 {
+				gradient_window := gradient_base + (oy*pool_height*job.width + ox*pool_width)*g.channels
+				for first_channel := 0; first_channel < g.channels; first_channel += _POOL_CHANNEL_BLOCK {
+					count := min(_POOL_CHANNEL_BLOCK, g.channels - first_channel)
+					_backward_max_pool2d_channels(job, window + first_channel, gradient_window + first_channel, job.upstream[next:][:count])
+					next += count
+				}
+				continue
+			}
 			for c in 0..<g.channels {
 				channel := window + c*g.channel_stride
 				best := data[channel]
@@ -204,6 +225,49 @@ _backward_max_pool2d_rows :: proc(job: ^_Pool_Job($T), first, last: int) #no_bou
 				job.gradient[gradient_base + (y*job.width + x)*g.channels + c] += job.upstream[next]
 				next += 1
 			}
+		}
+	}
+}
+
+// _POOL_CHANNEL_BLOCK channels of a window are handled together by
+// _backward_max_pool2d_channels.
+_POOL_CHANNEL_BLOCK :: 64
+
+// _backward_max_pool2d_channels adds upstream, one value per channel, to the
+// element of each channel's window that argmax picks, for len(upstream)
+// contiguous channels starting at source offset window and gradient offset
+// gradient_window. It scans every channel at once with selects rather than
+// branches, keeping the rule of _backward_max_pool2d_rows: a position takes
+// over unless the best so far is NaN, when it is larger or NaN.
+_backward_max_pool2d_channels :: proc(job: ^_Pool_Job($T), window, gradient_window: int, upstream: []T) #no_bounds_check {
+	g := job.g
+	data := job.source.data
+	count := len(upstream)
+	best: [_POOL_CHANNEL_BLOCK]T
+	position: [_POOL_CHANNEL_BLOCK]T
+	copy(best[:count], data[window:][:count])
+	k: T = 0
+	for dy in 0..<job.pool_height {
+		for dx in 0..<job.pool_width {
+			row := data[window + dy*g.row_stride + dx*g.pixel_stride:][:count]
+			for c in 0..<count {
+				element := row[c]
+				// & and | rather than && and ||, which would branch.
+				take := (best[c] == best[c]) & ((element > best[c]) | (element != element))
+				best[c] = element if take else best[c]
+				position[c] = k if take else position[c]
+			}
+			k += 1
+		}
+	}
+	k = 0
+	for dy in 0..<job.pool_height {
+		for dx in 0..<job.pool_width {
+			gradient := job.gradient[gradient_window + (dy*job.width + dx)*g.channels:][:count]
+			for c in 0..<count {
+				gradient[c] = gradient[c] + upstream[c] if position[c] == k else gradient[c]
+			}
+			k += 1
 		}
 	}
 }

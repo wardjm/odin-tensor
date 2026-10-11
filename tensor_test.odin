@@ -1010,6 +1010,35 @@ test_batched_matmul_edge_cases :: proc(t: ^testing.T) {
 	}
 }
 
+// Poisoning wraps an allocator and fills each block it hands out without
+// zeroing with 0xFF bytes, NaN as a float. Run under it, a kernel that skips
+// an element of an output it was given unzeroed fails an exact comparison,
+// instead of passing on fresh memory that happens to be zero.
+Poisoning :: struct {
+	backing: mem.Allocator,
+}
+
+poisoning_allocator :: proc(poisoning: ^Poisoning) -> mem.Allocator {
+	return {procedure = poisoning_proc, data = poisoning}
+}
+
+poisoning_proc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+	poisoning := (^Poisoning)(data)
+	result, err := poisoning.backing.procedure(poisoning.backing.data, mode, size, alignment, old_memory, old_size, loc)
+	if err != nil || len(result) == 0 {
+		return result, err
+	}
+	#partial switch mode {
+	case .Alloc_Non_Zeroed:
+		mem.set(raw_data(result), 0xFF, len(result))
+	case .Resize_Non_Zeroed:
+		if len(result) > old_size {
+			mem.set(&result[old_size], 0xFF, len(result) - old_size)
+		}
+	}
+	return result, err
+}
+
 // fill_product_operand fills data with operand values. Float values are not
 // small integers, so their sums round differently when the products are added
 // in another order; integer types get small values.
@@ -1137,6 +1166,8 @@ expect_vector_products_match_naive :: proc(t: ^testing.T, $T: typeid, k, n: int,
 
 @(test)
 test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	// Sizes straddle the 6-row tiles, the column panels and the 256-deep k
 	// blocks, leaving partial tiles and a partial last block.
 	expect_matmul_matches_naive(t, f32, 7, 300, 37, false, false)
@@ -1239,6 +1270,8 @@ test_product_copies_match_naive_product :: proc(t: ^testing.T) {
 
 @(test)
 test_batched_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	m, k, n :: 3, 600, 21
 	a, err := new_tensor(f32, []int{2, m, k})
 	require_ok(t, err)
@@ -2429,6 +2462,8 @@ check_unary_variants :: proc(t: ^testing.T, operation: _Unary_Operation, values:
 
 @(test)
 test_every_unary_variant_matches_reference_math :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	positive := []f64{0.25, 1, 2, 4, 9, 0.5}
 	signed := []f64{-2, -0.5, 0, 0.5, 1, 3}
 	check_unary_variants(t, .Exp, signed)
@@ -3374,6 +3409,8 @@ test_rank_zero_tensors_in_arithmetic_and_reductions :: proc(t: ^testing.T) {
 
 @(test)
 test_permute_view_and_copy_view :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values, err := from_slice(i32, []i32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, []int{2, 3, 2})
 	require_ok(t, err)
 	defer release(&values)

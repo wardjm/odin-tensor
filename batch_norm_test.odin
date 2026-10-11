@@ -114,6 +114,8 @@ test_tape_batch_norm_matches_direct_formula :: proc(t: ^testing.T) {
 // operations it replaces computes in the forward pass.
 @(test)
 test_tape_batch_norm_forward_matches_composition_exactly :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	ROWS, FEATURES :: 300, 20
 	x, err := new_tensor(f32, []int{ROWS, FEATURES})
 	require_ok(t, err)
@@ -171,6 +173,8 @@ test_tape_batch_norm_forward_matches_composition_exactly :: proc(t: ^testing.T) 
 // feature 0 entirely below zero.
 @(test)
 test_tape_batch_norm_relu_matches_tape_relu_exactly :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	ROWS, FEATURES :: 500, 9
 	x, err := new_tensor(f32, []int{ROWS, FEATURES})
 	require_ok(t, err)
@@ -254,6 +258,8 @@ test_tape_batch_norm_relu_matches_tape_relu_exactly :: proc(t: ^testing.T) {
 
 @(test)
 test_tape_batch_norm_matches_finite_differences :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values := make([]f64, 5*4*3)
 	defer delete(values)
 	for &value, i in values {

@@ -79,6 +79,8 @@ expect_linear_matches_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: int, tra
 
 @(test)
 test_linear_starts_each_sum_from_the_bias :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	// Packed, with partial tiles, panels and k blocks; too few rows to pack;
 	// too narrow for a column panel; and a long k summed over slices.
 	expect_linear_matches_naive(t, f32, 131, 270, 150, false)
@@ -88,6 +90,66 @@ test_linear_starts_each_sum_from_the_bias :: proc(t: ^testing.T) {
 	expect_linear_matches_naive(t, f32, 19, 300, 2, false)
 	expect_linear_matches_naive(t, f64, 3, 9000, 5, false)
 	expect_linear_matches_naive(t, i32, 13, 20, 9, false)
+}
+
+// expect_linear_matches_rows computes linear on x, of any rank, and on a
+// contiguous copy of it reshaped to [rows, k], and checks the two agree
+// exactly and that the result has x's leading shape.
+expect_linear_matches_rows :: proc(t: ^testing.T, x: Tensor_View(f32), n: int, loc := #caller_location) {
+	k := x.shape[len(x.shape)-1]
+	weights, err := new_tensor(f32, []int{k, n})
+	require_ok(t, err, loc)
+	defer release(&weights)
+	fill_product_operand(weights.data, 3)
+	bias: Tensor(f32)
+	bias, err = new_tensor(f32, []int{n})
+	require_ok(t, err, loc)
+	defer release(&bias)
+	fill_product_operand(bias.data, 5)
+	flat: Tensor(f32)
+	flat, err = copy_view(x)
+	require_ok(t, err, loc)
+	defer release(&flat)
+	require_ok(t, reshape(&flat, []int{-1, k}), loc)
+
+	result: Tensor(f32)
+	result, err = linear_views(x, as_view(weights), as_view(bias))
+	require_ok(t, err, loc)
+	defer release(&result)
+	expected: Tensor(f32)
+	expected, err = linear(flat, weights, bias)
+	require_ok(t, err, loc)
+	defer release(&expected)
+	testing.expect(t, _shapes_match(result.shape[:len(result.shape)-1], x.shape[:len(x.shape)-1]) && result.shape[len(result.shape)-1] == n, "shape", loc = loc)
+	mismatches := 0
+	for value, i in result.data {
+		if value != expected.data[i] {
+			mismatches += 1
+		}
+	}
+	testing.expectf(t, mismatches == 0, "x %v strides %v: %d elements differ from the [rows, k] product", x.shape, x.strides, mismatches, loc = loc)
+}
+
+@(test)
+test_linear_takes_any_leading_axes :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
+	storage, err := new_tensor(f32, []int{4, 5, 6, 30})
+	require_ok(t, err)
+	defer release(&storage)
+	fill_product_operand(storage.data, 0)
+	// Contiguous leading axes, a single vector, and a view whose leading
+	// axes do not collapse, which linear copies.
+	expect_linear_matches_rows(t, as_view(storage), 17)
+	vector := Tensor_View(f32){data = storage.data, shape = []int{30}, strides = []int{1}}
+	expect_linear_matches_rows(t, vector, 9)
+	permuted_shape, permuted_strides: [4]int
+	permuted, permute_err := permute_view(as_view(storage), []int{1, 0, 2, 3}, permuted_shape[:], permuted_strides[:])
+	require_ok(t, permute_err)
+	expect_linear_matches_rows(t, permuted, 17)
+	// A row-major slice of whole leading rows still collapses.
+	sliced := Tensor_View(f32){data = storage.data, shape = []int{2, 6, 30}, strides = []int{180, 30, 1}, offset = 180}
+	expect_linear_matches_rows(t, sliced, 7)
 }
 
 @(test)
@@ -107,16 +169,16 @@ test_linear_validates_arguments :: proc(t: ^testing.T) {
 	wrong, err = new_tensor(f32, []int{3})
 	require_ok(t, err)
 	defer release(&wrong)
-	vector: Tensor(f32)
-	vector, err = new_tensor(f32, []int{3})
+	scalar: Tensor(f32)
+	scalar, err = new_tensor(f32, []int{})
 	require_ok(t, err)
-	defer release(&vector)
+	defer release(&scalar)
 
 	_, err = linear(x, weights, wrong)
 	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
 	_, err = linear(x, x, bias)
 	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
-	_, err = linear(vector, weights, bias)
+	_, err = linear(scalar, weights, bias)
 	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
 
 	tape: Tape(f32)
@@ -147,6 +209,20 @@ linear_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_O
 	return tape_linear(tape, a, b, bias)
 }
 
+// linear_batched_helper is a, viewed as [2, rows/2, k], @ b plus a constant
+// bias. With gap, the last row of each half is sliced off, so the leading
+// axes no longer step through memory as one.
+linear_batched_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), gap: bool) -> (result: Tape_Value(f64), err: Tensor_Error) {
+	value := tape_value(tape, a) or_return
+	batched := tape_reshape(tape, a, []int{2, value.shape[0]/2, value.shape[1]}) or_return
+	if gap {
+		batched = tape_slice(tape, batched, 1, 0, value.shape[0]/2 - 1) or_return
+	}
+	weights := tape_value(tape, b) or_return
+	bias := constant_feature_leaf(tape, weights.shape[1], 0.75) or_return
+	return tape_linear(tape, batched, b, bias)
+}
+
 // linear_bias_helper is a @ constant weights plus bias b, with a transposed
 // so the product reads it strided.
 linear_bias_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
@@ -164,6 +240,8 @@ linear_bias_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: T
 
 @(test)
 test_tape_linear_matches_finite_differences :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values := make([]f64, 7*6)
 	defer delete(values)
 	for &value, i in values {
@@ -172,6 +250,12 @@ test_tape_linear_matches_finite_differences :: proc(t: ^testing.T) {
 	check_tape_helper(t, .Linear, values[:35], []int{7, 5}, values[:15], []int{5, 3}, linear_helper)
 	// The transposed [5, 7] a is a [7, 5] x; b is a bias of 4.
 	check_tape_helper(t, .Linear, values[:35], []int{5, 7}, []f64{0.5, -1, 2, 0.25}, []int{4}, linear_bias_helper)
+	check_tape_helper(t, .Linear, values[:40], []int{8, 5}, values[:15], []int{5, 3}, proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
+		return linear_batched_helper(tape, a, b, false)
+	})
+	check_tape_helper(t, .Linear, values[:40], []int{8, 5}, values[:15], []int{5, 3}, proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
+		return linear_batched_helper(tape, a, b, true)
+	})
 }
 
 linear_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {

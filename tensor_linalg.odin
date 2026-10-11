@@ -544,7 +544,7 @@ _matmul_views :: proc(a, b: Tensor_View($T), allocator := context.allocator) -> 
 	_validate_view(b) or_return
 	shape_buffer: [MAX_RANK]int
 	result_rank := _matmul_result_shape(a.shape, b.shape, shape_buffer[:]) or_return
-	result = new_tensor(T, shape_buffer[:result_rank], allocator) or_return
+	result = _new_tensor(T, shape_buffer[:result_rank], false, allocator) or_return
 	_matmul_kernel(result.data, a, b, shape_buffer[:result_rank])
 	return result, .None
 }
@@ -574,10 +574,13 @@ matmul_views_into :: proc(output: ^Tensor($T), a, b: Tensor_View(T)) -> Tensor_E
 	return _matmul_views_into(output, a, b)
 }
 
-// linear computes x @ weights + bias for an [m, k] x, [k, n] weights and an
-// [n] bias, the affine map of a dense layer. The bias starts each output
-// element's sum, to which its k products are added in order, so it needs no
-// pass of its own. Other ranks or mismatched sizes return Shape_Mismatch.
+// linear computes x @ weights + bias for an [..., k] x, [k, n] weights and an
+// [n] bias, the affine map of a dense layer applied to x's last axis, giving
+// [..., n], as PyTorch's Linear does. The bias starts each output element's
+// sum, to which its k products are added in order, so it needs no pass of its
+// own. x's leading axes are treated as one axis of rows, without a copy when
+// they are laid out like a contiguous tensor's. Other ranks or mismatched
+// sizes return Shape_Mismatch.
 linear :: proc(x, weights, bias: Tensor($T), allocator := context.allocator) -> (Tensor(T), Tensor_Error) where intrinsics.type_is_numeric(T) {
 	return linear_views(as_view(x), as_view(weights), as_view(bias), allocator)
 }
@@ -590,21 +593,66 @@ linear_views :: proc(x, weights, bias: Tensor_View($T), allocator := context.all
 		return result, .Shape_Mismatch
 	}
 	starts := bias
-	contiguous: Tensor(T)
+	contiguous, contiguous_x: Tensor(T)
 	defer release(&contiguous)
+	defer release(&contiguous_x)
 	if !_is_contiguous_view(bias) {
 		contiguous = copy_view(bias, allocator) or_return
 		starts = as_view(contiguous)
 	}
-	result = _new_tensor(T, []int{x.shape[0], weights.shape[1]}, false, allocator) or_return
-	_product_kernel(result.data, x, weights, bias = starts.data[starts.offset:][:weights.shape[1]])
+	rows_shape, rows_strides: [2]int
+	rows, collapsed := _linear_rows(x, &rows_shape, &rows_strides)
+	if !collapsed {
+		contiguous_x = copy_view(x, allocator) or_return
+		rows, _ = _linear_rows(as_view(contiguous_x), &rows_shape, &rows_strides)
+	}
+	shape_buffer: [MAX_RANK]int
+	result = _new_tensor(T, _linear_shape(x.shape, weights.shape[1], shape_buffer[:]), false, allocator) or_return
+	_product_kernel(result.data, rows, weights, bias = starts.data[starts.offset:][:weights.shape[1]])
 	return result, .None
 }
 
-// _linear_shapes_match reports whether x, weights and bias are [m, k], [k, n]
-// and [n].
+// _linear_shapes_match reports whether x, weights and bias are [..., k],
+// [k, n] and [n].
 _linear_shapes_match :: proc(x, weights, bias: []int) -> bool {
-	return len(x) == 2 && len(weights) == 2 && len(bias) == 1 && x[1] == weights[0] && bias[0] == weights[1]
+	return len(x) >= 1 && len(weights) == 2 && len(bias) == 1 && x[len(x)-1] == weights[0] && bias[0] == weights[1]
+}
+
+// _linear_shape writes linear's result shape, x_shape with its last axis
+// replaced by n, into buffer.
+_linear_shape :: proc(x_shape: []int, n: int, buffer: []int) -> []int {
+	rank := len(x_shape)
+	copy(buffer, x_shape[:rank-1])
+	buffer[rank-1] = n
+	return buffer[:rank]
+}
+
+// _linear_rows views x as an [m, k] matrix whose rows are x's leading axes
+// taken together, writing its shape and strides into the buffers. That needs
+// the leading axes to step through memory as one axis does, as they do in a
+// contiguous tensor; collapsed is false when they do not.
+_linear_rows :: proc(x: Tensor_View($T), shape, strides: ^[2]int) -> (rows: Tensor_View(T), collapsed: bool) {
+	rank := len(x.shape)
+	m, row_stride := 1, 0
+	// expected is the stride the next outer axis must have, once one is seen.
+	expected, seen := 0, false
+	for axis := rank-2; axis >= 0; axis -= 1 {
+		dim := x.shape[axis]
+		if dim == 1 {
+			continue
+		}
+		if seen && x.strides[axis] != expected {
+			return rows, false
+		}
+		if !seen {
+			row_stride = x.strides[axis]
+		}
+		expected, seen = x.strides[axis]*dim, true
+		m *= dim
+	}
+	shape^ = {m, x.shape[rank-1]}
+	strides^ = {row_stride, x.strides[rank-1]}
+	return Tensor_View(T){data = x.data, shape = shape[:], strides = strides[:], offset = x.offset}, true
 }
 
 // scale_in_place multiplies every element by a scalar without allocating.

@@ -45,7 +45,9 @@ tape_backward :: proc(tape: ^Tape($T), value: Tape_Value(T)) -> Tensor_Error whe
 // copies its gradient to its parent, as an addition does to an operand of the
 // result's shape and a subtraction to its first operand, since those
 // gradients pass unchanged. Batch normalization writes its input's gradient
-// when the input is not also its scale or shift, which it adds to.
+// when the input is not also its scale or shift, which it adds to, max
+// pooling writes its input's, and linear writes the products' gradients for x
+// and the weights when that parent is not also another of its inputs.
 _writes_gradient :: proc(node: ^_Tape_Node($T), index: int, parent_shape: []int) -> bool {
 	#partial switch node.operation {
 	case .Reshape:
@@ -56,6 +58,11 @@ _writes_gradient :: proc(node: ^_Tape_Node($T), index: int, parent_shape: []int)
 		return index == 0 && _shapes_match(parent_shape, node.value.shape)
 	case .Batch_Norm:
 		return index == 0 && node.parent_a != node.parent_b && node.parent_a != node.parent_c
+	case .Max_Pool2D:
+		return true
+	case .Linear:
+		parents := [3]int{node.parent_a, node.parent_b, node.parent_c}
+		return index < 2 && parents[index] != parents[1-index] && parents[index] != parents[2]
 	}
 	return false
 }
@@ -183,9 +190,9 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 		case .Batch_Norm:
 			err = _backward_batch_norm(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, tape.nodes[c].value, node.saved, node.relu, writes_parent[0], tape.allocator)
 		case .Linear:
-			err = _backward_linear(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value)
+			err = _backward_linear(&scratch[a], &scratch[b], &scratch[c], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, writes_parent[0], writes_parent[1], tape.allocator)
 		case .Max_Pool2D:
-			err = _backward_max_pool2d(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width)
+			err = _backward_max_pool2d(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width, writes_parent[0])
 		case .Leaf:
 		}
 		if err != .None {
@@ -751,19 +758,29 @@ _batch_norm_gradient_row :: #force_inline proc(gradient, upstream, x, sums: []$T
 	}
 }
 
-// _backward_linear adds linear's gradients: upstream @ weightsᵀ to x's,
-// xᵀ @ upstream to the weights', and each column's pairwise sum of upstream to
-// the bias's.
-_backward_linear :: proc(grad_x, grad_weights, grad_bias: ^Tensor($T), upstream: Tensor(T), x, weights: Tensor_View(T)) -> Tensor_Error where intrinsics.type_is_float(T) {
-	if len(x.shape) != 2 || len(weights.shape) != 2 || !_shapes_match(upstream.shape, []int{x.shape[0], weights.shape[1]}) {
+// _backward_linear adds linear's gradients, with x's leading axes as rows:
+// upstream @ weightsᵀ to x's, xᵀ @ upstream to the weights', and each
+// column's pairwise sum of upstream to the bias's. With store_x or
+// store_weights it writes that product instead of adding it.
+_backward_linear :: proc(grad_x, grad_weights, grad_bias: ^Tensor($T), upstream: Tensor(T), x, weights: Tensor_View(T), store_x, store_weights: bool, allocator: mem.Allocator) -> Tensor_Error where intrinsics.type_is_float(T) {
+	shape_buffer: [MAX_RANK]int
+	if len(weights.shape) != 2 || len(x.shape) == 0 || x.shape[len(x.shape)-1] != weights.shape[0] || !_shapes_match(upstream.shape, _linear_shape(x.shape, weights.shape[1], shape_buffer[:])) {
 		return .Shape_Mismatch
 	}
-	_backward_matrix_product(grad_x.data, grad_weights.data, upstream.data, x, weights) or_return
+	rows_shape, rows_strides: [2]int
+	rows, collapsed := _linear_rows(x, &rows_shape, &rows_strides)
+	contiguous: Tensor(T)
+	defer release(&contiguous)
+	if !collapsed {
+		contiguous = copy_view(x, allocator) or_return
+		rows, _ = _linear_rows(as_view(contiguous), &rows_shape, &rows_strides)
+	}
+	_backward_matrix_product(grad_x.data, grad_weights.data, upstream.data, rows, weights, store_x, store_weights) or_return
 	if grad_bias.data != nil {
 		if len(grad_bias.data) != weights.shape[1] {
 			return .Shape_Mismatch
 		}
-		_column_sums(grad_bias.data, upstream.data, 0, x.shape[0], weights.shape[1], nil, nil, nil, .Value, accumulate = true)
+		_column_sums(grad_bias.data, upstream.data, 0, rows.shape[0], weights.shape[1], nil, nil, nil, .Value, accumulate = true)
 	}
 	return .None
 }
@@ -1142,7 +1159,9 @@ _backward_matmul :: proc(grad_a, grad_b: ^Tensor($T), output_grad: Tensor(T), a,
 // forward kernel on transposed views. Each element adds its terms in naive-loop
 // order and matches that loop exactly, except for a @ a: grad_a and grad_b then
 // share a buffer and grad_a's terms land first, so the last bits can differ.
-_backward_matrix_product :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T)) -> Tensor_Error {
+// store_a and store_b write that gradient instead of adding to it, into a
+// buffer that need not be zeroed.
+_backward_matrix_product :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_View(T), store_a := false, store_b := false) -> Tensor_Error {
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	k := a.shape[a_rank-1]
 	m := a.shape[0] if a_rank == 2 else 1
@@ -1165,13 +1184,13 @@ _backward_matrix_product :: proc(grad_a, grad_b, upstream: []$T, a, b: Tensor_Vi
 		b_transposed_shape := [2]int{n, k}
 		b_transposed_strides := [2]int{b_strides[1], b_strides[0]}
 		b_transposed := Tensor_View(T){data = b.data, shape = b_transposed_shape[:], strides = b_transposed_strides[:], offset = b.offset}
-		_product_kernel(grad_a[:m*k], upstream_matrix, b_transposed, accumulate = true)
+		_product_kernel(grad_a[:m*k], upstream_matrix, b_transposed, accumulate = !store_a)
 	}
 	if grad_b != nil {
 		a_transposed_shape := [2]int{k, m}
 		a_transposed_strides := [2]int{a_strides[1], a_strides[0]}
 		a_transposed := Tensor_View(T){data = a.data, shape = a_transposed_shape[:], strides = a_transposed_strides[:], offset = a.offset}
-		_product_kernel(grad_b[:k*n], a_transposed, upstream_matrix, accumulate = true)
+		_product_kernel(grad_b[:k*n], a_transposed, upstream_matrix, accumulate = !store_b)
 	}
 	return .None
 }

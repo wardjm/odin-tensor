@@ -67,7 +67,7 @@ permute_view :: proc(source: Tensor_View($T), axes, shape_buffer, strides_buffer
 // np.ascontiguousarray.
 copy_view :: proc(source: Tensor_View($T), allocator := context.allocator) -> (result: Tensor(T), err: Tensor_Error) {
 	_validate_view(source) or_return
-	result = new_tensor(T, source.shape, allocator) or_return
+	result = _new_tensor(T, source.shape, false, allocator) or_return
 	_copy_into(result.data, source)
 	return result, .None
 }

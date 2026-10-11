@@ -69,6 +69,8 @@ expect_pool_matches_reference :: proc(t: ^testing.T, values: []f64, shape: []int
 
 @(test)
 test_max_pool2d_matches_reshaped_max_axis :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values := make([]f64, 2*5*7*3)
 	defer delete(values)
 	for &value, i in values {
@@ -89,6 +91,18 @@ test_max_pool2d_matches_reshaped_max_axis :: proc(t: ^testing.T) {
 		5, math.nan_f64(), -1, -1,
 	}
 	expect_pool_matches_reference(t, ties, []int{4, 4, 1}, 2, 2)
+
+	// 70 channels span two of the backward pass's channel blocks; few
+	// distinct values make ties common, and some windows hold NaN.
+	many := make([]f64, 2*5*4*70)
+	defer delete(many)
+	for &value, i in many {
+		value = f64((i*7) % 5)
+		if i % 37 == 0 {
+			value = math.nan_f64()
+		}
+	}
+	expect_pool_matches_reference(t, many, []int{2, 5, 4, 70}, 2, 2)
 }
 
 @(test)
@@ -153,6 +167,8 @@ test_max_pool2d_validates_arguments :: proc(t: ^testing.T) {
 
 @(test)
 test_tape_max_pool2d_matches_finite_differences :: proc(t: ^testing.T) {
+	poisoning := Poisoning{backing = context.allocator}
+	context.allocator = poisoning_allocator(&poisoning)
 	values := make([]f64, 5*4*2)
 	defer delete(values)
 	// Distinct values keep every window's maximum differentiable.

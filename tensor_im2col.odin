@@ -26,7 +26,8 @@ im2col_views :: proc(source: Tensor_View($T), kernel_height, kernel_width: int, 
 	_validate_view(source) or_return
 	shape_buffer: [MAX_RANK]int
 	rank := _im2col_shape(source.shape, kernel_height, kernel_width, stride, padding, shape_buffer[:]) or_return
-	result = new_tensor(T, shape_buffer[:rank], allocator) or_return
+	// The kernel writes every element, padding included.
+	result = _new_tensor(T, shape_buffer[:rank], false, allocator) or_return
 	_im2col_kernel(result.data, source, kernel_height, kernel_width, stride, padding, shape_buffer[:rank])
 	return result, .None
 }
