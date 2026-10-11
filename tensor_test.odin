@@ -3128,7 +3128,7 @@ test_integer_sums_accept_a_wider_accumulator :: proc(t: ^testing.T) {
 	require_ok(t, err)
 	defer release(&empty)
 	empty_total: Tensor(u64)
-	empty_total, err = sum_all(empty, Acc = u64)
+	empty_total, err = sum_all(empty, u64)
 	require_ok(t, err)
 	defer release(&empty_total)
 	testing.expect_value(t, empty_total.data[0], u64(0))

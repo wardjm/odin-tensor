@@ -29,7 +29,8 @@ failures=0
 for dir in $(ls -d "$work_dir"/line_* 2>/dev/null | sort -t_ -k2 -n); do
 	blocks=$((blocks + 1))
 	line=${dir##*_}
-	sed -i "s|\"path/to/odin-tensor\"|\"$import_path\"|" "$dir/main.odin"
+	sed "s|\"path/to/odin-tensor\"|\"$import_path\"|" "$dir/main.odin" > "$dir/main.odin.tmp"
+	mv "$dir/main.odin.tmp" "$dir/main.odin"
 	if output=$(odin build "$dir" -collection:"$collection" -vet -strict-style -out:"$dir/example" 2>&1); then
 		echo "PASS README.md:$line"
 	else

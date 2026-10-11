@@ -13,7 +13,11 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
 
@@ -22,7 +26,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: odin-compiler
-          key: odin-${{ env.ODIN_COMMIT }}-llvm${{ env.LLVM_VERSION }}
+          key: odin-${{ env.ODIN_COMMIT }}-llvm${{ env.LLVM_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install LLVM
         run: |
