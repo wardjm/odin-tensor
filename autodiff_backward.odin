@@ -144,6 +144,8 @@ _tape_backward_seeded :: proc(tape: ^Tape($T), root: int, seed: []T) -> Tensor_E
 			}
 		case .Im2col:
 			err = _backward_im2col(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width, node.step, node.padding)
+		case .Batch_Norm:
+			err = _backward_batch_norm(&scratch[a], &scratch[b], scratch[node_id], tape.nodes[a].value, tape.nodes[b].value, node.saved, tape.allocator)
 		case .Max_Pool2D:
 			err = _backward_max_pool2d(&scratch[a], scratch[node_id], tape.nodes[a].value, node.kernel_height, node.kernel_width)
 		case .Leaf:
@@ -601,6 +603,69 @@ _add_into :: proc(target, source: []$T) {
 			value += source[i]
 		}
 	}, &job)
+}
+
+// _backward_batch_norm adds the gradients of tape_batch_norm. With g the
+// upstream gradient, x̂ = (x - mean) / deviation and N rows, scale's gradient
+// is Σ g·x̂ over the rows and x's is
+// scale / deviation · (g - Σg/N - x̂ · Σ g·x̂ / N), the usual closed form, which
+// includes the statistics' dependence on x. Both sums are pairwise column
+// sums; the second pass is split between threads by rows.
+_backward_batch_norm :: proc(grad_x, grad_scale: ^Tensor($T), upstream: Tensor(T), x, scale: Tensor_View(T), saved: Tensor(T), allocator: mem.Allocator) -> (err: Tensor_Error) where intrinsics.type_is_float(T) {
+	features := len(saved.data) / 2
+	if features == 0 || len(upstream.data) % features != 0 {
+		return .Shape_Mismatch
+	}
+	rows := len(upstream.data) / features
+	contiguous: Tensor(T)
+	defer release(&contiguous)
+	source := x
+	if !_is_contiguous_view(source) {
+		contiguous = copy_view(source, allocator) or_return
+		source = as_view(contiguous)
+	}
+	// sums holds Σg and Σ g·x̂ per feature, then the means, deviations and
+	// scales the second pass reads.
+	sums := new_tensor(T, []int{5, features}, allocator) or_return
+	defer release(&sums)
+	upstream_sums, product_sums := sums.data[:features], sums.data[features:2*features]
+	means, deviations := saved.data[:features], saved.data[features:]
+	_column_sums(upstream_sums, upstream.data, 0, rows, features, nil, nil, nil, .Value)
+	_column_sums(product_sums, upstream.data, 0, rows, features, means, deviations, source.data[source.offset:], .Normalized_Product)
+	if grad_scale.data != nil {
+		for f in 0..<features {
+			grad_scale.data[f] += product_sums[f]
+		}
+	}
+	if grad_x.data == nil {
+		return .None
+	}
+	copy(sums.data[2*features:4*features], saved.data)
+	for f in 0..<features {
+		sums.data[4*features + f] = scale.data[scale.offset + f*scale.strides[0]]
+	}
+	Job :: struct {
+		gradient, upstream, x, sums: []T,
+		rows, features:              int,
+	}
+	job := Job{grad_x.data, upstream.data, source.data[source.offset:], sums.data, rows, features}
+	_parallel_ranges(rows, 1, proc(data: rawptr, first, last: int) {
+		job := (^Job)(data)
+		features := job.features
+		count := T(job.rows)
+		upstream_sums, product_sums := job.sums[:features], job.sums[features:2*features]
+		means, deviations, scales := job.sums[2*features:3*features], job.sums[3*features:4*features], job.sums[4*features:]
+		for row in first..<last {
+			gradient := job.gradient[row*features:][:features]
+			upstream := job.upstream[row*features:][:features]
+			x := job.x[row*features:][:features]
+			for f in 0..<features {
+				normalized := (x[f] - means[f]) / deviations[f]
+				gradient[f] += scales[f] / deviations[f] * (upstream[f] - upstream_sums[f]/count - normalized*product_sums[f]/count)
+			}
+		}
+	}, &job, 2*features)
+	return .None
 }
 
 // _copy_gradient copies source into target, which has the same length, split

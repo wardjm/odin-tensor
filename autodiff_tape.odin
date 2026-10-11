@@ -35,6 +35,7 @@ Tape_Operation :: enum {
 	Reshape,
 	Im2col,
 	Max_Pool2D,
+	Batch_Norm,
 }
 
 _Tape_Node :: struct($T: typeid) {
@@ -61,6 +62,9 @@ _Tape_Node :: struct($T: typeid) {
 	kernel_width:  int,
 	// padding is an Im2col's padding.
 	padding:       int,
+	// saved holds what a node's backward pass needs beyond its parents'
+	// values: a Batch_Norm's per-feature means and standard deviations.
+	saved:         Tensor(T),
 }
 
 // Tape owns all recorded operation outputs and gradient buffers. Leaf values
@@ -115,6 +119,7 @@ tape_init :: proc($T: typeid, reserve := 0, allocator := context.allocator) -> (
 _tape_release_nodes :: proc(tape: ^Tape($T)) {
 	for &node in tape.nodes {
 		release(&node.grad)
+		release(&node.saved)
 		if node.owns_value {
 			release(&node.owned_value)
 		}

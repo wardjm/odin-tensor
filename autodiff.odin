@@ -168,6 +168,110 @@ tape_im2col :: proc(tape: ^Tape($T), x: Tape_Value(T), kernel_height, kernel_wid
 	})
 }
 
+// tape_batch_norm records batch normalization of x over every axis but the
+// last, multiplied by scale: element (..., f) becomes
+// (x - mean_f) / sqrt(variance_f + epsilon) * scale_f, where mean_f and the
+// biased variance_f are taken over every other axis, and scale is a
+// [features] value. mean and variance, when given, receive each feature's
+// batch statistics, for callers that keep running estimates. The gradient
+// flows through the statistics, as for PyTorch's batch_norm in training mode;
+// add a shift with tape_add. One fused node replaces the dozen element-wise
+// operations and reductions this would otherwise take, and its backward pass
+// is two passes over the gradient. An x of rank zero, a scale that is not
+// [features], or a mean or variance of another length returns Shape_Mismatch,
+// and an x with no elements returns Empty_Reduction.
+tape_batch_norm :: proc(tape: ^Tape($T), x, scale: Tape_Value(T), epsilon: T, mean: []T = nil, variance: []T = nil) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+	x_node, scale_node := _tape_node(tape, x), _tape_node(tape, scale)
+	if x_node == nil || scale_node == nil {
+		return result, .Invalid_Tape
+	}
+	x_value, scale_value := x_node.value, scale_node.value
+	rank := len(x_value.shape)
+	if rank == 0 || len(scale_value.shape) != 1 || scale_value.shape[0] != x_value.shape[rank-1] {
+		return result, .Shape_Mismatch
+	}
+	features := x_value.shape[rank-1]
+	if (mean != nil && len(mean) != features) || (variance != nil && len(variance) != features) {
+		return result, .Shape_Mismatch
+	}
+	count, _ := _element_count(x_value.shape)
+	if count == 0 {
+		return result, .Empty_Reduction
+	}
+	rows := count / features
+
+	contiguous: Tensor(T)
+	defer release(&contiguous)
+	source := x_value
+	if !_is_contiguous_view(source) {
+		contiguous = copy_view(source, tape.allocator) or_return
+		source = as_view(contiguous)
+	}
+	// stats holds each feature's mean, then its standard deviation, for the
+	// backward pass, then its scale and variance, which are dropped after.
+	stats := new_tensor(T, []int{4, features}, tape.allocator) or_return
+	defer release(&stats)
+	means, deviations := stats.data[:features], stats.data[features:2*features]
+	scales, variances := stats.data[2*features:3*features], stats.data[3*features:]
+	_column_sums(means, source.data, source.offset, rows, features, nil, nil, nil, .Value)
+	for &value in means {
+		value /= T(rows)
+	}
+	_column_sums(variances, source.data, source.offset, rows, features, means, nil, nil, .Squared_Deviation)
+	for f in 0..<features {
+		variances[f] /= T(rows)
+		deviations[f] = intrinsics.sqrt(variances[f] + epsilon)
+		scales[f] = scale_value.data[scale_value.offset + f*scale_value.strides[0]]
+	}
+	if mean != nil {
+		copy(mean, means)
+	}
+	if variance != nil {
+		copy(variance, variances)
+	}
+
+	output := _new_tensor(T, x_value.shape, false, tape.allocator) or_return
+	defer release(&output)
+	_batch_norm_rows(output.data, source.data[source.offset:], stats.data, rows, features)
+	saved := new_tensor(T, []int{2, features}, tape.allocator) or_return
+	copy(saved.data, stats.data[:2*features])
+	result, err = _tape_take_output(tape, &output, _Tape_Node(T){
+		requires_grad = x_node.requires_grad || scale_node.requires_grad,
+		operation     = .Batch_Norm,
+		parent_a      = x.id,
+		parent_b      = scale.id,
+		parent_count  = 2,
+		saved         = saved,
+	})
+	if err != .None {
+		release(&saved)
+	}
+	return result, err
+}
+
+// _batch_norm_rows writes (x - mean) / deviation * scale for each of rows
+// contiguous rows of features, split between threads. stats holds the means,
+// deviations and scales, features each.
+_batch_norm_rows :: proc(output, x, stats: []$T, rows, features: int) {
+	Job :: struct {
+		output, x, stats: []T,
+		features:         int,
+	}
+	job := Job{output, x, stats, features}
+	_parallel_ranges(rows, 1, proc(data: rawptr, first, last: int) {
+		job := (^Job)(data)
+		features := job.features
+		means, deviations, scales := job.stats[:features], job.stats[features:2*features], job.stats[2*features:3*features]
+		for row in first..<last {
+			x := job.x[row*features:][:features]
+			output := job.output[row*features:][:features]
+			for f in 0..<features {
+				output[f] = (x[f] - means[f]) / deviations[f] * scales[f]
+			}
+		}
+	}, &job, features)
+}
+
 // tape_max_pool2d records max_pool2d of x. Each upstream value goes to the one
 // element of its window that argmax picks: the first NaN, or else the first
 // maximum in row-major order. PyTorch also sends a tie's gradient to a single

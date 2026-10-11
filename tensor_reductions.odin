@@ -112,17 +112,49 @@ _pairwise_sum :: proc(data: []$T, offset, step, count: int, center: T, $squared:
 // _pairwise_sum_columns.
 _PAIRWISE_COLUMNS :: 16
 
+// _Column_Term is what _pairwise_sum_columns adds for each element.
+_Column_Term :: enum {
+	// The element itself.
+	Value,
+	// (element - center)², as _pairwise_sum's squared terms.
+	Squared_Deviation,
+	// element * ((other - center) / divisor), where other is the element at
+	// the same position of a second array: an upstream gradient times the
+	// normalized input of batch normalization.
+	Normalized_Product,
+}
+
+// _Column_Terms holds the per-column constants of a _Column_Term, indexed
+// like the columns being summed, and the second array of a
+// Normalized_Product.
+_Column_Terms :: struct($T: typeid) {
+	center, divisor: [_PAIRWISE_COLUMNS]T,
+	other:           []T,
+}
+
+// _column_term computes the term for the element at position, in column c.
+_column_term :: #force_inline proc(data: []$T, position, c: int, terms: ^_Column_Terms(T), $term: _Column_Term) -> T #no_bounds_check {
+	when term == .Value {
+		return data[position]
+	} else when term == .Squared_Deviation {
+		deviation := data[position] - terms.center[c]
+		return deviation * deviation
+	} else {
+		return data[position] * ((terms.other[position] - terms.center[c]) / terms.divisor[c])
+	}
+}
+
 // _pairwise_sum_columns runs _pairwise_sum on width <= _PAIRWISE_COLUMNS
-// adjacent columns at once: column c sums data[offset + c + i*step] for i in
-// 0..<count. The splits and accumulators are _pairwise_sum's, so each column's
-// sum is bit-identical to it, but every step reads a contiguous run of a row
-// instead of one element per row.
-_pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int) -> (value: [_PAIRWISE_COLUMNS]T) #no_bounds_check {
+// adjacent columns at once: column c sums the terms of data[offset + c +
+// i*step] for i in 0..<count. The splits and accumulators are _pairwise_sum's,
+// so each column's sum is bit-identical to it, but every step reads a
+// contiguous run of a row instead of one element per row.
+_pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int, terms: ^_Column_Terms(T), $term: _Column_Term) -> (value: [_PAIRWISE_COLUMNS]T) #no_bounds_check {
 	if count < 8 {
 		for i in 0..<count {
-			row := data[offset + i*step:][:width]
+			row := offset + i*step
 			for c in 0..<width {
-				value[c] += row[c]
+				value[c] += _column_term(data, row + c, c, terms, term)
 			}
 		}
 		return value
@@ -130,18 +162,18 @@ _pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int) -> (v
 	if count <= PAIRWISE_BLOCK {
 		partial: [8][_PAIRWISE_COLUMNS]T
 		for lane in 0..<8 {
-			row := data[offset + lane*step:][:width]
+			row := offset + lane*step
 			for c in 0..<width {
-				partial[lane][c] = row[c]
+				partial[lane][c] = _column_term(data, row + c, c, terms, term)
 			}
 		}
 		i := 8
 		for ; i <= count-8; i += 8 {
 			base := offset + i*step
 			for lane in 0..<8 {
-				row := data[base + lane*step:][:width]
+				row := base + lane*step
 				for c in 0..<width {
-					partial[lane][c] += row[c]
+					partial[lane][c] += _column_term(data, row + c, c, terms, term)
 				}
 			}
 		}
@@ -149,21 +181,51 @@ _pairwise_sum_columns :: proc(data: []$T, offset, step, count, width: int) -> (v
 			value[c] = ((partial[0][c]+partial[1][c]) + (partial[2][c]+partial[3][c])) + ((partial[4][c]+partial[5][c]) + (partial[6][c]+partial[7][c]))
 		}
 		for ; i < count; i += 1 {
-			row := data[offset + i*step:][:width]
+			row := offset + i*step
 			for c in 0..<width {
-				value[c] += row[c]
+				value[c] += _column_term(data, row + c, c, terms, term)
 			}
 		}
 		return value
 	}
 	half := count/2
 	half -= half % 8
-	left := _pairwise_sum_columns(data, offset, step, half, width)
-	right := _pairwise_sum_columns(data, offset + half*step, step, count-half, width)
+	left := _pairwise_sum_columns(data, offset, step, half, width, terms, term)
+	right := _pairwise_sum_columns(data, offset + half*step, step, count-half, width, terms, term)
 	for c in 0..<width {
 		value[c] = left[c] + right[c]
 	}
 	return value
+}
+
+// _column_sums adds the terms of each column of the contiguous rows x
+// columns matrix starting at data[offset] into sums[column], one pairwise sum
+// per column. Runs of _PAIRWISE_COLUMNS columns are split between threads.
+// center and divisor, when the term uses them, hold one value per column, and
+// other, for a Normalized_Product, is laid out like data.
+_column_sums :: proc(sums: []$T, data: []T, offset, rows, columns: int, center, divisor, other: []T, $term: _Column_Term) {
+	Job :: struct {
+		sums, data, center, divisor, other: []T,
+		offset, rows, columns:              int,
+	}
+	job := Job{sums = sums, data = data, center = center, divisor = divisor, other = other, offset = offset, rows = rows, columns = columns}
+	chunks := (columns + _PAIRWISE_COLUMNS - 1) / _PAIRWISE_COLUMNS
+	_parallel_ranges(chunks, 1, proc(data: rawptr, first, last: int) {
+		job := (^Job)(data)
+		for chunk in first..<last {
+			first_column := chunk * _PAIRWISE_COLUMNS
+			width := min(_PAIRWISE_COLUMNS, job.columns - first_column)
+			terms := _Column_Terms(T){other = job.other}
+			when term != .Value {
+				copy(terms.center[:width], job.center[first_column:][:width])
+			}
+			when term == .Normalized_Product {
+				copy(terms.divisor[:width], job.divisor[first_column:][:width])
+			}
+			column_sums := _pairwise_sum_columns(job.data, job.offset + first_column, job.columns, job.rows, width, &terms, term)
+			copy(job.sums[first_column:][:width], column_sums[:width])
+		}
+	}, &job, rows*_PAIRWISE_COLUMNS)
 }
 
 // _reduce_columns is a float sum or mean along an axis of a contiguous
@@ -187,7 +249,8 @@ _reduce_columns :: proc(output: []$T, source: Tensor_View(T), reduced_count, inn
 			first_column := chunk * _PAIRWISE_COLUMNS
 			width := min(_PAIRWISE_COLUMNS, job.inner - first_column)
 			base := job.source.offset + outer_index*job.reduced_count*job.inner + first_column
-			sums := _pairwise_sum_columns(job.source.data, base, job.inner, job.reduced_count, width)
+			terms: _Column_Terms(T)
+			sums := _pairwise_sum_columns(job.source.data, base, job.inner, job.reduced_count, width, &terms, .Value)
 			for c in 0..<width {
 				value := sums[c]
 				when operation == .Mean {
