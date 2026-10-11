@@ -33,6 +33,9 @@ jobs:
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh "$LLVM_VERSION"
+          # The ARM image's preinstalled Ubuntu llvm-*-dev is removed rather
+          # than upgraded by llvm.sh, which leaves no static libraries to link.
+          sudo apt-get install -y "llvm-$LLVM_VERSION-dev"
           echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
 
       - name: Check out Odin
