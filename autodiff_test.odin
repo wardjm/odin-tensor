@@ -2402,3 +2402,65 @@ test_tape_backward_visits_only_reachable_nodes :: proc(t: ^testing.T) {
 	testing.expect_value(t, tape_backward(&tape, loss), Tensor_Error.None)
 	testing.expectf(t, math.is_nan(x_grad.data[0]), "got %v, want NaN", x_grad.data[0])
 }
+
+@(test)
+test_tape_axis_reduction_backward_expands_every_axis :: proc(t: ^testing.T) {
+	// Every axis of a [2, 3, 4] input, with a distinct upstream value per
+	// output element, so a gradient routed to the wrong place shows.
+	input_values: [24]f64
+	for &value, i in input_values {
+		value = f64(i)
+	}
+	shape := []int{2, 3, 4}
+	for axis in 0..<3 {
+		for keep_dims in ([]bool{false, true}) {
+			for mean in ([]bool{false, true}) {
+				input, input_err := from_slice(f64, input_values[:], shape)
+				require_ok(t, input_err)
+				defer release(&input)
+				tape, tape_err := tape_init(f64, 4)
+				require_ok(t, tape_err)
+				defer tape_release(&tape)
+				parent, parent_err := tape_add_leaf_borrow(&tape, &input)
+				require_ok(t, parent_err)
+				reduced: Tape_Value(f64)
+				reduce_err: Tensor_Error
+				if mean {
+					reduced, reduce_err = tape_mean_axis(&tape, parent, axis, keep_dims)
+				} else {
+					reduced, reduce_err = tape_sum_axis(&tape, parent, axis, keep_dims)
+				}
+				require_ok(t, reduce_err)
+				reduced_value, value_err := tape_value(&tape, reduced)
+				require_ok(t, value_err)
+				seed, seed_err := new_tensor(f64, reduced_value.shape)
+				require_ok(t, seed_err)
+				defer release(&seed)
+				for &value, i in seed.data {
+					value = f64(i + 1)
+				}
+				testing.expect_value(t, tape_backward_with_seed(&tape, reduced, seed), .None)
+				gradient, gradient_err := tape_gradient(&tape, parent)
+				require_ok(t, gradient_err)
+
+				for i in 0..<2 do for j in 0..<3 do for k in 0..<4 {
+					index := [3]int{i, j, k}
+					// The upstream index drops the reduced axis; keep_dims
+					// leaves it at length one, which is the same linear index.
+					upstream := 0
+					for a in 0..<3 {
+						if a != axis {
+							upstream = upstream*shape[a] + index[a]
+						}
+					}
+					want := seed.data[upstream]
+					if mean {
+						want /= f64(shape[axis])
+					}
+					got := gradient.data[gradient.offset + (i*3 + j)*4 + k]
+					testing.expectf(t, got == want, "axis %d keep_dims %v mean %v at %v: got %v, want %v", axis, keep_dims, mean, index, got, want)
+				}
+			}
+		}
+	}
+}

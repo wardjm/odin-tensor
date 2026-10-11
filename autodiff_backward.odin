@@ -199,6 +199,36 @@ _backward_axis_reduction :: proc(gradient: ^Tensor($T), output_grad: Tensor(T), 
 	if !valid || input_count != len(gradient.data) {
 		return .Invalid_Shape
 	}
+	if input_count == 0 {
+		return .None
+	}
+
+	// A contiguous upstream gradient is the input without the reduced axis,
+	// so with the input as [outer, length, inner], each row of inner gradient
+	// values gains the upstream row of its outer index. Rows split between
+	// threads.
+	if _is_contiguous_view(as_view(output_grad)) {
+		Job :: struct {
+			gradient, upstream: []T,
+			length, inner:      int,
+			divisor:            T,
+		}
+		job := Job{gradient = gradient.data, upstream = output_grad.data, length = input.shape[axis], inner = 1, divisor = T(divisor)}
+		for dim in input.shape[axis+1:] {
+			job.inner *= dim
+		}
+		_parallel_ranges(input_count/job.inner, 1, proc(data: rawptr, first, last: int) {
+			job := (^Job)(data)
+			for row in first..<last {
+				target := job.gradient[row*job.inner:][:job.inner]
+				source := job.upstream[row/job.length*job.inner:][:job.inner]
+				for &value, i in target {
+					value += source[i] / job.divisor
+				}
+			}
+		}, &job, job.inner)
+		return .None
+	}
 
 	for input_linear in 0..<input_count {
 		remaining := input_linear
