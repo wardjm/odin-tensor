@@ -146,13 +146,14 @@ tape_reshape :: proc(tape: ^Tape($T), x: Tape_Value(T), shape: []int) -> (Tape_V
 
 // tape_im2col records im2col of x, which must be [..., height, width,
 // channels]. Its gradient adds each upstream value back to the element of x it
-// was copied from, so elements in overlapping windows sum their gradients.
-tape_im2col :: proc(tape: ^Tape($T), x: Tape_Value(T), kernel_height, kernel_width: int, stride := 1) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
+// was copied from, so elements in overlapping windows sum their gradients;
+// values that came from padding have no element and are dropped.
+tape_im2col :: proc(tape: ^Tape($T), x: Tape_Value(T), kernel_height, kernel_width: int, stride := 1, padding := 0) -> (result: Tape_Value(T), err: Tensor_Error) where intrinsics.type_is_float(T) {
 	parent_node := _tape_node(tape, x)
 	if parent_node == nil {
 		return result, .Invalid_Tape
 	}
-	output := im2col_views(parent_node.value, kernel_height, kernel_width, stride, tape.allocator) or_return
+	output := im2col_views(parent_node.value, kernel_height, kernel_width, stride, padding, tape.allocator) or_return
 	defer release(&output)
 	return _tape_take_output(tape, &output, _Tape_Node(T){
 		requires_grad = parent_node.requires_grad,
@@ -161,6 +162,7 @@ tape_im2col :: proc(tape: ^Tape($T), x: Tape_Value(T), kernel_height, kernel_wid
 		parent_b      = -1,
 		parent_count  = 1,
 		step          = stride,
+		padding       = padding,
 		kernel_height = kernel_height,
 		kernel_width  = kernel_width,
 	})

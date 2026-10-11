@@ -5,17 +5,24 @@ import "core:mem"
 import "core:testing"
 
 // expect_im2col_matches_gather compares im2col of source with direct indexing
-// of every window element.
-expect_im2col_matches_gather :: proc(t: ^testing.T, source: Tensor_View(f64), kernel_height, kernel_width, stride: int, loc := #caller_location) {
-	result, err := im2col_views(source, kernel_height, kernel_width, stride)
+// of every window element, which is zero outside the image. The result is
+// written over an output full of NaN, so every zero must be written too.
+expect_im2col_matches_gather :: proc(t: ^testing.T, source: Tensor_View(f64), kernel_height, kernel_width, stride: int, padding := 0, loc := #caller_location) {
+	rank := len(source.shape)
+	height, width := source.shape[rank-3], source.shape[rank-2]
+	out_height := (height+2*padding-kernel_height)/stride + 1
+	out_width := (width+2*padding-kernel_width)/stride + 1
+	channels := source.shape[rank-1]
+	shape_buffer: [MAX_RANK]int
+	copy(shape_buffer[:], source.shape[:rank-3])
+	shape_buffer[rank-3], shape_buffer[rank-2], shape_buffer[rank-1] = out_height, out_width, kernel_height*kernel_width*channels
+	result, err := new_tensor(f64, shape_buffer[:rank])
 	require_ok(t, err, loc)
 	defer release(&result)
-	rank := len(source.shape)
+	fill(&result, math.nan_f64())
+	require_ok(t, im2col_views_into(&result, source, kernel_height, kernel_width, stride, padding), loc)
 	batch_shape := source.shape[:rank-3]
 	batch_count, _ := _element_count(batch_shape)
-	channels := source.shape[rank-1]
-	out_height := (source.shape[rank-3]-kernel_height)/stride + 1
-	out_width := (source.shape[rank-2]-kernel_width)/stride + 1
 	testing.expectf(t, result.shape[rank-3] == out_height && result.shape[rank-2] == out_width && result.shape[rank-1] == kernel_height*kernel_width*channels, "shape %v", result.shape, loc = loc)
 
 	indices: [MAX_RANK]int
@@ -27,9 +34,14 @@ expect_im2col_matches_gather :: proc(t: ^testing.T, source: Tensor_View(f64), ke
 			remaining /= batch_shape[axis]
 		}
 		for oy in 0..<out_height do for ox in 0..<out_width do for dy in 0..<kernel_height do for dx in 0..<kernel_width do for c in 0..<channels {
-			indices[rank-3], indices[rank-2], indices[rank-1] = oy*stride+dy, ox*stride+dx, c
-			expected, get_err := get_at_view(source, indices[:rank])
-			require_ok(t, get_err, loc)
+			y, x := oy*stride+dy-padding, ox*stride+dx-padding
+			expected: f64
+			if y >= 0 && y < height && x >= 0 && x < width {
+				indices[rank-3], indices[rank-2], indices[rank-1] = y, x, c
+				get_err: Tensor_Error
+				expected, get_err = get_at_view(source, indices[:rank])
+				require_ok(t, get_err, loc)
+			}
 			testing.expectf(t, result.data[next] == expected, "element %d: got %v, want %v", next, result.data[next], expected, loc = loc)
 			next += 1
 		}
@@ -70,6 +82,34 @@ test_im2col_matches_direct_gather :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_im2col_pads_with_zeros :: proc(t: ^testing.T) {
+	values := make([]f64, 2*5*4*3)
+	defer delete(values)
+	for &value, i in values {
+		value = f64(i) + 1
+	}
+	contiguous, err := from_slice(f64, values, []int{2, 5, 4, 3})
+	require_ok(t, err)
+	defer release(&contiguous)
+	// Same-size output, then strided windows that start in the padding.
+	expect_im2col_matches_gather(t, as_view(contiguous), 3, 3, 1, 1)
+	expect_im2col_matches_gather(t, as_view(contiguous), 3, 2, 2, 1)
+	expect_im2col_matches_gather(t, as_view(contiguous), 2, 3, 3, 2)
+	// Padding wider than the kernel gives windows wholly outside the image,
+	// and a kernel wider than the image fits once padded.
+	expect_im2col_matches_gather(t, as_view(contiguous), 2, 2, 1, 3)
+	expect_im2col_matches_gather(t, as_view(contiguous), 6, 6, 1, 1)
+
+	permuted_source, permuted_err := from_slice(f64, values, []int{3, 2, 5, 4})
+	require_ok(t, permuted_err)
+	defer release(&permuted_source)
+	shape_buffer, strides_buffer: [4]int
+	permuted := permute_view(as_view(permuted_source), []int{1, 2, 3, 0}, shape_buffer[:], strides_buffer[:]) or_else panic("permute")
+	expect_im2col_matches_gather(t, permuted, 3, 3, 1, 1)
+	expect_im2col_matches_gather(t, permuted, 2, 3, 2, 3)
+}
+
+@(test)
 test_im2col_validates_arguments :: proc(t: ^testing.T) {
 	image, err := new_tensor(f64, []int{1, 4, 4, 2})
 	require_ok(t, err)
@@ -87,6 +127,12 @@ test_im2col_validates_arguments :: proc(t: ^testing.T) {
 	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
 	_, err = im2col(image, 5, 2)
 	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
+	_, err = im2col(image, 2, 2, 1, -1)
+	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
+	_, err = im2col(image, 7, 2, 1, 1)
+	testing.expect_value(t, err, Tensor_Error.Shape_Mismatch)
+	_, err = im2col(image, 2, 2, 1, max(int))
+	testing.expect_value(t, err, Tensor_Error.Invalid_Shape)
 
 	output: Tensor(f64)
 	output, err = new_tensor(f64, []int{1, 3, 3, 8})
@@ -106,11 +152,17 @@ im2col_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_O
 	return tape_im2col(tape, a, 3, 2, 2)
 }
 
+// padded_im2col_helper applies im2col with a 3x2 kernel, stride 2 and
+// padding 2, so some windows lie wholly in the padding.
+padded_im2col_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (Tape_Value(f64), Tensor_Error) {
+	return tape_im2col(tape, a, 3, 2, 2, 2)
+}
+
 // transposed_im2col_helper reads im2col's input through a transposed view, so
 // the backward pass must route gradients through the view.
 transposed_im2col_helper :: proc(tape: ^Tape(f64), a, b: Tape_Value(f64), operation: Tape_Operation) -> (result: Tape_Value(f64), err: Tensor_Error) {
 	transposed := tape_transpose(tape, a) or_return
-	return tape_im2col(tape, transposed, 2, 2)
+	return tape_im2col(tape, transposed, 2, 2, padding = 1)
 }
 
 @(test)
@@ -124,6 +176,7 @@ test_tape_im2col_matches_finite_differences :: proc(t: ^testing.T) {
 	// Overlapping 2x2 windows make most elements feed several rows.
 	check_tape_helper(t, .Im2col, values[:18], []int{3, 3, 2}, row_values, []int{3})
 	check_tape_helper(t, .Im2col, values, []int{5, 4, 2}, row_values, []int{3}, im2col_helper)
+	check_tape_helper(t, .Im2col, values, []int{5, 4, 2}, row_values, []int{3}, padded_im2col_helper)
 	check_tape_helper(t, .Im2col, values, []int{2, 4, 5}, row_values, []int{3}, transposed_im2col_helper)
 }
 
@@ -152,7 +205,7 @@ im2col_allocation_scenario :: proc(allocator: mem.Allocator) -> Tensor_Error {
 	image := new_tensor(f64, []int{1, 3, 3, 2}, allocator) or_return
 	defer release(&image)
 	leaf := tape_add_leaf_borrow(&tape, &image) or_return
-	windows := tape_im2col(&tape, leaf, 2, 2) or_return
+	windows := tape_im2col(&tape, leaf, 2, 2, padding = 1) or_return
 	total := tape_sum_all(&tape, windows) or_return
 	direct := im2col(image, 2, 2, allocator = allocator) or_return
 	release(&direct)

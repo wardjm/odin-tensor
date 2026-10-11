@@ -59,6 +59,8 @@ _Tape_Node :: struct($T: typeid) {
 	// Max_Pool2D's window.
 	kernel_height: int,
 	kernel_width:  int,
+	// padding is an Im2col's padding.
+	padding:       int,
 }
 
 // Tape owns all recorded operation outputs and gradient buffers. Leaf values
