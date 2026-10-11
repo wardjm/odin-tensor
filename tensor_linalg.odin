@@ -3,6 +3,7 @@ package tensor
 // Vector/matrix dot products, matrix multiplication, and scaled updates.
 
 import "base:intrinsics"
+import "core:sys/info"
 
 // _validate_dot_view accepts rank-one and rank-two views whose addressed
 // elements all lie within their backing data.
@@ -40,21 +41,21 @@ _dot_result_shape :: proc(a_shape, b_shape, shape_buffer: []int) -> (rank: int, 
 	return rank, .None
 }
 
-// Blocking for _product_kernel, tuned on the matmul_into 512 bench. Output is
-// computed in register tiles of _PRODUCT_TILE_ROWS rows by _PRODUCT_TILE_BYTES
-// of columns. k is split into blocks of _PRODUCT_BLOCK_DEPTH so each tile's
-// slice of b packs into a panel that stays in L1 while every row tile reuses
-// it. Products too small to repay packing (under _PRODUCT_TILE_ROWS rows,
-// _PRODUCT_MIN_BLOCKED_DEPTH inner elements, or _PRODUCT_MIN_TILE_COLUMNS
-// columns) skip it.
-_PRODUCT_TILE_ROWS :: 2
-_PRODUCT_TILE_BYTES :: 64
+// Blocking for _product_kernel. The packed path follows the usual BLAS
+// layout: k is split into blocks of _PRODUCT_BLOCK_DEPTH; for each, a block of
+// b up to _PRODUCT_B_BLOCK_BYTES is packed into column panels, and a block of
+// a up to _PRODUCT_A_BLOCK_BYTES into row panels, sized for L2. A register
+// tile then multiplies one row panel by one column panel, whose
+// _PRODUCT_BLOCK_DEPTH rows stay in L1 while every row panel of the a block
+// reuses it. Edge panels are padded with zeros, and only the tile's valid
+// elements are stored, so every tile takes the same full-width loop. Products
+// too small to repay packing (under _PRODUCT_TILE_ROWS rows, or 2 when b's
+// rows are strided, _PRODUCT_MIN_BLOCKED_DEPTH inner elements, or
+// _PRODUCT_MIN_TILE_COLUMNS columns) skip it.
+_PRODUCT_TILE_ROWS :: 6
 _PRODUCT_BLOCK_DEPTH :: 256
-// When a's inner elements are not adjacent, as for a transposed a, each step
-// along k reads a new cache line of a, and with power-of-two row lengths those
-// lines alias in L1. A shallower block keeps them resident; it cut the aᵀ @ b
-// product in the backward bench by a quarter.
-_PRODUCT_STRIDED_BLOCK_DEPTH :: 64
+_PRODUCT_A_BLOCK_BYTES :: 64 * 1024
+_PRODUCT_B_BLOCK_BYTES :: 128 * 1024
 _PRODUCT_MIN_BLOCKED_DEPTH :: 8
 _PRODUCT_MIN_TILE_COLUMNS :: 4
 // Products narrower than _PRODUCT_MIN_TILE_COLUMNS, such as a convolution
@@ -64,19 +65,22 @@ _PRODUCT_COLUMN_ROWS :: 8
 // _product_kernel_serial computes output = a @ b, or output += a @ b when
 // accumulate is set, on the calling thread, treating a vector a as a row and a
 // vector b as a column. _product_kernel, in tensor_threads.odin, is the entry
-// point that may split it across threads. Products
-// with at least _PRODUCT_TILE_ROWS rows and _PRODUCT_MIN_BLOCKED_DEPTH inner
-// elements are blocked, in the widest column tile n fills: _PRODUCT_TILE_BYTES,
-// or a half or quarter of it down to _PRODUCT_MIN_TILE_COLUMNS. Halving keeps
-// narrow products such as [m, k] @ [k, 8] in f32 on the blocked path instead
-// of the much slower i-k-j loop. Each output element still adds its k products
-// in order, so neither blocking nor the tile width changes the result.
+// point that may split it across threads. Each output element adds its k
+// products in order, one multiply and one add at a time, on every path, so
+// neither the path nor the blocking changes the result.
 _product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false) #no_bounds_check {
-	FULL :: max(1, _PRODUCT_TILE_BYTES/size_of(T))
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
 	k := a.shape[a_rank-1]
 	n := b.shape[1] if b_rank == 2 else 1
+	// The unpacked loop walks b along its rows, so when those are strided,
+	// even two rows are worth packing.
+	b_contiguous := b_rank == 1 || b.strides[1] == 1
+	min_rows := _PRODUCT_TILE_ROWS if b_contiguous else 2
+	if m >= min_rows && k >= _PRODUCT_MIN_BLOCKED_DEPTH && n >= _PRODUCT_MIN_TILE_COLUMNS {
+		_product_packed(output, a, b, accumulate)
+		return
+	}
 	if !accumulate {
 		for &value in output {
 			value = 0
@@ -86,33 +90,44 @@ _product_kernel_serial :: proc(output: []$T, a, b: Tensor_View(T), accumulate :=
 		_product_columns(output, a, b)
 		return
 	}
-	if m >= _PRODUCT_TILE_ROWS && k >= _PRODUCT_MIN_BLOCKED_DEPTH {
-		if n >= FULL {
-			_product_blocked(output, a, b, FULL)
-			return
-		}
-		when FULL/2 >= _PRODUCT_MIN_TILE_COLUMNS {
-			if n >= FULL/2 {
-				_product_blocked(output, a, b, FULL/2)
-				return
-			}
-		}
-		when FULL/4 >= _PRODUCT_MIN_TILE_COLUMNS {
-			if n >= FULL/4 {
-				_product_blocked(output, a, b, FULL/4)
-				return
-			}
-		}
-	}
 	#force_inline _product_strip(output, a, b, 0, k, 0, n)
 }
 
-// _product_blocked adds a @ b into output in register tiles TILE_COLUMNS
-// wide. For each k block, every column tile packs its panel of b and sweeps
-// the row tiles; columns past the last full tile take the unpacked i-k-j
-// loop. The inlining directives on the _product_strip calls were measured:
-// flipping either costs narrow or tail-heavy products 10-15%.
-_product_blocked :: proc(output: []$T, a, b: Tensor_View(T), $TILE_COLUMNS: int) #no_bounds_check {
+// _product_packed computes output = a @ b, or output += a @ b when accumulate
+// is set, with the packed path. Without accumulate, the first k block's tiles
+// start from zero rather than reading output, which saves a pass over it. On x86 CPUs
+// with AVX it runs a copy compiled for AVX, whose tile is 64 bytes of columns
+// by _PRODUCT_TILE_ROWS rows in 32-byte vectors; elsewhere the tile's vectors
+// are 16 bytes, which SSE and NEON provide. Both multiply and then add, without
+// fusing, so they give the same results.
+_product_packed :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool) {
+	when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
+		if .avx in info.cpu_features() {
+			_product_packed_avx(output, a, b, accumulate)
+			return
+		}
+	}
+	#force_inline _product_packed_vectors(output, a, b, accumulate, 2, max(1, 16/size_of(T)))
+}
+
+when ODIN_ARCH == .amd64 || ODIN_ARCH == .i386 {
+	@(enable_target_feature = "avx")
+	_product_packed_avx :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool) {
+		#force_inline _product_packed_vectors(output, a, b, accumulate, 2, max(1, 32/size_of(T)))
+	}
+}
+
+// _product_packed_vectors is _product_packed with a tile VECTORS vectors of
+// LANES elements wide. a_pack holds row panel t's column p at
+// a_pack[(t*depth + p)*ROWS:][:ROWS], and b_vectors column panel t's row p at
+// b_vectors[(t*depth + p)*VECTORS:][:VECTORS].
+_product_packed_vectors :: #force_inline proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, $VECTORS, $LANES: int) #no_bounds_check {
+	Vector :: #simd[LANES]T
+	ROWS :: _PRODUCT_TILE_ROWS
+	COLUMNS :: VECTORS * LANES
+	DEPTH :: _PRODUCT_BLOCK_DEPTH
+	BLOCK_ROWS :: max(ROWS, _PRODUCT_A_BLOCK_BYTES/(DEPTH*size_of(T))/ROWS*ROWS)
+	BLOCK_COLUMNS :: max(COLUMNS, _PRODUCT_B_BLOCK_BYTES/(DEPTH*size_of(T))/COLUMNS*COLUMNS)
 	a_rank, b_rank := len(a.shape), len(b.shape)
 	m := a.shape[0] if a_rank == 2 else 1
 	k := a.shape[a_rank-1]
@@ -121,31 +136,105 @@ _product_blocked :: proc(output: []$T, a, b: Tensor_View(T), $TILE_COLUMNS: int)
 	a_inner_stride := a.strides[a_rank-1]
 	b_row_stride := b.strides[0]
 	b_column_stride := b.strides[1] if b_rank == 2 else 0
-	full_rows := m - m%_PRODUCT_TILE_ROWS
-	full_columns := n - n%TILE_COLUMNS
-	panel: [_PRODUCT_BLOCK_DEPTH*TILE_COLUMNS]T = ---
-	block_depth := _PRODUCT_BLOCK_DEPTH if a_inner_stride == 1 else _PRODUCT_STRIDED_BLOCK_DEPTH
-	for k0 := 0; k0 < k; k0 += block_depth {
-		depth := min(block_depth, k-k0)
-		a_block := a
-		a_block.offset += k0*a_inner_stride
-		block_panel := panel[:depth*TILE_COLUMNS]
-		for j0 := 0; j0 < full_columns; j0 += TILE_COLUMNS {
-			for p in 0..<depth {
-				b_offset := b.offset + (k0+p)*b_row_stride + j0*b_column_stride
-				for j in 0..<TILE_COLUMNS {
-					panel[p*TILE_COLUMNS + j] = b.data[b_offset + j*b_column_stride]
+	a_pack: [BLOCK_ROWS*DEPTH]T = ---
+	b_vectors: [DEPTH*BLOCK_COLUMNS/LANES]Vector = ---
+	b_pack := ([^]T)(&b_vectors[0])
+	for k0 := 0; k0 < k; k0 += DEPTH {
+		depth := min(DEPTH, k-k0)
+		load := accumulate || k0 > 0
+		for j0 := 0; j0 < n; j0 += BLOCK_COLUMNS {
+			columns := min(BLOCK_COLUMNS, n-j0)
+			column_panels := (columns + COLUMNS - 1) / COLUMNS
+			b_block := b
+			b_block.offset += k0*b_row_stride + j0*b_column_stride
+			_pack_panels(b_pack, b_block, b_row_stride, b_column_stride, depth, columns, COLUMNS, true)
+			for i0 := 0; i0 < m; i0 += BLOCK_ROWS {
+				rows := min(BLOCK_ROWS, m-i0)
+				row_panels := (rows + ROWS - 1) / ROWS
+				// a's rows are b's columns, so the same packing fits.
+				a_block := a
+				a_block.offset += i0*a_row_stride + k0*a_inner_stride
+				_pack_panels(([^]T)(&a_pack[0]), a_block, a_inner_stride, a_row_stride, depth, rows, ROWS, false)
+				for column_panel in 0..<column_panels {
+					width := min(COLUMNS, columns - column_panel*COLUMNS)
+					b_panel := ([^]Vector)(&b_vectors[column_panel*depth*VECTORS])
+					for row_panel in 0..<row_panels {
+						height := min(ROWS, rows - row_panel*ROWS)
+						a_panel := ([^]T)(&a_pack[row_panel*depth*ROWS])
+						first := (i0 + row_panel*ROWS)*n + j0 + column_panel*COLUMNS
+						if height == ROWS && width == COLUMNS {
+							_product_tile(ROWS, VECTORS, Vector, ([^]T)(&output[first]), n, a_panel, b_panel, depth, load)
+							continue
+						}
+						edge: [ROWS*COLUMNS]T
+						for r in 0..<height {
+							for j in 0..<width {
+								edge[r*COLUMNS + j] = output[first + r*n + j] if load else 0
+							}
+						}
+						_product_tile(ROWS, VECTORS, Vector, ([^]T)(&edge[0]), COLUMNS, a_panel, b_panel, depth, true)
+						for r in 0..<height {
+							for j in 0..<width {
+								output[first + r*n + j] = edge[r*COLUMNS + j]
+							}
+						}
+					}
 				}
 			}
-			for i0 := 0; i0 < full_rows; i0 += _PRODUCT_TILE_ROWS {
-				_product_tile(_PRODUCT_TILE_ROWS, TILE_COLUMNS, output[i0*n + j0:], n, a_block, i0, a_row_stride, a_inner_stride, block_panel)
-			}
-			for i in full_rows..<m {
-				_product_tile(1, TILE_COLUMNS, output[i*n + j0:], n, a_block, i, a_row_stride, a_inner_stride, block_panel)
+		}
+	}
+}
+
+// _pack_panels copies the depth x count block of source, whose element (p, j)
+// is at source.offset + p*depth_stride + j*count_stride, into panels of WIDTH
+// columns: panel t's row p goes to pack[(t*depth + p)*WIDTH:][:WIDTH], with
+// zeros past count. It reads along whichever of the two axes is contiguous.
+_pack_panels :: #force_inline proc(pack: [^]$T, source: Tensor_View(T), depth_stride, count_stride, depth, count: int, $WIDTH: int, $ACROSS: bool) #no_bounds_check {
+	panels := (count + WIDTH - 1) / WIDTH
+	if ACROSS && (count_stride == 1 || depth_stride != 1) {
+		// Row p of the block is read across every panel before row p+1.
+		for p in 0..<depth {
+			offset := source.offset + p*depth_stride
+			for t in 0..<panels {
+				width := min(WIDTH, count - t*WIDTH)
+				row := pack[(t*depth + p)*WIDTH:][:WIDTH]
+				first := offset + t*WIDTH*count_stride
+				for j in 0..<width {
+					row[j] = source.data[first + j*count_stride]
+				}
+				for j in width..<WIDTH {
+					row[j] = 0
+				}
 			}
 		}
-		if full_columns < n {
-			#force_no_inline _product_strip(output, a, b, k0, k0+depth, full_columns, n)
+		return
+	}
+	for t in 0..<panels {
+		width := min(WIDTH, count - t*WIDTH)
+		panel := pack[t*depth*WIDTH:]
+		if count_stride == 1 || depth_stride != 1 {
+			for p in 0..<depth {
+				row := panel[p*WIDTH:][:WIDTH]
+				offset := source.offset + p*depth_stride + t*WIDTH*count_stride
+				for j in 0..<width {
+					row[j] = source.data[offset + j*count_stride]
+				}
+				for j in width..<WIDTH {
+					row[j] = 0
+				}
+			}
+			continue
+		}
+		for j in 0..<width {
+			offset := source.offset + (t*WIDTH + j)*count_stride
+			for p in 0..<depth {
+				panel[p*WIDTH + j] = source.data[offset + p]
+			}
+		}
+		for p in 0..<depth {
+			for j in width..<WIDTH {
+				panel[p*WIDTH + j] = 0
+			}
 		}
 	}
 }
@@ -195,30 +284,30 @@ _product_columns :: proc(output: []$T, a, b: Tensor_View(T)) #no_bounds_check {
 	}
 }
 
-// _product_tile adds a's rows i0..<i0+ROWS times the packed panel, whose rows
-// are TILE_COLUMNS wide, into the matching output tile, whose first element is
-// output[0] and whose rows are row_length apart. The tile is accumulated in
-// locals so the compiler can keep it in registers.
-_product_tile :: #force_inline proc($ROWS, $TILE_COLUMNS: int, output: []$T, row_length: int, a: Tensor_View(T), i0, a_row_stride, a_inner_stride: int, panel: []T) #no_bounds_check {
-	tile: [ROWS][TILE_COLUMNS]T = ---
-	for r in 0..<ROWS {
-		for j in 0..<TILE_COLUMNS {
-			tile[r][j] = output[r*row_length + j]
+// _product_tile adds the ROWS x VECTORS*LANES tile a_panel @ b_panel, depth
+// deep, into the matching output tile, whose first element is output[0] and
+// whose rows are row_length apart, or stores it there when load is false. The
+// tile is accumulated in locals so the compiler can keep it in registers.
+_product_tile :: #force_inline proc($ROWS, $VECTORS: int, $Vector: typeid/#simd[$LANES]$T, output: [^]T, row_length: int, a_panel: [^]T, b_panel: [^]Vector, depth: int, load: bool) #no_bounds_check {
+	tile: [ROWS][VECTORS]Vector
+	if load {
+		for r in 0..<ROWS {
+			for v in 0..<VECTORS {
+				tile[r][v] = intrinsics.unaligned_load((^Vector)(&output[r*row_length + v*LANES]))
+			}
 		}
 	}
-	a_offset := a.offset + i0*a_row_stride
-	for p in 0..<len(panel)/TILE_COLUMNS {
-		b_row := panel[p*TILE_COLUMNS:][:TILE_COLUMNS]
+	for p in 0..<depth {
 		for r in 0..<ROWS {
-			scale := a.data[a_offset + r*a_row_stride + p*a_inner_stride]
-			for j in 0..<TILE_COLUMNS {
-				tile[r][j] += scale * b_row[j]
+			scale := Vector(a_panel[p*ROWS + r])
+			for v in 0..<VECTORS {
+				tile[r][v] += scale * b_panel[p*VECTORS + v]
 			}
 		}
 	}
 	for r in 0..<ROWS {
-		for j in 0..<TILE_COLUMNS {
-			output[r*row_length + j] = tile[r][j]
+		for v in 0..<VECTORS {
+			intrinsics.unaligned_store((^Vector)(&output[r*row_length + v*LANES]), tile[r][v])
 		}
 	}
 }

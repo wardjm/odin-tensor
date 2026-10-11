@@ -1120,32 +1120,42 @@ expect_vector_products_match_naive :: proc(t: ^testing.T, $T: typeid, k, n: int,
 
 @(test)
 test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
-	// Sizes straddle the register tiles and the k blocks, leaving partial row
-	// and column tiles and a partial last block.
-	expect_matmul_matches_naive(t, f32, 5, 300, 37, false, false)
-	expect_matmul_matches_naive(t, f32, 5, 300, 37, false, true)
-	expect_matmul_matches_naive(t, f32, 5, 300, 37, true, false)
+	// Sizes straddle the 6-row tiles, the column panels and the 256-deep k
+	// blocks, leaving partial tiles and a partial last block.
+	expect_matmul_matches_naive(t, f32, 7, 300, 37, false, false)
+	expect_matmul_matches_naive(t, f32, 7, 300, 37, false, true)
+	expect_matmul_matches_naive(t, f32, 7, 300, 37, true, false)
 	expect_matmul_matches_naive(t, f32, 6, 600, 33, true, true)
 	expect_matmul_matches_naive(t, f64, 7, 513, 19, false, false)
+	expect_matmul_matches_naive(t, f64, 13, 513, 7, false, false)
+	expect_matmul_matches_naive(t, i64, 8, 256, 16, false, true)
+	expect_matmul_matches_naive(t, i8, 9, 9, 70, false, false)
+	// Several a blocks (60 rows of f32, 30 of f64) and b blocks (128 columns
+	// of f32, 64 of f64), each with a partial last one.
+	expect_matmul_matches_naive(t, f32, 131, 270, 150, false, false)
+	expect_matmul_matches_naive(t, f32, 131, 270, 150, true, true)
+	expect_matmul_matches_naive(t, f64, 67, 260, 70, true, false)
+	expect_matmul_matches_naive(t, f64, 67, 260, 70, false, true)
+	// Too few rows, columns or inner elements to pack, except that 2 to 5 rows
+	// are packed when b is transposed.
+	expect_matmul_matches_naive(t, f32, 5, 300, 37, false, false)
+	expect_matmul_matches_naive(t, f32, 2, 300, 37, false, true)
+	expect_matmul_matches_naive(t, f64, 5, 270, 70, true, true)
 	expect_matmul_matches_naive(t, f64, 3, 513, 7, false, false)
-	expect_matmul_matches_naive(t, i64, 4, 256, 16, false, true)
-	expect_matmul_matches_naive(t, i8, 3, 9, 70, false, false)
 	expect_matmul_matches_naive(t, f32, 1, 300, 37, false, false)
 	expect_matmul_matches_naive(t, f32, 6, 300, 1, false, false)
 	expect_matmul_matches_naive(t, f32, 8, 3, 40, false, false)
-	// Products narrower than one 64-byte column tile use half or quarter tiles:
-	// f32 at 8 and 4 columns (13 leaves a 5-column remainder), f64 at 4, and
-	// i8 at 16.
+	// Products narrower than one column panel pad it.
 	expect_matmul_matches_naive(t, f32, 37, 25, 8, false, false)
 	expect_matmul_matches_naive(t, f32, 37, 300, 8, true, false)
 	expect_matmul_matches_naive(t, f32, 9, 40, 13, false, true)
 	expect_matmul_matches_naive(t, f32, 9, 40, 4, true, true)
-	expect_matmul_matches_naive(t, f32, 9, 40, 3, false, false)
 	expect_matmul_matches_naive(t, f64, 11, 30, 5, false, false)
 	expect_matmul_matches_naive(t, f64, 11, 300, 4, true, false)
 	expect_matmul_matches_naive(t, i8, 5, 12, 20, false, true)
-	// Narrower than a quarter tile, columns are summed 8 rows at a time; 19
-	// and 11 rows leave a remainder.
+	// Narrower than _PRODUCT_MIN_TILE_COLUMNS, columns are summed 8 rows at a
+	// time; 19 and 11 rows leave a remainder.
+	expect_matmul_matches_naive(t, f32, 9, 40, 3, false, false)
 	expect_matmul_matches_naive(t, f32, 19, 40, 1, false, false)
 	expect_matmul_matches_naive(t, f32, 19, 300, 2, true, false)
 	expect_matmul_matches_naive(t, f32, 16, 40, 3, false, true)
@@ -1154,6 +1164,41 @@ test_matmul_blocking_matches_naive_product :: proc(t: ^testing.T) {
 	expect_matmul_matches_naive(t, i64, 9, 20, 1, true, false)
 	expect_vector_products_match_naive(t, f32, 600, 37)
 	expect_vector_products_match_naive(t, f64, 257, 8)
+}
+
+// expect_packed_fallback_matches_naive runs the packed path with 16-byte
+// vectors, which _product_packed only picks on CPUs without AVX, on an m×k by
+// k×n product and compares it exactly with the naive product.
+expect_packed_fallback_matches_naive :: proc(t: ^testing.T, $T: typeid, m, k, n: int, transpose_a: bool, loc := #caller_location) {
+	a_storage, err := new_tensor(T, []int{k, m} if transpose_a else []int{m, k})
+	require_ok(t, err, loc)
+	defer release(&a_storage)
+	fill_product_operand(a_storage.data, 0)
+	b: Tensor(T)
+	b, err = new_tensor(T, []int{k, n})
+	require_ok(t, err, loc)
+	defer release(&b)
+	fill_product_operand(b.data, 3)
+	a := as_view(a_storage)
+	a_shape, a_strides: [2]int
+	if transpose_a {
+		a, err = transpose_view(a, a_shape[:], a_strides[:])
+		require_ok(t, err, loc)
+	}
+	product: Tensor(T)
+	product, err = new_tensor(T, []int{m, n})
+	require_ok(t, err, loc)
+	defer release(&product)
+	_product_packed_vectors(product.data, a, as_view(b), false, 2, max(1, 16/size_of(T)))
+	expect_product_matches_naive(t, product.data, a, as_view(b), loc = loc)
+}
+
+@(test)
+test_packed_fallback_matches_naive_product :: proc(t: ^testing.T) {
+	expect_packed_fallback_matches_naive(t, f32, 131, 270, 150, false)
+	expect_packed_fallback_matches_naive(t, f32, 37, 300, 13, true)
+	expect_packed_fallback_matches_naive(t, f64, 67, 260, 70, true)
+	expect_packed_fallback_matches_naive(t, i32, 13, 20, 9, false)
 }
 
 @(test)

@@ -1080,9 +1080,9 @@ test_tape_batched_matmul_gradients_through_permuted_view :: proc(t: ^testing.T) 
 }
 
 // The other matmul backward tests are too small for the product kernel to
-// block. Here a transposed [9,70] a broadcasts against a [2,70,10] b, so both
-// gradient products hit the register tiles and both tails, k spans two strided
-// blocks, and the second batch accumulates onto the first's gradient. With 3
+// pack. Here a transposed [9,70] a broadcasts against a [2,70,10] b, so both
+// gradient products are packed, with partial tiles, and the second batch
+// accumulates onto the first's gradient. With 3
 // columns in a, a's gradient product is too narrow for a column tile, and with
 // 1 column in b, so is b's; both then take the narrow column path.
 @(test)

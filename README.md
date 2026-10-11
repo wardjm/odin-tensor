@@ -248,7 +248,7 @@ Not differentiable yet: `var`/`std`, the several-axes `*_axes` reductions, `perm
 
 ## Limitations
 
-- Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products are cache-blocked with register tiles, but there is no hand-written SIMD, so large products are well short of a BLAS.
+- Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products pack their operands into cache-sized blocks and accumulate register tiles of SIMD vectors, with a copy compiled for AVX that x86 CPUs supporting it run. They multiply and add separately rather than with fused multiply-adds, so every CPU gets the same results, at roughly 60–70% of an FMA BLAS on large products.
 - Reductions (`sum_axis`, `max_all`, ...) and the backward pass of a general broadcast, other than the bias pattern, stay on the calling thread: splitting them would change the order of their sums. The exception is a float `sum_axis` or `mean_axis` over any axis but the last of a contiguous tensor, which sums 16 neighbouring outputs at a time along contiguous rows and splits those groups between threads, each output keeping its pairwise order.
 
 ## Tests
