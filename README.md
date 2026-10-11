@@ -149,7 +149,7 @@ Each of `add`, `sub`, `mul`, and `div` comes in five forms:
 
 ## Threads
 
-The library is single-threaded by default. `set_thread_count(n)` lets it use up to `n` threads, counting the caller; `thread_count()` reports the setting, and `set_thread_count(1)` joins the workers again. Threads are used by matrix products (`dot`, `matmul`, `linear`), element-wise arithmetic and unary operations, `im2col` and `max_pool2d`, and by the backward pass of each of these and of reshapes. Work is split into one range per thread once it is large enough: 2¹⁸ multiply-adds for a product, 2¹⁶ elements for element-wise work. A product is split by output rows, a batched `matmul` of many small matrices by matrix, `im2col` and pooling by output row, and their backward passes by image or row so no two threads write the same gradient. Each output element is still computed on one thread, combining its inputs in the same order, so results are identical for every thread count.
+The library is single-threaded by default. `set_thread_count(n)` lets it use up to `n` threads, counting the caller; `thread_count()` reports the setting, and `set_thread_count(1)` joins the workers again. Threads are used by matrix products (`dot`, `matmul`, `linear`), element-wise arithmetic and unary operations, `im2col` and `max_pool2d`, and `tape_batch_norm`, and by the backward pass of each of these and of reshapes. Work is split into one range per thread once it is large enough: 2¹⁸ multiply-adds for a product, 2¹⁶ elements for element-wise work. A product is split by output rows, a batched `matmul` of many small matrices by matrix, `im2col` and pooling by output row, and their backward passes by image or row so no two threads write the same gradient. Each output element is still computed on one thread, combining its inputs in the same order, so results are identical for every thread count.
 
 One case is split differently: a product with an inner dimension of at least 8192 and a small output, such as a convolution's weight gradient `[k·k·c, positions] @ [positions, filters]`, has too few rows to share. Its inner dimension is cut into 2048-long slices whose partial products are added in order, when those partial products fit in 128 KB, as a first convolution's `[27, 65536] @ [65536, 32]` does in `f32`. The cut depends only on the shape, and applies on one thread too, so these results are also the same for every thread count. They differ from a single running sum only in rounding: about 4e-5 relative in `f32` over 36,864 terms, slightly closer to the exact sum than the running sum was.
 
@@ -181,7 +181,7 @@ main :: proc() {
 }
 ```
 
-Physical cores are the right ceiling: on an 8-core, 16-thread CPU, 16 threads were slower than 8. `set_thread_count` is safe to call while other threads use the library. If several threads multiply at once, one gets the workers and the others run on their own threads.
+Physical cores are the right ceiling: on an 8-core, 16-thread CPU, 16 threads were slower than 8. Work is split evenly, so a run waits for its slowest thread, and on Linux the scheduler sometimes places two workers on the two hardware threads of one core; that run then takes up to twice as long. Pinning the process to one hardware thread per core, for example `taskset -c 0-7` where CPUs 0 to 7 are distinct cores, keeps times steady. `set_thread_count` is safe to call while other threads use the library. If several threads multiply at once, one gets the workers and the others run on their own threads.
 
 ## Allocators
 
@@ -251,7 +251,7 @@ Not differentiable yet: `var`/`std`, the several-axes `*_axes` reductions, `perm
 ## Limitations
 
 - Kernels are plain loops that rely on the compiler to vectorize: contiguous inputs take a direct path and strided inputs advance by row. Matrix products pack their operands into cache-sized blocks and accumulate register tiles of SIMD vectors, close to a BLAS on one thread. x86 CPUs run a copy compiled for AVX with FMA, for AVX alone, or for SSE, whichever they support; float products use fused multiply-adds on CPUs with FMA, including all ARM64 CPUs, and a separate multiply and add elsewhere. Results are the same for every thread count, but in the last bits can differ between a CPU with FMA and one without.
-- Reductions (`sum_axis`, `max_all`, ...) and the backward pass of a general broadcast, other than the bias pattern, stay on the calling thread: splitting them would change the order of their sums. The exception is a float `sum_axis` or `mean_axis` over any axis but the last of a contiguous tensor, which sums 16 neighbouring outputs at a time along contiguous rows and splits those groups between threads, each output keeping its pairwise order. The gradient of a bias added to a batch is summed the same way, and when there are fewer groups than threads, as for a bias of 32 channels, each sum is also split along its pairwise tree, so the pieces combine into exactly the sum one thread would compute.
+- Reductions (`sum_axis`, `max_all`, ...) and the backward pass of a general broadcast, other than the bias pattern, stay on the calling thread: splitting them would change the order of their sums. The exception is a float `sum_axis` or `mean_axis` over any axis but the last of a contiguous tensor, which sums 16 neighbouring outputs at a time along contiguous rows and splits those groups between threads, each output keeping its pairwise order. The gradient of a bias, added to a batch by `tape_add` or by `tape_linear`, and batch normalization's statistics and gradient sums are summed the same way, and when there are fewer groups than threads, as for 32 channels, each sum is also split along its pairwise tree, so the pieces combine into exactly the sum one thread would compute.
 
 ## Tests
 
@@ -259,7 +259,7 @@ Not differentiable yet: `var`/`std`, the several-axes `*_axes` reductions, `perm
 odin test . -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 ```
 
-The define makes leaks and bad frees fail the run; plain `odin test .` only reports them. Several tests use a failing allocator to drive every `.Allocation_Failed` path, and the flag turns a leak on those paths into a failure.
+The define makes leaks and bad frees fail the run; plain `odin test .` only reports them. Several tests use a failing allocator to drive every `.Allocation_Failed` path, and the flag turns a leak on those paths into a failure. Tests of kernels that write into buffers they don't zero first run under an allocator that fills such memory with NaN bytes, so an element a kernel misses fails the comparison instead of passing on memory that happened to be zero.
 
 ```sh
 scripts/check_readme.sh
