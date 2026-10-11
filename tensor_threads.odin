@@ -224,8 +224,10 @@ _Product_Rows :: struct($T: typeid) {
 // differs from one unsliced sum only in rounding.
 _DEPTH_SPLIT_MIN_DEPTH :: 1 << 13
 _DEPTH_SPLIT_SLICE :: 1 << 11
-// _DEPTH_SPLIT_MAX_PARTIALS bounds the partial products, held on the stack.
-_DEPTH_SPLIT_MAX_PARTIALS :: 1 << 14
+// _DEPTH_SPLIT_PARTIAL_BYTES bounds the partial products, held on the stack:
+// 32768 f32 values, enough for a first convolution's weight gradient such as
+// [27, 65536] @ [65536, 32] in 32 slices, or 16384 f64 values.
+_DEPTH_SPLIT_PARTIAL_BYTES :: 128 * 1024
 
 _Product_Depth :: struct($T: typeid) {
 	partials: []T,
@@ -243,7 +245,7 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false,
 	if len(a.shape) == 2 && len(b.shape) == 2 {
 		m, k, n := a.shape[0], a.shape[1], b.shape[1]
 		slices := (k + _DEPTH_SPLIT_SLICE - 1) / _DEPTH_SPLIT_SLICE
-		if k >= _DEPTH_SPLIT_MIN_DEPTH && slices*m*n <= _DEPTH_SPLIT_MAX_PARTIALS {
+		if k >= _DEPTH_SPLIT_MIN_DEPTH && slices*m*n <= _DEPTH_SPLIT_PARTIAL_BYTES/size_of(T) {
 			_product_depth_split(output, a, b, accumulate, bias, m, k, n, slices)
 			return
 		}
@@ -274,7 +276,7 @@ _product_kernel :: proc(output: []$T, a, b: Tensor_View(T), accumulate := false,
 // when there are threads, then adds them into output, or into the bias, in
 // slice order.
 _product_depth_split :: proc(output: []$T, a, b: Tensor_View(T), accumulate: bool, bias: []T, m, k, n, slices: int) {
-	buffer: [_DEPTH_SPLIT_MAX_PARTIALS]T = ---
+	buffer: [_DEPTH_SPLIT_PARTIAL_BYTES/size_of(T)]T = ---
 	job := _Product_Depth(T){partials = buffer[:slices*m*n], a = a, b = b, m = m, k = k, n = n}
 	_parallel_for(slices, proc(data: rawptr, chunk: int) {
 		job := (^_Product_Depth(T))(data)

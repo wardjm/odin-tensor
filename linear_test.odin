@@ -12,7 +12,7 @@ naive_linear_element :: proc(x, weights: Tensor_View($T), bias: []T, i, j: int, 
 	m, k, n := x.shape[0], x.shape[1], weights.shape[1]
 	slices := (k + _DEPTH_SPLIT_SLICE - 1) / _DEPTH_SPLIT_SLICE
 	slice_depth := k
-	if k >= _DEPTH_SPLIT_MIN_DEPTH && slices*m*n <= _DEPTH_SPLIT_MAX_PARTIALS {
+	if k >= _DEPTH_SPLIT_MIN_DEPTH && slices*m*n <= _DEPTH_SPLIT_PARTIAL_BYTES/size_of(T) {
 		slice_depth = _DEPTH_SPLIT_SLICE
 	}
 	value := bias[j]

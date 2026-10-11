@@ -348,10 +348,10 @@ test_threaded_products_match_one_thread :: proc(t: ^testing.T) {
 // depth split: the in-order sum of the products of 2048-long slices of k,
 // each computed whole. transpose_a stores a as [k, m], as a weight gradient
 // reads its input.
-expect_sliced_product :: proc(t: ^testing.T, m, k, n: int, transpose_a: bool, loc := #caller_location) {
-	a_storage := new_tensor(f64, []int{k, m} if transpose_a else []int{m, k}) or_else panic("a")
+expect_sliced_product :: proc(t: ^testing.T, $T: typeid, m, k, n: int, transpose_a: bool, loc := #caller_location) {
+	a_storage := new_tensor(T, []int{k, m} if transpose_a else []int{m, k}) or_else panic("a")
 	defer release(&a_storage)
-	b_storage := new_tensor(f64, []int{k, n}) or_else panic("b")
+	b_storage := new_tensor(T, []int{k, n}) or_else panic("b")
 	defer release(&b_storage)
 	fill_product_operand(a_storage.data, 0)
 	fill_product_operand(b_storage.data, 3)
@@ -363,7 +363,7 @@ expect_sliced_product :: proc(t: ^testing.T, m, k, n: int, transpose_a: bool, lo
 	product := matmul_views(a, b) or_else panic("matmul")
 	defer release(&product)
 
-	expected := new_tensor(f64, []int{m, n}) or_else panic("expected")
+	expected := new_tensor(T, []int{m, n}) or_else panic("expected")
 	defer release(&expected)
 	for first := 0; first < k; first += _DEPTH_SPLIT_SLICE {
 		depth := min(_DEPTH_SPLIT_SLICE, k-first)
@@ -381,11 +381,15 @@ expect_sliced_product :: proc(t: ^testing.T, m, k, n: int, transpose_a: bool, lo
 @(test)
 test_long_products_sum_fixed_slices :: proc(t: ^testing.T) {
 	// From 2^13 inner elements, with a small output, the product sums slices.
-	expect_sliced_product(t, 3, 8192, 5, false)
-	expect_sliced_product(t, 25, 20000, 8, true)
-	expect_sliced_product(t, 7, 9000, 16, true)
+	expect_sliced_product(t, f64, 3, 8192, 5, false)
+	expect_sliced_product(t, f64, 25, 20000, 8, true)
+	expect_sliced_product(t, f64, 7, 9000, 16, true)
+	// The partial products' room is in bytes, so f32 holds twice as many: a
+	// first convolution's weight gradient, 32 slices of 27×32, fits.
+	expect_sliced_product(t, f32, 27, 65536, 32, true)
 	// Just below the threshold, or with too many partial products to hold,
 	// it is one sequential sum, exactly the naive product.
 	expect_matmul_matches_naive(t, f64, 3, 8191, 5, false, false)
-	expect_matmul_matches_naive(t, f32, 300, 9000, 16, true, false)
+	expect_matmul_matches_naive(t, f32, 300, 9000, 32, true, false)
+	expect_matmul_matches_naive(t, f64, 27, 65536, 32, true, false)
 }
